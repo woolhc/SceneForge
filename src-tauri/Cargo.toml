@@ -1,0 +1,29 @@
+[package]
+name = "scenescript-desktop"
+version = "0.1.0"
+description = "Local AI video editor client"
+authors = ["SceneScript"]
+edition = "2021"
+
+[lib]
+name = "scenescript_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5.1", features = [] }
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6.0"
+rusqlite = { version = "0.32", features = ["bundled"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha1 = "0.10"
+tauri = { version = "2.9.1", features = ["protocol-asset"] }
+thiserror = "2.0"
+tokio = { version = "1.42", features = ["process", "rt-multi-thread", "macros", "fs"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
+tauri-plugin-dialog = "2.7.1"
+which = "8.0.4"

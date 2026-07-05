@@ -1,0 +1,74 @@
+
+/* ===========================================================================
+   画中画变换面板
+   ======================================================================== */
+.transform-box {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px;
+  border-radius: 7px;
+  border: 1px solid var(--soft-line);
+  background: #17191b;
+}
+
+.transform-box label {
+  gap: 4px;
+}
+
+/* ===========================================================================
+   临时诊断错误面板
+   ======================================================================== */
+.error-diag {
+  position: fixed;
+  right: 12px;
+  bottom: 36px;
+  z-index: 100;
+}
+
+.error-diag-toggle {
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 999px;
+  background: #7f1d1d;
+  color: #fecaca;
+  font-size: 12px;
+  font-weight: 600;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+.error-diag-panel {
+  position: absolute;
+  right: 0;
+  bottom: 34px;
+  max-width: 520px;
+  max-height: 340px;
+  overflow: auto;
+  padding: 12px;
+  border-radius: 8px;
+  background: #1a0d0d;
+  border: 1px solid #7f1d1d;
+  color: #fca5a5;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-family: "SF Mono", Menlo, monospace;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6);
+}
+
+/* 画中画叠加层（预览用） */
+.stage-overlay-clip {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  z-index: 4;
+  pointer-events: none;
+}
+
+.stage-overlay-clip img {
+  width: 100%;
+  height: auto;
+  display: block;
+  border-radius: 2px;
+  object-fit: contain;
+}

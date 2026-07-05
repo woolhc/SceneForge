@@ -1,0 +1,50 @@
+import { Loader2, Upload } from "lucide-react";
+import { MediaLibrary } from "../library/MediaLibrary";
+import type { MediaSource } from "../types";
+
+/**
+ * 媒体 Tab：Pexels 搜索 + 本地导入 + 素材网格。
+ * 点击素材 = 替换当前选中视频 clip（或追加）。
+ */
+export function MediaPanel({
+  media,
+  busy,
+  previewingId,
+  onImportLocal,
+  onSearchVideos,
+  onSearchPhotos,
+  onPreview,
+  onAddToTimeline,
+}: {
+  media: MediaSource[];
+  busy: string | null;
+  previewingId?: string | null;
+  onImportLocal: () => void;
+  onSearchVideos: (query: string) => void;
+  onSearchPhotos: (query: string) => void;
+  onPreview: (asset: MediaSource | null) => void;
+  onAddToTimeline: (asset: MediaSource) => void;
+}) {
+  const importing = busy === "library-import";
+  return (
+    <div className="panel-content">
+      <button
+        className={`panel-primary-action ${importing ? "disabled" : ""}`}
+        disabled={importing}
+        onClick={onImportLocal}
+      >
+        {importing ? <Loader2 className="spin" size={16} /> : <Upload size={16} />}
+        导入本地素材
+      </button>
+      <MediaLibrary
+        media={media}
+        busy={busy}
+        previewingId={previewingId}
+        onSearchVideos={onSearchVideos}
+        onSearchPhotos={onSearchPhotos}
+        onPreview={onPreview}
+        onAddToTimeline={onAddToTimeline}
+      />
+    </div>
+  );
+}
