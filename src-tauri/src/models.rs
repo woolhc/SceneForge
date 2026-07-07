@@ -612,6 +612,13 @@ pub struct RenderConfig {
     /// T4.10: 导出模式："video"（默认）| "audio-only"（仅音频）
     #[serde(default = "default_export_mode")]
     pub export_mode: String,
+    /// T4.5: 默认转场时长（秒）
+    #[serde(default = "default_transition_duration")]
+    pub transition_duration: f64,
+}
+
+fn default_transition_duration() -> f64 {
+    0.5
 }
 
 fn default_codec() -> String {
@@ -630,6 +637,7 @@ impl Default for RenderConfig {
             bitrate_mbps: 0,
             codec: default_codec(),
             export_mode: default_export_mode(),
+            transition_duration: default_transition_duration(),
         }
     }
 }

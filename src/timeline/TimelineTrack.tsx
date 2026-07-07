@@ -17,6 +17,7 @@ function TimelineTrackInner({
   totalDuration,
   timelineWidth,
   selectedClipId,
+  selectedClipIds,
   locked,
   onSelectClip,
   onClipDrag,
@@ -35,8 +36,9 @@ function TimelineTrackInner({
   timelineWidth: number;
   pxPerSecond: number;
   selectedClipId: string | null;
+  selectedClipIds?: string[];
   locked: boolean;
-  onSelectClip: (id: string) => void;
+  onSelectClip: (id: string, additive: boolean) => void;
   onClipDrag: (clipId: string, patch: Partial<Clip>, commit: boolean) => void;
   onClipCommit: (clipId: string) => void;
   onDropAsset: (trackId: string, assetId: string, startOnTrack: number) => void;
@@ -58,7 +60,7 @@ function TimelineTrackInner({
     if (locked) return;
     event.stopPropagation();
     event.preventDefault();
-    onSelectClip(clip.id);
+    onSelectClip(clip.id, event.metaKey || event.ctrlKey);
     const peers = clips.filter((c) => c.id !== clip.id);
     dragRef.current = {
       clipId: clip.id,
@@ -195,7 +197,7 @@ function TimelineTrackInner({
         return (
           <div
             key={clip.id}
-            className={`clip ${track.kind} ${clip.id === selectedClipId ? "selected" : ""}`}
+            className={`clip ${track.kind} ${clip.id === selectedClipId ? "selected" : ""} ${selectedClipIds?.includes(clip.id) ? "multi-selected" : ""}`}
             style={{
               left: `${leftPct}%`,
               width: `${widthPct}%`,
@@ -210,7 +212,7 @@ function TimelineTrackInner({
             onContextMenu={(e) => {
               e.preventDefault();
               e.stopPropagation();
-              onSelectClip(clip.id);
+              onSelectClip(clip.id, e.metaKey || e.ctrlKey);
               onContextMenu(clip, track.kind, e.clientX, e.clientY);
             }}
           >

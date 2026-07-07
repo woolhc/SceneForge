@@ -186,6 +186,8 @@ export function App() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [project, setProject] = useState<Project | null>(null);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
+  /** T4.6: 多选 clip id 集合（Ctrl/Cmd+点击加选） */
+  const [selectedClipIds, setSelectedClipIds] = useState<string[]>([]);
   const [settings, setSettings] = useState<AppSettings>({
     deepseekApiKey: "",
     pexelsApiKey: "",
@@ -409,8 +411,10 @@ export function App() {
     project: Project | null;
     selectedClip: Clip | null;
     selectedClipId: string | null;
+    selectedClipIds: string[];
     totalDuration: number;
     deleteSelectedClip: () => void;
+    deleteSelectedClips: () => void;
     undo: () => void;
     redo: () => void;
     duplicateSelectedClip: () => void;
@@ -420,8 +424,8 @@ export function App() {
     seek: (t: number) => void;
   } | null>(null);
   kbStateRef.current = {
-    project, selectedClip, selectedClipId, totalDuration,
-    deleteSelectedClip, undo, redo, duplicateSelectedClip, pasteClip,
+    project, selectedClip, selectedClipId, selectedClipIds, totalDuration,
+    deleteSelectedClip, deleteSelectedClips, undo, redo, duplicateSelectedClip, pasteClip,
     togglePlay, splitAtPlayhead, seek,
   };
 
@@ -441,10 +445,14 @@ export function App() {
       ) {
         return;
       }
-      // Delete 或 Backspace 删除选中 clip
+      // Delete 或 Backspace 删除选中 clip（T4.6: 多选时批量删）
       if ((event.key === "Delete" || event.key === "Backspace") && s.selectedClipId) {
         event.preventDefault();
-        s.deleteSelectedClip();
+        if (s.selectedClipIds && s.selectedClipIds.length > 1) {
+          s.deleteSelectedClips();
+        } else {
+          s.deleteSelectedClip();
+        }
       }
       // Ctrl+Z 撤销，Ctrl+Shift+Z 或 Ctrl+Y 重做
       if ((event.ctrlKey || event.metaKey) && event.key === "z") {
@@ -1485,6 +1493,49 @@ export function App() {
     const next = { ...project, clips: newClips };
     void persist(next, "已删除片段");
     setSelectedClipId(next.clips.find((c) => c.trackId === deleted.trackId)?.id || null);
+    setSelectedClipIds([]);
+  }
+
+  /** T4.6: 批量删除多个选中 clip */
+  function deleteSelectedClips() {
+    if (!project || selectedClipIds.length === 0) return;
+    const idsToDelete = new Set(selectedClipIds);
+    // 按 track 分组，每轨各自做涟漪前移
+    const newClips: Clip[] = [];
+    const trackDeleted: Record<string, { start: number; gap: number }[]> = {};
+    for (const c of project.clips) {
+      if (idsToDelete.has(c.id)) {
+        trackDeleted[c.trackId] = trackDeleted[c.trackId] || [];
+        trackDeleted[c.trackId].push({ start: c.startOnTrack, gap: c.duration });
+      }
+    }
+    for (const c of project.clips) {
+      if (idsToDelete.has(c.id)) continue;
+      let offset = 0;
+      const dels = trackDeleted[c.trackId] || [];
+      for (const d of dels) {
+        if (c.startOnTrack >= d.start - 0.01) offset += d.gap;
+      }
+      newClips.push(offset > 0 ? { ...c, startOnTrack: c.startOnTrack - offset } : c);
+    }
+    const next = { ...project, clips: newClips };
+    void persist(next, `已删除 ${idsToDelete.size} 个片段`);
+    setSelectedClipId(null);
+    setSelectedClipIds([]);
+  }
+
+  /** T4.6: 选中 clip（additive=true 时 Ctrl/Cmd+点击多选） */
+  function selectClip(id: string, additive: boolean) {
+    if (additive) {
+      setSelectedClipIds((prev) =>
+        prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
+      );
+      // 多选时 selectedClipId 取第一个或保持
+      setSelectedClipId((prev) => prev ?? id);
+    } else {
+      setSelectedClipIds([id]);
+      setSelectedClipId(id);
+    }
   }
 
   /** 复制选中 clip（原地复制，偏移 0.5s 避免重叠） */
@@ -2047,7 +2098,15 @@ export function App() {
               <TransitionPanel
                 selectedClipId={selectedClipId}
                 currentTransition={selectedClip?.transitionIn ?? null}
+                currentDuration={project?.renderConfig?.transitionDuration ?? 0.5}
                 onApply={handleApplyTransition}
+                onDurationChange={(d) => {
+                  if (project) {
+                    const next = { ...project, renderConfig: { ...project.renderConfig, transitionDuration: d } };
+                    setProject(next);
+                    void desktopApi.saveProject(next);
+                  }
+                }}
               />
             )}
           </div>
@@ -3061,11 +3120,12 @@ export function App() {
                   timelineWidth={timelineWidth}
                   pxPerSecond={pxPerSecond}
                   selectedClipId={selectedClipId}
+                  selectedClipIds={selectedClipIds}
                   locked={track.locked}
-                  onSelectClip={(id) => {
-                    setSelectedClipId(id);
+                  onSelectClip={(id, additive) => {
+                    selectClip(id, additive);
                     const c = project.clips.find((cl) => cl.id === id);
-                    if (c) seek(c.startOnTrack);
+                    if (c && !additive) seek(c.startOnTrack);
                   }}
                   onClipDrag={handleClipDrag}
                   onClipCommit={handleClipCommit}

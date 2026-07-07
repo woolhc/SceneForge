@@ -576,6 +576,37 @@ textarea {
 }
 .kf-buttons button:hover { background: #34353a; }
 
+/* T4.5: 转场面板增强 */
+.transition-category {
+  margin-bottom: 12px;
+}
+.transition-cat-title {
+  font-size: 11px;
+  color: #888;
+  margin: 8px 0 6px;
+  padding-left: 4px;
+}
+.transition-duration-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  background: #1a1b1e;
+  border-radius: 4px;
+  margin-bottom: 8px;
+  font-size: 12px;
+}
+.transition-duration-row input { flex: 1; }
+.mask-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+  padding: 6px 8px;
+  background: #1a1b1e;
+  border-radius: 4px;
+}
+
 .stage-content {
   position: absolute;
   inset: 0;
@@ -999,6 +1030,12 @@ textarea {
 
 .clip:active {
   cursor: grabbing;
+}
+
+/* T4.6: 多选高亮 */
+.clip.multi-selected {
+  outline: 2px solid #4a9eff;
+  outline-offset: -1px;
 }
 
 /* T4.7: 视频胶片条缩略图 */

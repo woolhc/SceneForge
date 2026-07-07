@@ -612,7 +612,7 @@ pub async fn render_project_video(
         }
     } else {
         // 有转场：用 filter_complex xfade 逐段合并
-        let transition_duration = 0.5; // 默认转场 0.5 秒
+        let transition_duration = project.render_config.transition_duration.max(0.1);
         // 收集每段的时长
         let seg_durations: Vec<f64> = segments.iter().map(|(s, e)| e - s).collect();
         // 构建 filter_complex
@@ -635,11 +635,22 @@ pub async fn render_project_video(
             let xfade_type = clip_with_trans
                 .and_then(|c| c.transition_in.as_deref())
                 .unwrap_or("fade");
+            // T4.5: xfade 名映射 —— 新种类（已是 xfade 原生名）直接透传，旧短名兼容
             let xfade_name = match xfade_type {
                 "slide" => "slideleft",
                 "zoom" => "smoothleft",
                 "wipe" => "wipeleft",
                 "blur" => "dissolve",
+                // 以下已是 xfade 原生名，直接透传
+                "fade" | "dissolve" | "fadeblack" | "fadewhite"
+                | "wipeleft" | "wiperight" | "wipeup" | "wipedown"
+                | "slideleft" | "slideright" | "slideup" | "slidedown"
+                | "smoothleft" | "smoothright" | "smoothup" | "smoothdown"
+                | "circleopen" | "circleclose" | "radial"
+                | "horzopen" | "horzclose" | "vertopen" | "vertclose"
+                | "diagbl" | "diagbr" | "diagtl" | "diagtr"
+                | "hlslice" | "hrslice" | "vuslice" | "vdslice"
+                | "hblur" | "fadegrays" | "pixellize" | "sshred" => xfade_type,
                 _ => "fade",
             };
             let this_label = format!("[{}:v]", i);
@@ -694,7 +705,7 @@ pub async fn render_project_video(
     // 转场偏移表：xfade 会让视频总长缩短，音频/字幕需要同步平移
     // 收集所有转场的发生时间点（转场前一段的结束时间）和缩短量
     let transition_shrink_points = if has_transitions && segments.len() > 1 {
-        let td = 0.5_f64;
+        let td = project.render_config.transition_duration.max(0.1);
         let mut points: Vec<(f64, f64)> = Vec::new();
         let mut acc = segments[0].1 - segments[0].0; // 第一段时长
         for i in 1..segments.len() {

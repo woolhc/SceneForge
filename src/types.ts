@@ -250,6 +250,8 @@ export type RenderConfig = {
   codec?: "h264" | "hevc";
   /** T4.10: 导出模式：video（默认）| audio-only（仅音频 mp3） */
   exportMode?: "video" | "audio-only";
+  /** T4.5: 默认转场时长（秒） */
+  transitionDuration?: number;
 };
 
 export type Project = {
@@ -357,4 +359,5 @@ export const DEFAULT_RENDER_CONFIG: RenderConfig = {
   bitrateMbps: 0,
   codec: "h264",
   exportMode: "video",
+  transitionDuration: 0.5,
 };
