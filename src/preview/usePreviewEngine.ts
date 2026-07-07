@@ -9,19 +9,31 @@ export function usePreviewEngine(
   active: boolean = true,
 ) {
   const engineRef = useRef<PreviewEngine | null>(null);
+  // 缓存最新的 project，引擎创建后立即同步
+  const pendingProjectRef = useRef<Project | null>(null);
   const [engineState, setEngineState] = useState<EngineState>({
     currentTime: 0,
     playing: false,
     activeSubtitle: null,
     activeSubtitleStyle: null,
+    activeSubtitleClip: null,
     activeVideoClip: null,
     activeOverlayClips: [],
   });
 
-  // active 变为 true 时（从首页进入编辑器），轮询等 video ref 就绪
+  // active 变化时创建/销毁引擎
   useEffect(() => {
-    if (!active) return;
+    if (!active) {
+      // 离开编辑器时销毁引擎，释放绑定的 video 元素
+      if (engineRef.current) {
+        engineRef.current.dispose();
+        engineRef.current = null;
+      }
+      return;
+    }
+
     let disposed = false;
+
     function tryInit() {
       if (disposed || engineRef.current) return;
       if (!videoARef.current || !videoBRef.current) return;
@@ -29,7 +41,12 @@ export function usePreviewEngine(
       engine.resolveLocal = (localPath: string) =>
         desktopApi.mediaSrc(localPath) ?? localPath;
       engineRef.current = engine;
+      // 创建后立即同步缓存的 project（修复首次 syncProject 丢失的 race）
+      if (pendingProjectRef.current) {
+        engine.setProject(pendingProjectRef.current);
+      }
     }
+
     tryInit();
     const timer = setInterval(tryInit, 100);
     const stop = setTimeout(() => clearInterval(timer), 5000);
@@ -41,6 +58,8 @@ export function usePreviewEngine(
   }, [active]);
 
   const syncProject = useCallback(async (project: Project | null) => {
+    // 缓存 project，供引擎创建后同步
+    pendingProjectRef.current = project;
     const engine = engineRef.current;
     if (!engine) return;
     engine.setProject(project);

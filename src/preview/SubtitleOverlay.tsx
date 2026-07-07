@@ -1,6 +1,6 @@
 import Moveable from "react-moveable";
 import { useEffect, useRef, useState } from "react";
-import type { Clip, SubtitleStyle } from "../types";
+import type { Clip, SubtitleStyle, WordCue } from "../types";
 import { DEFAULT_SUBTITLE_STYLE } from "../types";
 
 /**
@@ -9,6 +9,7 @@ import { DEFAULT_SUBTITLE_STYLE } from "../types";
  * - 拖角点/边中点 → 等比缩放 scale（不改 fontSize）
  * - 拖旋转手柄 → 改 rotation
  * - 双击 → 进入文字编辑模式
+ * - 当 clip.words 非空 + style.karaoke=true：逐字高亮（已播到的字变色）
  *
  * 字号（fontSize）是基准，scale 是独立缩放因子。
  * 渲染：transform: translate + rotate + scale，moveable 自动跟踪 transform 后的边界。
@@ -17,6 +18,7 @@ export function SubtitleOverlay({
   clip,
   targetRef,
   isSelected,
+  currentTime,
   onMove,
   onScale,
   onRotate,
@@ -26,6 +28,8 @@ export function SubtitleOverlay({
   /** 预览区容器 ref（用于 moveable 的 bounds 约束） */
   targetRef: React.RefObject<HTMLDivElement | null>;
   isSelected: boolean;
+  /** 当前播放头时间（秒，时间线坐标）—— 用于逐字高亮判断 */
+  currentTime?: number;
   onMove: (x: number, y: number) => void;
   onScale: (scaleX: number, scaleY: number) => void;
   onRotate: (rotation: number) => void;
@@ -36,13 +40,42 @@ export function SubtitleOverlay({
   // 记录拖动开始时的 scale（用于计算增量）
   const startScaleXRef = useRef(100);
   const startScaleYRef = useRef(100);
-  const style: SubtitleStyle = clip.subtitleStyle ?? DEFAULT_SUBTITLE_STYLE;
+  const style: SubtitleStyle = { ...DEFAULT_SUBTITLE_STYLE, ...(clip.subtitleStyle ?? {}) };
   const scaleX = (style.scaleX ?? 100) / 100;
   const scaleY = (style.scaleY ?? 100) / 100;
   const rotation = style.rotation ?? 0;
   const fontSize = `${Math.max(12, (style.fontSize ?? 48) * 0.35)}px`;
   const strokeColor = style.strokeColor ?? "#000";
+  const baseColor = style.color ?? "#FFFFFF";
+  const highlightColor = style.highlightColor ?? "#FFD700";
   const strokeShadow = `1px 1px 0 ${strokeColor}, -1px -1px 0 ${strokeColor}, 1px -1px 0 ${strokeColor}, -1px 1px 0 ${strokeColor}`;
+
+  // 逐字高亮：判断是否启用
+  const karaokeEnabled = (style.karaoke ?? true) && (clip.words?.length ?? 0) > 0;
+  // word 时间是相对音频整体的，加上 clip 在时间线的偏移 → 得到时间线坐标
+  // （ASR 音频从配音轨起始合并；为简化，假设 word.start/end 已与 startOnTrack 同坐标系，
+  //   实际播放验证若不对再补偏移）
+  const renderWords = (words: WordCue[]) => {
+    const t = currentTime ?? -1;
+    return words.map((w, i) => {
+      // 已播到：word.end <= t 或 word.start <= t < word.end（正在播）
+      // 未播到：t < word.start
+      const played = t >= w.start;
+      // 智能空格：前后都是 ASCII 字母/数字时，词间加空格（英文用）
+      const prev = words[i - 1];
+      const needSpace =
+        i > 0 &&
+        prev &&
+        /[A-Za-z0-9]$/.test(prev.text) &&
+        /^[A-Za-z0-9]/.test(w.text);
+      return (
+        <span key={i} style={{ color: played ? highlightColor : baseColor }}>
+          {needSpace ? " " : ""}
+          {w.text}
+        </span>
+      );
+    });
+  };
 
   // textRef 就绪后才渲染 Moveable（避免首次渲染 ref 为 null）
   useEffect(() => {
@@ -93,7 +126,9 @@ export function SubtitleOverlay({
           }
         }}
       >
-        {clip.text || ""}
+        {karaokeEnabled && clip.words
+          ? renderWords(clip.words)
+          : clip.text || ""}
       </div>
 
       {/* moveable 控制器：target DOM 就绪后渲染 */}

@@ -15,6 +15,8 @@ export function Ruler({
 }) {
   const ref = useRef<HTMLDivElement | null>(null);
   const dragging = useRef(false);
+  const downPos = useRef<{ x: number; y: number } | null>(null);
+  const seekTimer = useRef<number | null>(null);
 
   // 计算合适的刻度间隔（秒）：目标每 ~80px 一个刻度
   const targetPxPerTick = 80;
@@ -64,15 +66,37 @@ export function Ruler({
       ref={ref}
       className="ruler ruler-interactive"
       onPointerDown={(event) => {
+        // 只在主键（左键）触发
+        if (event.button !== 0) return;
         dragging.current = true;
+        downPos.current = { x: event.clientX, y: event.clientY };
         event.currentTarget.setPointerCapture(event.pointerId);
-        seekFromEvent(event);
+        // 延迟 seek：只在按下不动 150ms 后才 seek（避免快速滑过误触）
+        seekTimer.current = window.setTimeout(() => {
+          if (dragging.current) seekFromEvent(event);
+        }, 150);
       }}
       onPointerMove={(event) => {
-        if (dragging.current) seekFromEvent(event);
+        if (!dragging.current) return;
+        // 如果鼠标移动超过 5px，立即 seek（拖动模式）
+        if (downPos.current) {
+          const dx = Math.abs(event.clientX - downPos.current.x);
+          const dy = Math.abs(event.clientY - downPos.current.y);
+          if (dx > 5 || dy > 5) {
+            if (seekTimer.current) { clearTimeout(seekTimer.current); seekTimer.current = null; }
+            seekFromEvent(event);
+          }
+        }
       }}
       onPointerUp={(event) => {
+        if (seekTimer.current) {
+          clearTimeout(seekTimer.current);
+          seekTimer.current = null;
+          // 短按（没拖动）= 点击 seek
+          seekFromEvent(event);
+        }
         dragging.current = false;
+        downPos.current = null;
         event.currentTarget.releasePointerCapture(event.pointerId);
       }}
     >

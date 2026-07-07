@@ -354,6 +354,7 @@ export class PreviewEngine {
         currentTime: this.currentTime,
         playing: this.playing,
         activeSubtitle: null,
+        activeSubtitleClip: null,
         activeVideoClip: null,
         activeOverlayClips: [],
       });
@@ -369,6 +370,7 @@ export class PreviewEngine {
       playing: this.playing,
       activeSubtitle: subtitleClip?.text || null,
       activeSubtitleStyle: subtitleClip?.subtitleStyle || null,
+      activeSubtitleClip: subtitleClip || null,
       activeVideoClip: baseClip,
       activeOverlayClips: overlayClips,
     });
@@ -457,7 +459,9 @@ export type EngineState = {
   currentTime: number;
   playing: boolean;
   activeSubtitle: string | null;
-  activeSubtitleStyle?: { fontSize: number; color: string; strokeColor: string; position: string; fontFamily: string; x: number; y: number; scaleX: number; scaleY: number; rotation: number } | null;
+  activeSubtitleStyle?: { fontSize: number; color: string; strokeColor: string; position: string; fontFamily: string; x: number; y: number; scaleX: number; scaleY: number; rotation: number; karaoke?: boolean; highlightColor?: string } | null;
+  /** 当前活跃字幕 clip（含 words，用于逐字高亮） */
+  activeSubtitleClip: Clip | null;
   activeVideoClip: Clip | null;
   /** 画中画叠加层：除底层外的活跃视频 clip */
   activeOverlayClips: Clip[];

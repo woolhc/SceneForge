@@ -86,6 +86,17 @@ export type SubtitleStyle = {
   scaleY: number;
   /** 旋转角度（度） */
   rotation: number;
+  /** 是否启用逐字高亮（卡拉OK效果） */
+  karaoke?: boolean;
+  /** 逐字高亮颜色（已播到的字色） */
+  highlightColor?: string;
+};
+
+/** 单个词/字符的时间戳（用于逐字高亮） */
+export type WordCue = {
+  start: number;
+  end: number;
+  text: string;
 };
 
 export type ClipCrop = {
@@ -154,6 +165,8 @@ export type Clip = {
   /** 字幕文案（字幕 clip 用） */
   text?: string | null;
   subtitleStyle?: SubtitleStyle | null;
+  /** 字幕逐词时间戳（用于逐字高亮；null/空表示无词级数据） */
+  words?: WordCue[] | null;
   /** 入场转场 */
   transitionIn?: string | null;
   /** 出场转场 */
@@ -218,13 +231,35 @@ export type AiSegment = {
   title: string;
   text: string;
   visualQuery: string;
+  /** 中文画面关键词（展示用） */
+  visualQueryZh?: string;
   mood: string;
   estimatedDuration: number;
+  /** 素材策略："auto_search" | "manual" | "color_card" */
+  materialStrategy?: string;
+  /** 真实起始时间（秒）。音频模式下由 whisper 提供，文案模式为 0 */
+  start?: number;
+  /** 真实结束时间（秒）。音频模式下由 whisper 提供 */
+  end?: number;
 };
 
 export type SegmentScriptResult = {
   segments: AiSegment[];
   rawSegmentCount: number;
+};
+
+/** 带时间戳的句子（音频模式用） */
+export type TimedSentence = {
+  start: number;
+  end: number;
+  text: string;
+};
+
+/** 音频模式：whisper 识别返回的句子级结果 */
+export type TimedSentencesResult = {
+  sentences: TimedSentence[];
+  totalDuration: number;
+  fullText: string;
 };
 
 export const DEFAULT_SUBTITLE_STYLE: SubtitleStyle = {
@@ -238,6 +273,8 @@ export const DEFAULT_SUBTITLE_STYLE: SubtitleStyle = {
   scaleX: 100,
   scaleY: 100,
   rotation: 0,
+  karaoke: true,
+  highlightColor: "#FFD700",
 };
 
 export const DEFAULT_TRANSFORM: ClipTransform = {

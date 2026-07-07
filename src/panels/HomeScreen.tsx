@@ -1,4 +1,4 @@
-import { Clock, Film, MoreVertical, Plus, Search, Trash2, Copy, Edit3 } from "lucide-react";
+import { Clock, Film, MoreVertical, Plus, Search, Sparkles, Trash2, Copy, Edit3 } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { ProjectSummary } from "../types";
 
@@ -9,6 +9,7 @@ export function HomeScreen({
   onRename,
   onDuplicate,
   onDelete,
+  onGenerate,
 }: {
   projects: ProjectSummary[];
   onOpen: (id: string) => void;
@@ -16,6 +17,7 @@ export function HomeScreen({
   onRename: (id: string, name: string) => void;
   onDuplicate: (id: string) => void;
   onDelete: (id: string) => void;
+  onGenerate: () => void;
 }) {
   const [search, setSearch] = useState("");
   const [menuOpen, setMenuOpen] = useState<string | null>(null);
@@ -46,6 +48,12 @@ export function HomeScreen({
       </header>
 
       <div className="home-content">
+        <button className="generate-project-card" onClick={onGenerate}>
+          <Sparkles size={32} />
+          <strong>一键生成</strong>
+          <small>文案 → AI 自动生成视频</small>
+        </button>
+
         <button className="new-project-card" onClick={onCreate}>
           <Plus size={32} />
           <strong>新建项目</strong>

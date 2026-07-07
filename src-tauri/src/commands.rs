@@ -533,6 +533,7 @@ pub async fn detach_audio(
         visual_query: None,
         text: None,
         subtitle_style: None,
+        words: None,
         transition_in: None,
         crop: None,
         transition_out: None,
@@ -631,7 +632,7 @@ pub async fn separate_vocals(
             volume: if name == "人声" { 1.0 } else { 0.5 }, // 伴奏默认半音量
             fade_in: 0.0, fade_out: 0.0,
             filter: None, brightness: 0.0, contrast: 0.0, saturation: 0.0,
-            transform: None, visual_query: None, text: None, subtitle_style: None,
+            transform: None, visual_query: None, text: None, subtitle_style: None, words: None,
             transition_in: None,
         crop: None, transition_out: None,
         });
@@ -673,13 +674,21 @@ pub async fn generate_subtitles(
         )
     };
 
-    // 找字幕轨（没有则报错）
-    let subtitle_track = project
-        .tracks
-        .iter()
-        .find(|t| t.kind == TrackKind::Subtitle)
-        .ok_or_else(|| "没有字幕轨，请先添加字幕轨".to_string())?
-        .clone();
+    // 找字幕轨，没有则自动创建
+    let subtitle_track_id = if let Some(t) = project.tracks.iter().find(|t| t.kind == TrackKind::Subtitle) {
+        t.id.clone()
+    } else {
+        let tid = format!("track_subtitle_{}", uuid::Uuid::new_v4());
+        project.tracks.push(Track {
+            id: tid.clone(),
+            kind: TrackKind::Subtitle,
+            name: "字幕".to_string(),
+            order: project.tracks.iter().map(|t| t.order).min().unwrap_or(0),
+            muted: false,
+            locked: false,
+        });
+        tid
+    };
 
     // 收集所有配音轨 clip 的音频路径（按时间顺序）
     let voiceover_track_ids: Vec<String> = project
@@ -769,13 +778,19 @@ pub async fn generate_subtitles(
         .map_err(map_error)?;
 
     // 清空字幕轨现有 clip，用识别结果重建
-    project.clips.retain(|c| c.track_id != subtitle_track.id);
+    project.clips.retain(|c| c.track_id != subtitle_track_id);
     let _ = &audio_dir; // 预留
     for cue in &refined {
         let duration = (cue.end - cue.start).max(0.3);
+        // 透传词级时间戳（非空时才存，避免空数组占用空间）
+        let words = if cue.words.is_empty() {
+            None
+        } else {
+            Some(cue.words.clone())
+        };
         project.clips.push(Clip {
             id: format!("sub-{}", uuid::Uuid::new_v4()),
-            track_id: subtitle_track.id.clone(),
+            track_id: subtitle_track_id.clone(),
             source_id: None,
             start_on_track: cue.start,
             duration,
@@ -794,6 +809,7 @@ pub async fn generate_subtitles(
             crop: None,
             text: Some(cue.text.clone()),
             subtitle_style: None,
+            words,
             transition_in: None,
             transition_out: None,
         });
@@ -978,6 +994,80 @@ async fn probe_video_resolution(path: &std::path::Path) -> anyhow::Result<(u32, 
         anyhow::bail!("解析分辨率失败");
     }
     Ok((parts[0].parse().unwrap_or(0), parts[1].parse().unwrap_or(0)))
+}
+
+/// 模式 1 音频识别：把音频文件转写成纯文本（不做字幕编排，只返回文字）
+#[tauri::command]
+pub async fn transcribe_to_text(
+    state: State<'_, AppState>,
+    audio_path: String,
+) -> Result<String, String> {
+    let settings = {
+        let conn = state.db.lock().map_err(map_error)?;
+        storage::load_settings(&conn).map_err(map_error)?
+    };
+    let path = std::path::PathBuf::from(&audio_path);
+    if !path.exists() {
+        return Err(format!("音频文件不存在：{audio_path}"));
+    }
+    let cues = asr::transcribe_audio(&settings, &state.paths.cache_dir, &path)
+        .await
+        .map_err(map_error)?;
+    // 拼接所有 cue 的文本
+    let text = cues
+        .iter()
+        .map(|c| c.text.trim())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.trim().is_empty() {
+        return Err("音频识别结果为空，请检查音频文件或 whisper 配置".to_string());
+    }
+    Ok(text)
+}
+
+/// 音频模式：识别音频并返回句子级时间戳（驱动分镜编排）。
+/// 与 transcribe_to_text 不同：保留每句的真实 start/end，用于精准分镜。
+#[tauri::command]
+pub async fn transcribe_to_sentences(
+    state: State<'_, AppState>,
+    audio_path: String,
+) -> Result<crate::models::TimedSentencesResult, String> {
+    let settings = {
+        let conn = state.db.lock().map_err(map_error)?;
+        storage::load_settings(&conn).map_err(map_error)?
+    };
+    let path = std::path::PathBuf::from(&audio_path);
+    if !path.exists() {
+        return Err(format!("音频文件不存在：{audio_path}"));
+    }
+    let (sentences, total_duration, full_text) =
+        asr::transcribe_to_sentences(&settings, &state.paths.cache_dir, &path)
+            .await
+            .map_err(map_error)?;
+    if sentences.is_empty() {
+        return Err("音频识别结果为空，请检查音频文件或 whisper 配置".to_string());
+    }
+    Ok(crate::models::TimedSentencesResult {
+        sentences,
+        total_duration,
+        full_text,
+    })
+}
+
+/// 音频模式：给 whisper 识别的句子补充画面关键词/情绪（不改时间，不改数量顺序）。
+#[tauri::command]
+pub async fn enrich_segments(
+    state: State<'_, AppState>,
+    request: crate::models::EnrichSegmentsRequest,
+) -> Result<Vec<crate::models::AiSegment>, String> {
+    let settings = {
+        let conn = state.db.lock().map_err(map_error)?;
+        storage::load_settings(&conn).map_err(map_error)?
+    };
+    ai::enrich_segments(&settings, request)
+        .await
+        .map_err(map_error)
 }
 
 // ============================================================================

@@ -659,13 +659,18 @@ async fn render_segment_with_overlay(
     // 准备每个 clip 的本地文件路径 + 素材类型作为输入
     let mut inputs: Vec<(PathBuf, &Clip, bool)> = Vec::new(); // (path, clip, is_image)
     for clip in active_clips {
-        let source = project
+        let source = match project
             .media
             .iter()
-            .find(|m| Some(&m.id) == clip.source_id.as_ref())
-            .ok_or_else(|| anyhow::anyhow!("片段引用的素材不存在"))?;
+            .find(|m| Some(&m.id) == clip.source_id.as_ref()) {
+            Some(s) => s,
+            None => continue, // 跳过未绑定素材的 clip（避免渲染崩溃）
+        };
         let local_path = ensure_media_local(cache_dir, source).await?;
         inputs.push((local_path, *clip, source.kind == "image"));
+    }
+    if inputs.is_empty() {
+        anyhow::bail!("该时间段没有已绑定素材的视频片段");
     }
 
     // 构造 ffmpeg 命令：图片用 -loop 1，视频用 -ss 定位
@@ -713,7 +718,13 @@ async fn render_segment_with_overlay(
             format!("scale={target_w}:{target_h}:force_original_aspect_ratio=decrease")
         };
 
-        let mut chain = scale_expr;
+        // 画面裁剪（在 scale 之前，操作源帧）
+        let source_crop = clip_source_crop(clip);
+        let mut chain = if source_crop.is_empty() {
+            scale_expr
+        } else {
+            format!("{}{}", source_crop.trim_start_matches(','), scale_expr)
+        };
         // 圆角：用 alphaextract + geq 做四角圆切（简化版，radius 像素）
         if let Some(t) = tf {
             if t.corner_radius > 0 {
@@ -800,11 +811,16 @@ async fn render_single_clip_for_segment(
     seg_index: usize,
     preview: bool,
 ) -> anyhow::Result<PathBuf> {
-    let source = project
+    let source = match project
         .media
         .iter()
-        .find(|m| Some(&m.id) == clip.source_id.as_ref())
-        .ok_or_else(|| anyhow::anyhow!("片段引用的素材不存在"))?;
+        .find(|m| Some(&m.id) == clip.source_id.as_ref()) {
+        Some(s) => s,
+        None => {
+            // 未绑定素材 → 渲染纯黑段（避免崩溃）
+            return render_black_segment(segment_dir, project, seg_duration, seg_index, preview).await;
+        }
+    };
     let local_path = ensure_media_local(cache_dir, source).await?;
     let (width, height) = dimensions_for_ratio(&project.ratio, preview);
     let scale_filter = format!(
@@ -962,7 +978,10 @@ async fn burn_subtitle_and_mix_audio(
         ));
         match merge_audio_clips(cache_dir, &merged, &audio_clips, project, &project.media).await {
             Ok(p) => Some(p),
-            Err(_) => None,
+            Err(e) => {
+                eprintln!("音频混音失败，导出将无音轨：{e}");
+                None
+            }
         }
     } else {
         None
@@ -1023,10 +1042,42 @@ async fn burn_subtitle_and_mix_audio(
 
     let output = Command::new("ffmpeg").args(&args).output().await?;
     if !output.status.success() {
-        // 烧录失败时回退到无字幕版本（保证至少能导出）
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        eprintln!("字幕烧录/混音失败，回退到无字幕版本：{stderr}");
-        tokio::fs::copy(video_input, &output_path).await?;
+        // 字幕/混音失败时尝试无字幕版本（去掉 subtitles 滤镜重试一次）
+        eprintln!("字幕烧录/混音失败，尝试无字幕重试：{stderr}");
+        // 重新构造命令：去掉 subtitles 滤镜
+        let mut retry_args: Vec<String> = vec!["-y".to_string(), "-i".to_string(), video_input.to_string_lossy().to_string()];
+        if merged_audio_path.is_some() {
+            retry_args.push("-i".to_string());
+            retry_args.push(merged_audio_path.as_ref().unwrap().to_string_lossy().to_string());
+        }
+        retry_args.push("-map".to_string());
+        retry_args.push("0:v".to_string());
+        if merged_audio_path.is_some() {
+            retry_args.push("-map".to_string());
+            retry_args.push("1:a".to_string());
+        }
+        retry_args.push("-c:v".to_string());
+        retry_args.push("libx264".to_string());
+        retry_args.push("-preset".to_string());
+        retry_args.push(if preview { "ultrafast" } else { "veryfast" }.to_string());
+        retry_args.push("-crf".to_string());
+        retry_args.push(if preview { "30" } else { "23" }.to_string());
+        if merged_audio_path.is_some() {
+            retry_args.push("-c:a".to_string());
+            retry_args.push("aac".to_string());
+        } else {
+            retry_args.push("-an".to_string());
+        }
+        retry_args.push("-movflags".to_string());
+        retry_args.push("+faststart".to_string());
+        retry_args.push(output_path.to_string_lossy().to_string());
+        let retry_output = Command::new("ffmpeg").args(&retry_args).output().await?;
+        if !retry_output.status.success() {
+            // 最终回退：无字幕无混音的裸拷贝
+            eprintln!("无字幕重试也失败，输出裸视频：{}", String::from_utf8_lossy(&retry_output.stderr).trim());
+            tokio::fs::copy(video_input, &output_path).await?;
+        }
     }
     Ok(output_path)
 }
@@ -1036,17 +1087,16 @@ fn generate_ass_subtitles(subtitle_clips: &[&Clip], project: &Project) -> String
     let (width, height) = export_dimensions_for_project(project);
     let default_style = crate::models::SubtitleStyle::default();
 
+    // margin: 帧宽的 7%（剪映式像素宽度换行，不贴边）
+    let margin_lr = (width as f64 * 0.07).round() as i32;
+
     // 收集所有不同的样式（按 font+size+color+stroke+position 分组），生成多个 Style 行
-    // 没有自定义样式的 clip 用 "Default"
     let mut style_names: Vec<(String, &crate::models::SubtitleStyle)> = Vec::new();
     style_names.push(("Default".to_string(), &default_style));
 
-    let mut style_header = String::new();
     let mut style_counter = 0u32;
-
     for clip in subtitle_clips {
         if let Some(ref s) = clip.subtitle_style {
-            // 检查是否已有相同样式
             let exists = style_names.iter().any(|(_, existing)| {
                 existing.font_family == s.font_family
                     && existing.font_size == s.font_size
@@ -1062,37 +1112,52 @@ fn generate_ass_subtitles(subtitle_clips: &[&Clip], project: &Project) -> String
         }
     }
 
-    // 生成 Style 行
+    // 生成 Style 行（加宽 margin + 描边 4px 提升可读性）
     let mut styles_str = String::new();
     for (name, style) in &style_names {
-        let primary = hex_to_ass_color(&style.color);
+        // 逐字高亮（karaoke）：PrimaryColour=高亮色（已播过），SecondaryColour=文字色（未播）
+        // ASS \kf：颜色从 Secondary 渐变到 Primary
+        let (primary, secondary) = if style.karaoke {
+            let hi = hex_to_ass_color(&style.highlight_color);
+            let base = hex_to_ass_color(&style.color);
+            (hi, base)
+        } else {
+            let c = hex_to_ass_color(&style.color);
+            (c.clone(), c)
+        };
         let outline = hex_to_ass_color(&style.stroke_color);
         let alignment = match style.position.as_str() {
             "top" => 8,
             "center" => 5,
             _ => 2,
         };
-        let margin_v = if style.position == "center" { height as i32 / 2 } else { 60 };
+        let margin_v = if style.position == "center" { height as i32 / 2 } else { (height as f64 * 0.06).round() as i32 };
         styles_str.push_str(&format!(
-            "Style: {name},{font},{size},{primary},{primary},{outline},&H80000000,0,0,0,0,{sx},{sy},0,{rot},1,3,0,{align},20,20,{mv},1\n",
+            "Style: {name},{font},{size},{primary},{secondary},{outline},&H80000000,0,0,0,0,{sx},{sy},0,{rot},1,4,1,{align},{mlr},{mlr},{mv},1\n",
             name = name,
             font = style.font_family,
             size = style.font_size,
             primary = primary,
+            secondary = secondary,
             outline = outline,
             sx = style.scale_x,
             sy = style.scale_y,
             rot = style.rotation,
             align = alignment,
+            mlr = margin_lr,
             mv = margin_v,
         ));
     }
 
+    // ASS header: WrapStyle 2 = 不自动换行（我们用 \N 控制），
+    // 但实际我们让 libass 按像素宽度自动换行（WrapStyle 0 智能换行 + UAX#14 CJK 支持）
     let mut ass = format!(
         "[Script Info]\n\
          ScriptType: v4.00+\n\
          PlayResX: {}\n\
          PlayResY: {}\n\
+         WrapStyle: 0\n\
+         ScaledBorderAndShadow: yes\n\
          \n\
          [V4+ Styles]\n\
          Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
@@ -1111,9 +1176,7 @@ fn generate_ass_subtitles(subtitle_clips: &[&Clip], project: &Project) -> String
         }
         let start = seconds_to_ass_time(clip.start_on_track);
         let end = seconds_to_ass_time(clip.start_on_track + clip.duration);
-        let escaped = text.replace('\n', "\\N").replace('{', "\\{").replace('}', "\\}");
 
-        // 找到该 clip 对应的 Style 名
         let style_name = if let Some(ref s) = clip.subtitle_style {
             style_names.iter()
                 .find(|(_, existing)| {
@@ -1129,9 +1192,74 @@ fn generate_ass_subtitles(subtitle_clips: &[&Clip], project: &Project) -> String
             "Default".to_string()
         };
 
+        // 逐字高亮（卡拉OK \kf）：当 clip 有 words 且样式启用 karaoke 时
+        let karaoke_enabled = clip
+            .subtitle_style
+            .as_ref()
+            .map(|s| s.karaoke)
+            .unwrap_or(true); // 默认 SubtitleStyle::default().karaoke = true
+        let escaped = if karaoke_enabled {
+            if let Some(words) = clip.words.as_ref() {
+                if !words.is_empty() {
+                    build_karaoke_text(words, clip.start_on_track, clip.duration)
+                } else {
+                    text.replace('{', "\\{").replace('}', "\\}").replace('\n', "\\N")
+                }
+            } else {
+                text.replace('{', "\\{").replace('}', "\\}").replace('\n', "\\N")
+            }
+        } else {
+            text.replace('{', "\\{").replace('}', "\\}").replace('\n', "\\N")
+        };
+
         ass.push_str(&format!("Dialogue: 0,{start},{end},{style_name},,0,0,0,,{escaped}\n"));
     }
     ass
+}
+
+/// 构建逐字高亮 ASS 文本：每个词/字用 {\kfNN} 标签包裹。
+/// NN = 该词的持续时间（厘秒，1/100 秒）。
+/// word 时间是相对音频整体的，需要减去字幕块的起始偏移，得到相对字幕块显示的时间。
+/// 同时把所有词的持续时间按比例缩放到字幕块的实际 duration，保证 \kf 总时长 == 字幕块时长。
+fn build_karaoke_text(
+    words: &[crate::models::WordCue],
+    clip_start_on_track: f64,
+    clip_duration: f64,
+) -> String {
+    if words.is_empty() {
+        return String::new();
+    }
+    // 原始词级总时长（最后一个词的 end - 第一个词的 start）
+    let words_start = words.first().map(|w| w.start).unwrap_or(0.0);
+    let words_end = words.last().map(|w| w.end).unwrap_or(0.0);
+    let words_total = (words_end - words_start).max(0.001);
+
+    // 缩放因子：让词级总时长贴合字幕块 duration
+    // （字幕块 duration 可能因最小时长规则被拉长，按比例分配）
+    let scale = (clip_duration / words_total).max(0.01);
+
+    let mut out = String::new();
+    for (i, w) in words.iter().enumerate() {
+        // 英文单词间加空格（放在 \kf 标签外，不占高亮时间）
+        if i > 0 {
+            let prev_last = words[i - 1].text.chars().last();
+            let this_first = w.text.chars().next();
+            let need_space = matches!((prev_last, this_first),
+                (Some(a), Some(b)) if a.is_ascii_alphanumeric() && b.is_ascii_alphanumeric());
+            if need_space {
+                out.push(' ');
+            }
+        }
+        // 每个词相对字幕块开始的偏移时长（秒）→ 厘秒
+        let word_dur = ((w.end - w.start) * scale).max(0.01);
+        let cs = (word_dur * 100.0).round().clamp(1.0, 8600.0) as u32; // ASS \kf 上限约 86s
+        // 转义花括号（词文本一般不含，但保险）
+        let escaped = w.text.replace('\\', "\\\\").replace('{', "\\{").replace('}', "\\}");
+        out.push_str(&format!("{{\\kf{cs}}}{escaped}"));
+    }
+    // 触发 ASS 重绘对齐：开头的 \kf 从字幕块 0 时刻开始
+    let _ = clip_start_on_track; // 词时间已是相对音频，与 start_on_track 解耦
+    out
 }
 
 /// #RRGGBB → .ass 颜色 &H00BBGGRR
@@ -1228,11 +1356,22 @@ async fn merge_audio_clips(
     // 构造 filter：每个输入加 adelay（按 startOnTrack 偏移）+ afade（淡入淡出），然后 amix
     let mut filter = String::new();
     let n = segment_paths.len();
+    // 默认最小淡入淡出 30ms（消除 clip 首尾波形硬切导致的爆音，借鉴 video-use 的切点交叉淡入淡出）
+    const DEFAULT_FADE: f64 = 0.03;
     for (i, clip) in audio_clips.iter().enumerate().take(n) {
         let delay_ms = (clip.start_on_track * 1000.0).round() as u64;
         let dur = clip.duration;
-        let fade_in = clip.fade_in.max(0.0).min(dur / 2.0);
-        let fade_out = clip.fade_out.max(0.0).min(dur / 2.0);
+        // 用户没设 fade 时给 30ms 默认值（足够消除爆音，听感上无感知）
+        let fade_in = if clip.fade_in > 0.001 {
+            clip.fade_in.min(dur / 2.0)
+        } else {
+            DEFAULT_FADE.min(dur / 2.0)
+        };
+        let fade_out = if clip.fade_out > 0.001 {
+            clip.fade_out.min(dur / 2.0)
+        } else {
+            DEFAULT_FADE.min(dur / 2.0)
+        };
         let fade_out_start = (dur - fade_out).max(0.0);
         let vol = clip.volume.max(0.0); // 线性增益，0=静音
         // adelay + volume(clip音量) + afade 淡入淡出

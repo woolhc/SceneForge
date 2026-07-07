@@ -47,12 +47,15 @@ import type {
   VoiceProfile,
 } from "./types";
 import { DEFAULT_SUBTITLE_STYLE, DEFAULT_TRANSFORM, DEFAULT_CROP } from "./types";
+import type { AiSegment } from "./types";
 import { FONT_OPTIONS } from "./fonts";
 import { SubtitleOverlay } from "./preview/SubtitleOverlay";
 import { Panel, Group as PanelGroup, Separator as PanelResizeHandle } from "react-resizable-panels";
 import { ContextMenu, type ContextMenuState } from "./timeline/ContextMenu";
 import { ExportDialog, type ExportState } from "./panels/ExportDialog";
 import { HomeScreen } from "./panels/HomeScreen";
+import { GenerateWizard, type PipelineState } from "./panels/GenerateWizard";
+import { EdlPreview } from "./panels/EdlPreview";
 import { FilterRenderer } from "./preview/FilterRenderer";
 import { LUT_FILTERS, getLutData } from "./luts";
 import { usePreviewEngine } from "./preview/usePreviewEngine";
@@ -108,9 +111,13 @@ function newClipId() {
  * 把 AI 文案片段编排成轨道初始结构。
  * 每个 AiSegment → 视频clip（占位）+ 字幕clip + 配音clip，三者 startOnTrack 对齐。
  * 轨道 ID 按实际项目的 tracks 按 kind 动态查找（支持多轨道，取第一个匹配的）。
+ *
+ * 时间来源：
+ * - 音频模式：seg.start/end 由 whisper 提供（真实音频时间），直接用
+ * - 文案模式：seg.start/end 为 0，用 estimatedDuration 累加（cursor）
  */
 function arrangeSegmentsToClips(
-  segments: { text: string; visualQuery: string; estimatedDuration: number }[],
+  segments: { text: string; visualQuery: string; estimatedDuration: number; start?: number; end?: number }[],
   tracks: { id: string; kind: string }[],
 ): Clip[] {
   const videoTrackId = tracks.find((t) => t.kind === "video")?.id;
@@ -118,8 +125,10 @@ function arrangeSegmentsToClips(
   const clips: Clip[] = [];
   let cursor = 0;
   for (const seg of segments) {
-    const duration = seg.estimatedDuration;
-    const start = cursor;
+    // 音频模式：用 whisper 真实时间；文案模式：累加 estimatedDuration
+    const hasRealTime = (seg.start ?? 0) !== 0 || (seg.end ?? 0) !== 0;
+    const start = hasRealTime ? (seg.start ?? cursor) : cursor;
+    const duration = hasRealTime ? ((seg.end ?? 0) - (seg.start ?? 0)) : seg.estimatedDuration;
     // 视频轨（占位，sourceId 暂空，等用户绑定素材）
     if (videoTrackId) {
       clips.push({
@@ -165,7 +174,8 @@ function arrangeSegmentsToClips(
         transitionOut: null,
       });
     }
-    cursor += duration;
+    // 文案模式：累加 cursor；音频模式：cursor 跟随真实 end
+    cursor = hasRealTime ? (seg.end ?? (cursor + duration)) : cursor + duration;
   }
   return clips;
 }
@@ -227,6 +237,11 @@ export function App() {
   // 预览窗口缩放
   const [previewZoom, setPreviewZoom] = useState(100); // 百分比，100=适配
   const [view, setView] = useState<"home" | "editor">("home");
+  const [showGenerate, setShowGenerate] = useState(false);
+  const [pipeline, setPipeline] = useState<PipelineState>({ active: false, steps: [], error: null });
+  // EDL 预览（AI 分段后先让用户确认/编辑，再执行编排）
+  const [edlSegments, setEdlSegments] = useState<AiSegment[] | null>(null);
+  const [edlBusy, setEdlBusy] = useState(false);
   const previewViewportRef = useRef<HTMLDivElement | null>(null);
   const [exportMessage, setExportMessage] = useState("");
 
@@ -780,7 +795,92 @@ export function App() {
     }
   }
 
-  async function handleSegmentScript() {
+  /**
+   * 一键生成流水线：
+   * 模式 2（文案）：文案 → AI分段+配素材 → TTS配音 → 字幕识别
+   * 模式 1（音频）：whisper 句级识别 → AI 配关键词（保留真实时间）→ (已有音频) → 字幕识别
+   */
+  async function handleGeneratePipeline(input: {
+    script: string;
+    ratio: string;
+    voiceId: string;
+    translate: boolean;
+    audioPath?: string | null;
+  }) {
+    const isAudioMode = !!input.audioPath;
+    const steps = [
+      { label: "创建项目", status: "pending" as const },
+      { label: isAudioMode ? "识别音频 + 匹配素材" : "AI 分段 + 匹配素材", status: "pending" as const },
+      { label: input.voiceId ? "生成配音" : "准备音频", status: "pending" as const },
+      { label: "识别字幕", status: "pending" as const },
+      { label: "完成", status: "pending" as const },
+    ];
+
+    const updateStep = (idx: number, status: "running" | "done" | "error") => {
+      setPipeline((prev) => ({
+        ...prev,
+        steps: prev.steps.map((s, i) => (i === idx ? { ...s, status } : s)),
+        currentStep: idx,
+      }));
+    };
+
+    setPipeline({ active: true, steps, error: null });
+
+    try {
+      // Step 1: 创建项目 + 设置文案
+      updateStep(0, "running");
+      const proj = await desktopApi.createProject({ title: "一键生成", ratio: input.ratio });
+      const withScript = { ...proj, script: input.script };
+      await desktopApi.saveProject(withScript);
+      setProject(withScript);
+      setSelectedClipId(null);
+      setView("editor");
+      updateStep(0, "done");
+
+      // Step 2: 分段 + 绑素材
+      updateStep(1, "running");
+      await new Promise((r) => setTimeout(r, 200));
+      if (isAudioMode && input.audioPath) {
+        // 音频模式：whisper 句级识别（真实时间）→ AI 配关键词 → 编排（保留真实时间）
+        await handleAudioSegmentPipeline(input.audioPath, input.ratio);
+      } else {
+        // 文案模式：AI 分段（估算时长）→ 编排
+        await handleSegmentScript({ skipEdl: true });
+      }
+      updateStep(1, "done");
+
+      // Step 3: 生成配音 或 跳过（音频模式已有原始音频）
+      updateStep(2, "running");
+      if (input.voiceId) {
+        setSelectedVoiceId(input.voiceId);
+        await new Promise((r) => setTimeout(r, 200));
+        await handleGenerateProjectAudio();
+      }
+      updateStep(2, "done");
+
+      // Step 4: 识别字幕
+      updateStep(3, "running");
+      await new Promise((r) => setTimeout(r, 300));
+      await handleRecognizeSubtitles(input.translate);
+      updateStep(3, "done");
+
+      // Step 5: 完成
+      updateStep(4, "done");
+      setStatus("一键生成完成！请在编辑器中检查并导出");
+      setTimeout(() => {
+        setPipeline({ active: false, steps: [], error: null });
+        setShowGenerate(false);
+      }, 1500);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      const currentIdx = pipeline.steps.findIndex((s) => s.status === "running");
+      if (currentIdx >= 0) updateStep(currentIdx, "error");
+      setPipeline((prev) => ({ ...prev, error: msg }));
+      setStatus(`生成失败：${msg}`);
+    }
+  }
+
+  async function handleSegmentScript(opts?: { skipEdl?: boolean }) {
     if (!project) return;
     const script = project.script.trim();
     if (!script) {
@@ -794,26 +894,136 @@ export function App() {
         script,
         ratio: project.ratio,
       });
+      if (opts?.skipEdl) {
+        // 一键生成场景：跳过预览，直接执行
+        await applyEdlSegments(result.segments);
+      } else {
+        // 先展示 EDL 预览面板，让用户确认/编辑后再执行编排
+        setEdlSegments(result.segments);
+        setStatus(`AI 分段完成：${result.rawSegmentCount} 段，请确认分镜方案`);
+      }
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /**
+   * 音频模式分镜流水线（由 handleGeneratePipeline 调用）：
+   * 1. whisper 句级识别 → 拿到带真实时间戳的句子
+   * 2. DeepSeek 富化（配画面关键词/情绪，不改时间数量顺序）
+   * 3. 编排成轨道 clip（用真实 start/end，不用估算时长累加）
+   * 4. 把原始音频导入到配音轨（作为整条配音）
+   * 5. 自动绑素材
+   */
+  async function handleAudioSegmentPipeline(audioPath: string, ratio: string) {
+    if (!project) return;
+    setStatus("正在用 whisper 识别音频（句子级时间戳）...");
+    // Step 1: whisper 句级识别
+    const result = await desktopApi.transcribeToSentences(audioPath);
+    setStatus(`音频识别完成：${result.sentences.length} 句，共 ${result.totalDuration.toFixed(1)}s`);
+
+    // Step 2: AI 富化（配关键词，保留真实时间）
+    setStatus("正在用 AI 为每句配画面关键词...");
+    const segments = await desktopApi.enrichSegments({
+      sentences: result.sentences,
+      ratio,
+    });
+
+    // Step 3: 编排成轨道 clip（arrangeSegmentsToClips 会用 seg.start/end 真实时间）
+    const clips = arrangeSegmentsToClips(segments, project.tracks);
+
+    // Step 4: 把原始音频导入素材库 + 作为整条配音放到配音轨
+    // 音频模式下配音就是这一条完整音频，不需要按句子分段（分段会重叠）
+    const audioSource = await desktopApi.importMedia(audioPath);
+    const voiceoverTrackId = project.tracks.find((t) => t.kind === "voiceover")?.id;
+    // 去掉 arrangeSegmentsToClips 创建的分段配音 clip
+    let finalClips = voiceoverTrackId
+      ? clips.filter((c) => c.trackId !== voiceoverTrackId)
+      : clips;
+    if (voiceoverTrackId) {
+      // 只放一个完整音频 clip（从 0 到音频总时长）
+      finalClips.push({
+        id: newClipId(),
+        trackId: voiceoverTrackId,
+        sourceId: audioSource.id,
+        startOnTrack: 0,
+        duration: result.totalDuration,
+        sourceIn: 0,
+        sourceOut: result.totalDuration,
+        speed: 1,
+        volume: 1,
+        fadeIn: 0,
+        fadeOut: 0,
+        brightness: 0,
+        contrast: 0,
+        saturation: 0,
+        text: undefined,
+        transitionIn: null,
+        transitionOut: null,
+      });
+    }
+
+    const nextProject: Project = {
+      ...project,
+      clips: finalClips,
+      media: project.media.some((m) => m.id === audioSource.id)
+        ? project.media
+        : [...project.media, audioSource],
+      // 音频模式：把识别出的完整文案也存到 script（供字幕识别复用）
+      script: result.fullText || project.script,
+    };
+    const saved = await desktopApi.saveProject(nextProject);
+    setProject(saved);
+    setSelectedClipId(saved.clips[0]?.id || null);
+    await refreshProjects(saved.id);
+
+    // Step 5: 为视频 clip 绑素材
+    const videoTrackIds = saved.tracks.filter((t) => t.kind === "video").map((t) => t.id);
+    const videoClips = saved.clips.filter((c) => videoTrackIds.includes(c.trackId));
+    let boundCount = 0;
+    for (const clip of videoClips) {
+      const segPeer = segments.find((s) => Math.abs((s.start ?? -1) - clip.startOnTrack) < 0.5);
+      const query =
+        clip.visualQuery ||
+        segPeer?.visualQuery ||
+        segPeer?.text?.slice(0, 24) ||
+        "nature landscape";
+      const ok = await searchAndBindAsset(saved.id, clip.id, query);
+      if (ok) boundCount += 1;
+      setStatus(`正在匹配素材：${boundCount}/${videoClips.length}`);
+    }
+    setStatus(`音频分镜完成：${segments.length} 句，已匹配 ${boundCount}/${videoClips.length} 段素材`);
+  }
+
+  /**
+   * 执行 EDL：把用户确认/编辑后的 segments 编排成轨道 clip + 自动绑素材。
+   * 由 EdlPreview 面板的"执行"按钮触发。
+   */
+  async function applyEdlSegments(segments: AiSegment[]) {
+    if (!project) return;
+    setEdlBusy(true);
+    setStatus("正在编排轨道并匹配素材...");
+    try {
       // 编排成轨道 clips（按实际项目的 tracks 动态匹配轨道 ID）
-      const clips = arrangeSegmentsToClips(result.segments, project.tracks);
+      const clips = arrangeSegmentsToClips(segments, project.tracks);
       const nextProject: Project = {
         ...project,
         clips,
-        media: project.media, // 保留已有素材库
+        media: project.media,
       };
       const saved = await desktopApi.saveProject(nextProject);
       setProject(saved);
       setSelectedClipId(saved.clips[0]?.id || null);
       await refreshProjects(saved.id);
+
       // 串行为每个视频 clip 搜素材并绑定（用 clip 自带的 visualQuery）
       const videoTrackIds = saved.tracks.filter((t) => t.kind === "video").map((t) => t.id);
       const videoClips = saved.clips.filter((c) => videoTrackIds.includes(c.trackId));
       let boundCount = 0;
       for (const clip of videoClips) {
-        // video clip 在编排时已存入 visualQuery；同时按 startOnTrack 找对应文案段兜底
-        const segPeer = result.segments.find(
-          (_, idx) => idx === videoClips.indexOf(clip),
-        );
+        const segPeer = segments.find((_, idx) => idx === videoClips.indexOf(clip));
         const query =
           clip.visualQuery ||
           segPeer?.visualQuery ||
@@ -821,13 +1031,14 @@ export function App() {
           "nature landscape";
         const ok = await searchAndBindAsset(saved.id, clip.id, query);
         if (ok) boundCount += 1;
-        setStatus(`AI 分段完成，正在匹配素材：${boundCount}/${videoClips.length}`);
+        setStatus(`正在匹配素材：${boundCount}/${videoClips.length}`);
       }
-      setStatus(`AI 分段完成：${result.rawSegmentCount} 段，已匹配 ${boundCount}/${videoClips.length} 段素材`);
+      setStatus(`分镜方案已执行：${segments.length} 段，已匹配 ${boundCount}/${videoClips.length} 段素材`);
+      setEdlSegments(null); // 关闭预览面板
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
-      setBusy(null);
+      setEdlBusy(false);
     }
   }
 
@@ -1516,6 +1727,7 @@ export function App() {
           await handleCreateProject();
           setView("editor");
         }}
+        onGenerate={() => setShowGenerate(true)}
         onRename={async (id, name) => {
           const p = await desktopApi.getProject(id);
           await desktopApi.saveProject({ ...p, title: name });
@@ -1544,6 +1756,14 @@ export function App() {
   return (
     <div className="app-shell">
       <header className="topbar">
+        <button
+          className="home-back-btn"
+          onClick={() => { void refreshProjects(); setView("home"); }}
+          title="返回首页"
+        >
+          <ChevronLeft size={16} />
+          <span>首页</span>
+        </button>
         <div className="brand" onClick={() => { void refreshProjects(); setView("home"); }} style={{ cursor: "pointer" }} title="返回首页">
           <div className="brand-mark">
             <Clapperboard size={18} />
@@ -1867,6 +2087,7 @@ export function App() {
                     clip={selectedClip}
                     targetRef={stageRef}
                     isSelected
+                    currentTime={playhead}
                     onMove={(x, y) => {
                       const cur = selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE };
                       updateSelectedClip({ subtitleStyle: { ...cur, position: "custom", x, y } });
@@ -1887,11 +2108,16 @@ export function App() {
               // 未选中：引擎实时字幕（纯渲染，无控制点）
               const subText = engineState.activeSubtitle;
               const subStyle = engineState.activeSubtitleStyle;
+              const subClip = engineState.activeSubtitleClip;
               if (!subText || !subText.trim()) return null;
               const s = subStyle;
               const isCustom = s?.position === "custom";
               const posX = isCustom ? (s?.x ?? 50) : 50;
               const posY = isCustom ? (s?.y ?? 80) : (s?.position === "top" ? 12 : s?.position === "center" ? 50 : 88);
+              // 逐字高亮：subClip 有 words 且 style.karaoke
+              const baseColor = s?.color ?? "#FFFFFF";
+              const highlightColor = s?.highlightColor ?? "#FFD700";
+              const karaokeOn = (s?.karaoke ?? true) && (subClip?.words?.length ?? 0) > 0;
               return (
                 <div
                   className="subtitle-overlay-text"
@@ -1905,7 +2131,7 @@ export function App() {
                     fontSize: `${Math.max(12, (s?.fontSize ?? 48) * 0.35)}px`,
                     fontWeight: 700,
                     lineHeight: 1.4,
-                    color: s?.color,
+                    color: baseColor,
                     textShadow: `1px 1px 0 ${s?.strokeColor ?? "#000"}, -1px -1px 0 ${s?.strokeColor ?? "#000"}, 1px -1px 0 ${s?.strokeColor ?? "#000"}, -1px 1px 0 ${s?.strokeColor ?? "#000"}`,
                     padding: "4px 10px",
                     textAlign: "center",
@@ -1915,7 +2141,22 @@ export function App() {
                     pointerEvents: "none",
                   }}
                 >
-                  {subText}
+                  {karaokeOn && subClip?.words
+                    ? subClip.words.map((w, i, arr) => {
+                        const prev = arr[i - 1];
+                        const needSpace =
+                          i > 0 &&
+                          prev &&
+                          /[A-Za-z0-9]$/.test(prev.text) &&
+                          /^[A-Za-z0-9]/.test(w.text);
+                        return (
+                          <span key={i} style={{ color: playhead >= w.start ? highlightColor : baseColor }}>
+                            {needSpace ? " " : ""}
+                            {w.text}
+                          </span>
+                        );
+                      })
+                    : subText}
                 </div>
               );
             })()}
@@ -2064,6 +2305,30 @@ export function App() {
                       <option value="custom">自定义（拖动）</option>
                     </select>
                   </label>
+                  {/* 逐字高亮（卡拉OK）：仅当字幕有词级时间戳时生效 */}
+                  <label className="style-field" style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                    <input
+                      type="checkbox"
+                      checked={(selectedClip.subtitleStyle?.karaoke ?? true) && !!(selectedClip.words?.length)}
+                      disabled={!selectedClip.words?.length}
+                      onChange={(event) => updateSelectedClip({
+                        subtitleStyle: { ...selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE }, karaoke: event.target.checked },
+                      })}
+                    />
+                    <span>逐字高亮{selectedClip.words?.length ? "" : "（需先识别字幕）"}</span>
+                  </label>
+                  {(selectedClip.subtitleStyle?.karaoke ?? true) && selectedClip.words?.length ? (
+                    <label className="style-field">
+                      高亮色
+                      <input
+                        type="color"
+                        value={selectedClip.subtitleStyle?.highlightColor || "#FFD700"}
+                        onChange={(event) => updateSelectedClip({
+                          subtitleStyle: { ...selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE }, highlightColor: event.target.value },
+                        })}
+                      />
+                    </label>
+                  ) : null}
                 </div>
               )}
 
@@ -2712,6 +2977,28 @@ export function App() {
       )}
 
       {/* 导出弹窗 */}
+      {/* 一键生成向导 */}
+      <GenerateWizard
+        open={showGenerate}
+        onClose={() => { setShowGenerate(false); setPipeline({ active: false, steps: [], error: null }); }}
+        voiceProfiles={voiceProfiles}
+        hasDeepSeekKey={!!settings.deepseekApiKey}
+        hasPexelsKey={!!settings.pexelsApiKey}
+        pipeline={pipeline}
+        onStart={(input) => handleGeneratePipeline(input)}
+      />
+
+      {/* EDL 预览：AI 分段后先让用户确认/编辑，再执行编排 */}
+      {edlSegments && (
+        <EdlPreview
+          segments={edlSegments}
+          totalDuration={edlSegments.reduce((s, x) => s + x.estimatedDuration, 0)}
+          busy={edlBusy}
+          onConfirm={(segs) => applyEdlSegments(segs)}
+          onCancel={() => { if (!edlBusy) setEdlSegments(null); }}
+        />
+      )}
+
       <ExportDialog
         open={showExport}
         onClose={() => setShowExport(false)}

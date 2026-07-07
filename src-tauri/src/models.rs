@@ -59,11 +59,21 @@ fn default_whisper_model() -> String {
         // Windows 无默认安装路径，留空让用户填
         String::new()
     } else if cfg!(target_os = "macos") {
-        "/opt/homebrew/share/whisper-cpp/ggml-large-v3.bin".to_string()
+        // 默认用 medium-q5_0 量化模型（514MB，中文质量优秀，比 large-v3 小 6 倍）
+        "/opt/homebrew/share/whisper-cpp/ggml-medium-q5_0.bin".to_string()
     } else {
         // Linux
-        "/usr/local/share/whisper-cpp/ggml-large-v3.bin".to_string()
+        "/usr/local/share/whisper-cpp/ggml-medium-q5_0.bin".to_string()
     }
+}
+
+/// 单个词/字符的时间戳（用于逐字高亮卡拉OK字幕）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WordCue {
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
 }
 
 /// ASR 识别结果（带时间戳的字幕片段，整理前/后的中间结构）
@@ -73,6 +83,9 @@ pub struct SubtitleCue {
     pub start: f64,
     pub end: f64,
     pub text: String,
+    /// 逐词/逐字时间戳（whisper -ml 1 模式下产出，可能为空）
+    #[serde(default)]
+    pub words: Vec<WordCue>,
 }
 
 impl Default for AppSettings {
@@ -277,6 +290,12 @@ pub struct SubtitleStyle {
     /// 旋转角度（度）
     #[serde(default)]
     pub rotation: f64,
+    /// 是否启用逐字高亮（卡拉OK效果）
+    #[serde(default = "default_true")]
+    pub karaoke: bool,
+    /// 逐字高亮颜色（默认金色）
+    #[serde(default = "default_karaoke_color")]
+    pub highlight_color: String,
 }
 
 impl Default for SubtitleStyle {
@@ -292,6 +311,8 @@ impl Default for SubtitleStyle {
             scale_x: default_subtitle_scale(),
             scale_y: default_subtitle_scale(),
             rotation: 0.0,
+            karaoke: default_true(),
+            highlight_color: default_karaoke_color(),
         }
     }
 }
@@ -319,6 +340,12 @@ fn default_subtitle_y_bottom() -> f64 {
 }
 fn default_subtitle_scale() -> f64 {
     100.0
+}
+fn default_true() -> bool {
+    true
+}
+fn default_karaoke_color() -> String {
+    "#FFD700".to_string() // 金色高亮
 }
 
 /// 画面变换 —— 视频 clip 用（画中画位置/缩放/不透明度/圆角/混合模式）
@@ -428,6 +455,9 @@ pub struct Clip {
     /// 字幕样式 —— 字幕 clip 用
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitle_style: Option<SubtitleStyle>,
+    /// 字幕逐词时间戳 —— 字幕 clip 用（用于逐字高亮；None 表示无词级数据）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub words: Option<Vec<WordCue>>,
     /// 入场转场：None | "fade" | "slide" 等
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transition_in: Option<String>,
@@ -605,8 +635,24 @@ pub struct AiSegment {
     pub title: String,
     pub text: String,
     pub visual_query: String,
+    /// 中文画面关键词（展示用，方便用户理解 visual_query 的含义）
+    #[serde(default)]
+    pub visual_query_zh: String,
     pub mood: String,
     pub estimated_duration: f64,
+    /// 素材策略建议："auto_search"（自动搜 Pexels）| "manual"（手动选）| "color_card"（纯色卡）
+    #[serde(default = "default_material_strategy")]
+    pub material_strategy: String,
+    /// 真实起始时间（秒）。音频模式下由 whisper 提供，文案模式为 0（用 estimatedDuration 累加）
+    #[serde(default)]
+    pub start: f64,
+    /// 真实结束时间（秒）。音频模式下由 whisper 提供
+    #[serde(default)]
+    pub end: f64,
+}
+
+fn default_material_strategy() -> String {
+    "auto_search".to_string()
 }
 
 /// AI 分段结果 —— 现在直接产出轨道初始编排
@@ -616,6 +662,33 @@ pub struct SegmentScriptResult {
     /// 文案片段（用于前端展示 / 编排轨道）
     pub segments: Vec<AiSegment>,
     pub raw_segment_count: usize,
+}
+
+/// 带时间戳的句子（音频模式用：whisper 识别出的句子级片段）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimedSentence {
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+}
+
+/// 音频模式：用 whisper 识别音频，返回句子级（带真实时间戳）的结果。
+/// 时间驱动分镜编排，避免 AI 估算时长与真实音频错位。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimedSentencesResult {
+    pub sentences: Vec<TimedSentence>,
+    pub total_duration: f64,
+    pub full_text: String,
+}
+
+/// AI 富化请求：给已有的带时间句子补充 title/visualQuery/mood/strategy，不改时间。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnrichSegmentsRequest {
+    pub sentences: Vec<TimedSentence>,
+    pub ratio: String,
 }
 
 // ============================================================================

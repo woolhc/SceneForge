@@ -495,6 +495,19 @@ export const desktopApi = {
     call<Project>("separate_vocals", { request }),
   generateSubtitles: (request: { projectId: string; translate: boolean }) =>
     call<Project>("generate_subtitles", { request }),
+  transcribeToText: (audioPath: string) =>
+    call<string>("transcribe_to_text", { audioPath }),
+  /** 音频模式：识别音频返回句子级时间戳（驱动分镜编排） */
+  transcribeToSentences: (audioPath: string) =>
+    call<{ sentences: { start: number; end: number; text: string }[]; totalDuration: number; fullText: string }>(
+      "transcribe_to_sentences",
+      { audioPath },
+    ),
+  /** 音频模式：给 whisper 句子配画面关键词（不改时间/数量/顺序） */
+  enrichSegments: (request: {
+    sentences: { start: number; end: number; text: string }[];
+    ratio: string;
+  }) => call<AiSegment[]>("enrich_segments", { request }),
   renderProject: (request: { projectId: string; preview: boolean; outputPath?: string | null }) =>
     call<RenderResult>("render_project", { request }),
 };
