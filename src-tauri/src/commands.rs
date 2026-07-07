@@ -554,6 +554,7 @@ pub async fn detach_audio(
         source_in: clip.source_in,
         source_out: clip.source_out,
         speed: clip.speed,
+        speed_curve: None,
         volume: 1.0,
         fade_in: clip.fade_in,
         fade_out: clip.fade_out,
@@ -570,6 +571,7 @@ pub async fn detach_audio(
         crop: None,
         transition_out: None,
         keyframes: None,
+        mask: None,
     };
     project.clips.push(audio_clip);
 
@@ -662,10 +664,11 @@ pub async fn separate_vocals(
             source_in: clip.source_in,
             source_out: clip.source_out,
             speed: clip.speed,
+            speed_curve: None,
             volume: if name == "人声" { 1.0 } else { 0.5 }, // 伴奏默认半音量
             fade_in: 0.0, fade_out: 0.0,
             filter: None, brightness: 0.0, contrast: 0.0, saturation: 0.0,
-            transform: None, visual_query: None, text: None, subtitle_style: None, words: None, keyframes: None,
+            transform: None, visual_query: None, text: None, subtitle_style: None, words: None, keyframes: None, mask: None,
             transition_in: None,
         crop: None, transition_out: None,
         });
@@ -830,6 +833,7 @@ pub async fn generate_subtitles(
             source_in: 0.0,
             source_out: duration,
             speed: 1.0,
+            speed_curve: None,
             volume: 1.0,
             fade_in: 0.0,
             fade_out: 0.0,
@@ -844,6 +848,7 @@ pub async fn generate_subtitles(
             subtitle_style: None,
             words,
             keyframes: None,
+        mask: None,
             transition_in: None,
             transition_out: None,
         });

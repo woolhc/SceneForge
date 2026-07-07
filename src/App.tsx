@@ -60,6 +60,7 @@ import { FilterRenderer } from "./preview/FilterRenderer";
 import { LUT_FILTERS, getLutData } from "./luts";
 import { usePreviewEngine } from "./preview/usePreviewEngine";
 import { usePlaybackStore } from "./store/playbackStore";
+import { SPEED_PRESETS } from "./editor/speedCurve";
 import { Ruler } from "./timeline/Ruler";
 import { TimelineTrack } from "./timeline/TimelineTrack";
 import { removeClip, splitClipAt } from "./timeline/clipInteraction";
@@ -2747,6 +2748,20 @@ export function App() {
                           value={selectedClip.speed}
                           onChange={(event) => selectedClip && changeClipSpeed(selectedClip, Number(event.target.value))}
                         />
+                        {/* T4.3: 曲线变速预设 */}
+                        <div className="speed-label" style={{ marginTop: 8 }}>曲线变速</div>
+                        <div className="speed-presets">
+                          {Object.entries(SPEED_PRESETS).map(([key, preset]) => (
+                            <button
+                              key={key}
+                              className="speed-preset"
+                              title={preset.label}
+                              onClick={() => updateSelectedClip({ speedCurve: preset.points.length > 0 ? preset.points : null })}
+                            >
+                              {preset.label}
+                            </button>
+                          ))}
+                        </div>
                       </div>
                     </div>
                     </>
@@ -2893,6 +2908,49 @@ export function App() {
                           onChange={(event) => updateOverlayTransform({ cornerRadius: Number(event.target.value) })}
                         />
                       </label>
+                      {/* T4.4: 蒙版 */}
+                      <div className="mask-section">
+                        <span className="kf-label">蒙版</span>
+                        <div className="kf-buttons">
+                          {(["none", "circle", "rect", "linear", "mirror"] as const).map((k) => (
+                            <button
+                              key={k}
+                              className="speed-preset"
+                              onClick={() => {
+                                if (k === "none") {
+                                  updateSelectedClip({ mask: null });
+                                } else {
+                                  const cur = selectedClip.mask ?? { kind: k, cx: 0.5, cy: 0.5, width: 0.8, height: 0.8, rotation: 0, feather: 0.2, invert: false };
+                                  updateSelectedClip({ mask: { ...cur, kind: k } });
+                                }
+                              }}
+                            >
+                              {k === "none" ? "无" : k === "circle" ? "圆形" : k === "rect" ? "矩形" : k === "linear" ? "线性" : "镜面"}
+                            </button>
+                          ))}
+                        </div>
+                        {selectedClip.mask && (
+                          <>
+                            <label className="style-field">
+                              羽化（{Math.round((selectedClip.mask.feather ?? 0.2) * 100)}%）
+                              <input
+                                type="range" min={0} max={1} step={0.05}
+                                value={selectedClip.mask.feather ?? 0.2}
+                                onChange={(e) => updateSelectedClip({ mask: { ...selectedClip.mask!, feather: Number(e.target.value) } }, false)}
+                                onPointerUp={() => commitInteractiveEdit()}
+                              />
+                            </label>
+                            <label className="style-field" style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                              <input
+                                type="checkbox"
+                                checked={selectedClip.mask.invert ?? false}
+                                onChange={(e) => updateSelectedClip({ mask: { ...selectedClip.mask!, invert: e.target.checked } })}
+                              />
+                              <span>反转</span>
+                            </label>
+                          </>
+                        )}
+                      </div>
                     </div>
                   )}
                 </>

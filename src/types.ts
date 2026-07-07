@@ -155,6 +155,29 @@ export type ClipKeyframes = {
   volume?: Keyframe[];
 };
 
+/** T4.3: 曲线变速控制点 */
+export type SpeedPoint = {
+  /** 源素材归一化位置 0-1 */
+  time: number;
+  /** 该点倍速 */
+  speed: number;
+};
+
+/** T4.4: 蒙版 */
+export type ClipMask = {
+  kind: "linear" | "mirror" | "circle" | "rect";
+  /** 中心，0-1 归一化 */
+  cx: number;
+  cy: number;
+  /** 宽高，0-1 */
+  width: number;
+  height: number;
+  rotation: number;
+  /** 羽化 0-1 */
+  feather: number;
+  invert: boolean;
+};
+
 export type Clip = {
   id: string;
   trackId: string;
@@ -169,6 +192,9 @@ export type Clip = {
   /** 源媒体的出点（秒） */
   sourceOut: number;
   speed: number;
+  /** T4.3: 曲线变速控制点。time 为源素材归一化位置 0-1，speed 为该点倍速。
+   *  为空/undefined 时用常量 speed。预设曲线（蒙太奇/英雄时刻/子弹时间）存为常量模板。 */
+  speedCurve?: SpeedPoint[] | null;
   volume: number;
   /** 音频淡入时长（秒） */
   fadeIn: number;
@@ -186,6 +212,8 @@ export type Clip = {
   transform?: ClipTransform | null;
   /** T4.2: 关键帧动画（位置/缩放/不透明度/旋转/音量） */
   keyframes?: ClipKeyframes | null;
+  /** T4.4: 蒙版 */
+  mask?: ClipMask | null;
   /** 画面搜索词（视频 clip 用，AI 生成的英文 Pexels 关键词） */
   visualQuery?: string | null;
   /** 画面裁剪（源帧百分比） */

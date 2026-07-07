@@ -1,6 +1,15 @@
 import type { Clip, MediaSource, Project, TrackKind } from "../types";
 import { sampleAllKeyframes } from "../editor/keyframes";
 
+/** T4.3: 曲线变速的有效速度（v1 用曲线平均速度） */
+function effectiveSpeed(clip: Clip): number {
+  if (clip.speedCurve && clip.speedCurve.length > 0) {
+    const avg = clip.speedCurve.reduce((s, p) => s + Math.abs(p.speed), 0) / clip.speedCurve.length;
+    return Math.min(16, Math.max(0.0625, avg));
+  }
+  return Math.min(4, Math.max(0.25, Math.abs(clip.speed)));
+}
+
 /**
  * 实时预览引擎：按统一的 currentTime 时钟，同步调度
  *  - 视频轨：主 <video> 元素 + 一个预加载 <video>（提前加载下一个 clip）
@@ -207,8 +216,8 @@ export class PreviewEngine {
     }
 
     const rel = this.currentTime - clip.startOnTrack;
-    const targetSourceTime = clip.sourceIn + Math.max(0, rel) * clip.speed;
-    const rate = Math.min(4, Math.max(0.25, Math.abs(clip.speed)));
+    const targetSourceTime = clip.sourceIn + Math.max(0, rel) * effectiveSpeed(clip);
+    const rate = effectiveSpeed(clip);
     this.videoEl.playbackRate = rate;
     // 视频自带音轨音量通过 GainNode 控制（video 元素保持 muted 避免双重音频）
     // 检查视频轨是否被静音
@@ -327,10 +336,30 @@ export class PreviewEngine {
       if (tf?.mix) {
         (v.style.mixBlendMode as string) = tf.mix;
       }
+      // T4.4: 蒙版（CSS clip-path / mask 近似）
+      const m = clip.mask;
+      if (m && m.kind !== "linear" && m.kind !== "mirror") {
+        if (m.kind === "circle") {
+          const r = Math.min(m.width, m.height) * 50;
+          v.style.clipPath = `circle(${r}% at ${m.cx * 100}% ${m.cy * 100}%)`;
+        } else if (m.kind === "rect") {
+          const l = (m.cx - m.width / 2) * 100;
+          const t = (m.cy - m.height / 2) * 100;
+          v.style.clipPath = `inset(${t}% ${100 - l - m.width * 100}% ${100 - t - m.height * 100}% ${l}%)`;
+        }
+      } else if (m && (m.kind === "linear" || m.kind === "mirror")) {
+        const dir = m.kind === "mirror" ? "90deg" : "180deg";
+        v.style.webkitMaskImage = `linear-gradient(${dir}, transparent ${m.feather * 50}%, black ${(1 - m.feather) * 50}%)`;
+        v.style.maskImage = `linear-gradient(${dir}, transparent ${m.feather * 50}%, black ${(1 - m.feather) * 50}%)`;
+      } else {
+        v.style.clipPath = "";
+        v.style.maskImage = "";
+        v.style.webkitMaskImage = "";
+      }
 
       // seek 追赶（同主 video 逻辑，rel 已在上面计算）
-      const targetSourceTime = clip.sourceIn + Math.max(0, rel) * clip.speed;
-      const rate = Math.min(4, Math.max(0.25, Math.abs(clip.speed)));
+      const targetSourceTime = clip.sourceIn + Math.max(0, rel) * effectiveSpeed(clip);
+      const rate = effectiveSpeed(clip);
       v.playbackRate = rate;
       const seekThreshold = 0.3 + rate * 0.2;
       if (Math.abs(v.currentTime - targetSourceTime) > seekThreshold) {

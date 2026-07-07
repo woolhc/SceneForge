@@ -406,6 +406,41 @@ fn default_easing() -> String {
     "linear".to_string()
 }
 
+/// T4.3: 曲线变速控制点
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeedPoint {
+    /// 源素材归一化位置 0-1
+    pub time: f64,
+    /// 该点倍速
+    pub speed: f64,
+}
+
+/// T4.4: 蒙版
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipMask {
+    /// "linear" | "mirror" | "circle" | "rect"
+    pub kind: String,
+    #[serde(default = "default_mask_center")]
+    pub cx: f64,
+    #[serde(default = "default_mask_center")]
+    pub cy: f64,
+    #[serde(default = "default_mask_size")]
+    pub width: f64,
+    #[serde(default = "default_mask_size")]
+    pub height: f64,
+    #[serde(default)]
+    pub rotation: f64,
+    #[serde(default)]
+    pub feather: f64,
+    #[serde(default)]
+    pub invert: bool,
+}
+
+fn default_mask_center() -> f64 { 0.5 }
+fn default_mask_size() -> f64 { 0.8 }
+
 /// T4.2: clip 的关键帧集合
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -473,6 +508,9 @@ pub struct Clip {
     pub source_out: f64,
     #[serde(default = "default_speed")]
     pub speed: f64,
+    /// T4.3: 曲线变速控制点。time 为源素材归一化位置 0-1，speed 为该点倍速
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_curve: Option<Vec<SpeedPoint>>,
     #[serde(default = "default_volume")]
     pub volume: f64,
     /// 音频淡入时长（秒，0=无淡入）
@@ -499,6 +537,9 @@ pub struct Clip {
     /// T4.2: 关键帧动画（位置/缩放/不透明度/旋转/音量）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyframes: Option<ClipKeyframes>,
+    /// T4.4: 蒙版
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask: Option<ClipMask>,
     /// 画面搜索词 —— 视频 clip 用（AI 生成的英文 Pexels 关键词）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visual_query: Option<String>,

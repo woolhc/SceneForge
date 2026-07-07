@@ -881,6 +881,11 @@ async fn render_segment_with_overlay(
                 chain.push_str(&format!(",colorchannelmixer=aa={:.3}", opacity));
             }
         }
+        // T4.4: 蒙版（geq alpha）
+        if let Some(mask) = clip.mask.as_ref() {
+            let expr = mask_alpha_expr(mask);
+            chain.push_str(&format!(",geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{expr}'"));
+        }
 
         if i == 0 {
             filter.push_str(&format!("{in_label}{chain}{out_label};"));
@@ -974,7 +979,14 @@ async fn render_single_clip_for_segment(
     let scale_filter = format!(
         "scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},format=yuv420p"
     );
-    let speed_abs = clip.speed.abs().clamp(0.25, 4.0);
+    // T4.3: 曲线变速导出 —— v1 用曲线控制点的平均速度作为该 clip 的等效常速
+    // （真正的逐段变速需拆子段渲染，留作后续增强；数据模型 speed_curve 已就绪）
+    let speed_abs = if let Some(curve) = clip.speed_curve.as_ref().filter(|c| !c.is_empty()) {
+        let avg: f64 = curve.iter().map(|p| p.speed.abs()).sum::<f64>() / curve.len() as f64;
+        avg.clamp(0.0625, 16.0)
+    } else {
+        clip.speed.abs().clamp(0.25, 4.0)
+    };
     let is_reverse = clip.speed < 0.0;
     let color_fx = clip_color_filter(clip);
     let source_crop = clip_source_crop(clip);
@@ -1789,6 +1801,44 @@ fn export_dimensions_for_project(project: &Project) -> (u32, u32) {
 }
 
 /// 转义 ffmpeg 滤镜参数里的单引号（M14）：' → '\''（用于 subtitles/lut3d 的 file= 路径）
+
+/// T4.4: 生成蒙版的 alpha 滤镜表达式（用于 geq 的 a 通道）。
+/// 返回 None 表示无蒙版。返回的字符串是 geq 的 a= 表达式（不含 "a=" 前缀）。
+/// feather 用 smoothstep 近似：clip((edge-d)/feather,0,1)*255
+fn mask_alpha_expr(mask: &crate::models::ClipMask) -> String {
+    let inv = if mask.invert { "255-" } else { "" };
+    match mask.kind.as_str() {
+        "circle" => {
+            // 到中心的椭圆距离，与半径比较
+            let rx = (mask.width / 2.0).max(0.01);
+            let ry = (mask.height / 2.0).max(0.01);
+            let cx = mask.cx;
+            let cy = mask.cy;
+            let feather = mask.feather.max(0.001);
+            format!(
+                "{inv}clip((1-sqrt(pow((X/w-{cx})*{rx},2)+pow((Y/h-{cy})*{ry},2)))/{feather},0,1)*255"
+            )
+        }
+        "rect" => {
+            let l = mask.cx - mask.width / 2.0;
+            let r = mask.cx + mask.width / 2.0;
+            let t = mask.cy - mask.height / 2.0;
+            let b = mask.cy + mask.height / 2.0;
+            let feather = mask.feather.max(0.001);
+            // 在矩形内为 1（255），边界羽化
+            format!(
+                "{inv}clip(min(min((X/w-{l})/{feather},({r}-X/w)/{feather}),min((Y/h-{t})/{feather},({b}-Y/h)/{feather})),0,1)*255"
+            )
+        }
+        "linear" | "mirror" => {
+            // 线性渐变：按 X 位置（0-1）
+            let feather = mask.feather.max(0.001);
+            format!("{inv}clip((X/w)/{feather},0,1)*255")
+        }
+        _ => format!("{inv}255"),
+    }
+}
+
 /// T4.2: 把关键帧序列编译为 ffmpeg overlay 的 x/y 分段线性表达式。
 /// 输出形如：if(lt(t,t0),v0+(t-t0)*(v1-v0)/(t1-t0), if(lt(t,t1),...))
 /// t 是 ffmpeg 内置时间变量（秒）。offset 把关键帧的相对 clip 时间对齐到段内时间。
