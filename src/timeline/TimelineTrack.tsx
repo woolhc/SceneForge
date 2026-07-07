@@ -188,6 +188,9 @@ function TimelineTrackInner({
         const source = clip.sourceId ? media.find((m) => m.id === clip.sourceId) : null;
         // 视频/图片 clip 显示缩略图背景
         const thumbUrl = source ? desktopApi.mediaSrc(source.thumbnailUrl || source.localPath || null) : null;
+        const clipWidthPx = (widthPct / 100) * timelineWidth;
+        const isVideoKind = track.kind === "video" || track.kind === "image";
+        const showFilmstrip = isVideoKind && source && source.kind === "video" && clipWidthPx > 60;
         const showHandles = true;
         return (
           <div
@@ -196,7 +199,7 @@ function TimelineTrackInner({
             style={{
               left: `${leftPct}%`,
               width: `${widthPct}%`,
-              backgroundImage: thumbUrl ? `url(${thumbUrl})` : undefined,
+              backgroundImage: (!showFilmstrip && thumbUrl) ? `url(${thumbUrl})` : undefined,
               backgroundSize: "cover",
               backgroundPosition: "center",
             }}
@@ -211,7 +214,16 @@ function TimelineTrackInner({
               onContextMenu(clip, track.kind, e.clientX, e.clientY);
             }}
           >
-            <span style={{ textShadow: "0 1px 3px rgba(0,0,0,0.9)" }}>
+            {showFilmstrip && source && (
+              <Filmstrip
+                source={source}
+                clipWidthPx={clipWidthPx}
+                sourceIn={clip.sourceIn}
+                sourceOut={clip.sourceOut}
+                fallbackThumb={thumbUrl}
+              />
+            )}
+            <span className="clip-label" style={{ textShadow: "0 1px 3px rgba(0,0,0,0.9)", position: "relative", zIndex: 2 }}>
               {track.kind === "video" || track.kind === "image"
                 ? source?.title || "未绑素材"
                 : clip.text || track.name}
@@ -337,6 +349,74 @@ function WaveformCanvas({
         height={canvasHeight}
       />
     </div>
+  );
+}
+
+/**
+ * T4.7: 视频胶片条缩略图。
+ * 异步加载均匀分布的多帧，平铺显示（先回退单张缩略图，加载完替换）。
+ * 模块级缓存避免重复 IPC（key 为 sourcePath + 时间区间）。
+ */
+const filmstripCache = new Map<string, string[]>();
+function Filmstrip({
+  source,
+  clipWidthPx,
+  sourceIn,
+  sourceOut,
+  fallbackThumb,
+}: {
+  source: MediaSource;
+  clipWidthPx: number;
+  sourceIn: number;
+  sourceOut: number;
+  fallbackThumb: string | null;
+}) {
+  // 按像素宽度决定取几帧（每帧约 80px）
+  const count = Math.max(2, Math.min(8, Math.ceil(clipWidthPx / 80)));
+  const localPath = source.localPath || "";
+  const cacheKey = `${localPath}|${sourceIn.toFixed(1)}-${sourceOut.toFixed(1)}|${count}`;
+  const [frames, setFrames] = useState<string[] | null>(filmstripCache.get(cacheKey) ?? null);
+
+  useEffect(() => {
+    if (!localPath || frames) return;
+    let cancelled = false;
+    void desktopApi.generateFilmstrip(localPath, sourceIn, sourceOut, count).then((paths) => {
+      if (cancelled || paths.length === 0) return;
+      const urls = paths.map((p) => desktopApi.mediaSrc(p) ?? "").filter(Boolean);
+      if (urls.length > 0) {
+        filmstripCache.set(cacheKey, urls);
+        setFrames(urls);
+      }
+    }).catch(() => { /* 静默失败，保持单张缩略图 */ });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cacheKey]);
+
+  if (frames && frames.length > 0) {
+    return (
+      <div className="clip-filmstrip">
+        {frames.map((url, i) => (
+          <div
+            key={i}
+            className="clip-filmstrip-frame"
+            style={{ backgroundImage: `url(${url})`, flex: 1 }}
+          />
+        ))}
+      </div>
+    );
+  }
+  // 回退：单张缩略图
+  return (
+    <div
+      className="clip-thumb-fallback"
+      style={{
+        backgroundImage: fallbackThumb ? `url(${fallbackThumb})` : undefined,
+        backgroundSize: "cover",
+        backgroundPosition: "center",
+        position: "absolute",
+        inset: 0,
+      }}
+    />
   );
 }
 

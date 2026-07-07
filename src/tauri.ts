@@ -485,6 +485,9 @@ export const desktopApi = {
     call<MediaSource>("import_media", { request: { sourcePath } }),
   generateThumbnail: (sourcePath: string, at = 0.5) =>
     call<string>("generate_thumbnail", { request: { sourcePath, at } }),
+  /** T4.7: 生成视频胶片条缩略图（均匀取帧） */
+  generateFilmstrip: (sourcePath: string, sourceIn: number, sourceOut: number, count: number) =>
+    call<string[]>("generate_filmstrip", { request: { sourcePath, sourceIn, sourceOut, count } }),
   generateWaveform: (sourcePath: string) =>
     call<[number, number][]>("generate_waveform", { request: { sourcePath } }),
   generateAudio: (request: { projectId: string; clipId?: string | null; voiceId?: string | null }) =>

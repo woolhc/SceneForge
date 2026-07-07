@@ -961,6 +961,21 @@ textarea {
   cursor: grabbing;
 }
 
+/* T4.7: 视频胶片条缩略图 */
+.clip-filmstrip {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  overflow: hidden;
+  border-radius: inherit;
+}
+.clip-filmstrip-frame {
+  background-size: cover;
+  background-position: center;
+  height: 100%;
+  min-width: 0;
+}
+
 .clip-handle {
   position: absolute;
   top: 0;

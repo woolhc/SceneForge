@@ -52,6 +52,7 @@ pub fn run() {
             commands::enrich_segments,
             commands::import_media,
             commands::generate_thumbnail,
+            commands::generate_filmstrip,
             commands::render_project,
             commands::cancel_render,
         ])

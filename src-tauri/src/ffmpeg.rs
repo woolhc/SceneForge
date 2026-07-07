@@ -304,6 +304,61 @@ pub async fn generate_thumbnail(
     Ok(output_path)
 }
 
+/// T4.7: 生成视频胶片条缩略图（均匀取 count 帧，输出到缓存目录）。
+/// 返回每帧的本地路径列表（前端用 asset 协议加载）。
+pub async fn generate_filmstrip(
+    cache_dir: &Path,
+    source_path: &Path,
+    source_in: f64,
+    source_out: f64,
+    count: usize,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let filmstrip_dir = cache_dir.join("filmstrip");
+    tokio::fs::create_dir_all(&filmstrip_dir).await?;
+    let stem = source_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("media");
+    let dur = (source_out - source_in).max(0.1);
+    let mut paths = Vec::with_capacity(count);
+    for i in 0..count {
+        // 均匀分布的取帧时间点（避免首尾边界）
+        let t = source_in + dur * (i as f64 + 0.5) / count as f64;
+        let id = format!(
+            "{}-{}-{}",
+            sanitize_file_stem(stem),
+            (t * 1000.0) as u64,
+            i
+        );
+        let output_path = filmstrip_dir.join(format!("{}.jpg", id));
+        if !output_path.exists() {
+            let output = Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-ss",
+                    &format!("{:.3}", t.max(0.0)),
+                    "-i",
+                    &source_path.to_string_lossy(),
+                    "-frames:v",
+                    "1",
+                    "-vf",
+                    "scale=160:-1", // 胶片条帧宽 160px（高度按比例）
+                    "-q:v",
+                    "5",
+                    &output_path.to_string_lossy(),
+                ])
+                .output()
+                .await?;
+            if !output.status.success() {
+                // 单帧失败不阻塞，跳过
+                continue;
+            }
+        }
+        paths.push(output_path);
+    }
+    Ok(paths)
+}
+
 /// 生成音频波形数据：解码为低采样率 PCM → 计算 min/max 峰值对。
 /// 返回 Vec<(min, max)>，每对代表一个时间桶的振幅范围。
 pub async fn generate_waveform(

@@ -8,10 +8,10 @@ use crate::ffmpeg;
 use crate::pexels;
 use crate::models::{
     AppInfo, AppSettings, CacheAssetRequest, Clip, CreateProjectRequest,
-    CreateVoiceProfileRequest, FfmpegStatus, GenerateAudioRequest, ImportMediaRequest,
-    ImportVoiceProfileRequest, MediaSource, PexelsSearchRequest, Project, ProjectSummary,
-    RenderProjectRequest, ReplaceVoiceSampleRequest, RenderResult, SegmentScriptRequest,
-    SegmentScriptResult, SubtitleCue, ThumbnailRequest, Track, TrackKind,
+    CreateVoiceProfileRequest, FfmpegStatus, FilmstripRequest, GenerateAudioRequest,
+    ImportMediaRequest, ImportVoiceProfileRequest, MediaSource, PexelsSearchRequest, Project,
+    ProjectSummary, RenderProjectRequest, ReplaceVoiceSampleRequest, RenderResult,
+    SegmentScriptRequest, SegmentScriptResult, SubtitleCue, ThumbnailRequest, Track, TrackKind,
     UpdateVoiceProfileRequest, VoicePreviewRequest, VoicePreviewResult, VoiceProfile,
 };
 use crate::storage;
@@ -934,6 +934,25 @@ pub async fn generate_thumbnail(
         .await
         .map_err(map_error)?;
     Ok(thumb.to_string_lossy().to_string())
+}
+
+/// T4.7: 生成视频胶片条缩略图，返回每帧的本地路径列表。
+#[tauri::command]
+pub async fn generate_filmstrip(
+    state: State<'_, AppState>,
+    request: FilmstripRequest,
+) -> Result<Vec<String>, String> {
+    let path = PathBuf::from(&request.source_path);
+    let paths = ffmpeg::generate_filmstrip(
+        &state.paths.cache_dir,
+        &path,
+        request.source_in,
+        request.source_out,
+        request.count,
+    )
+    .await
+    .map_err(map_error)?;
+    Ok(paths.iter().map(|p| p.to_string_lossy().to_string()).collect())
 }
 
 fn infer_kind(path: &std::path::Path, width: u32, height: u32) -> String {

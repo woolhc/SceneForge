@@ -714,3 +714,20 @@ pub struct ThumbnailRequest {
 fn default_thumb_at() -> f64 {
     0.5
 }
+
+/// T4.7: 胶片条缩略图请求
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilmstripRequest {
+    pub source_path: String,
+    #[serde(default)]
+    pub source_in: f64,
+    #[serde(default)]
+    pub source_out: f64,
+    #[serde(default = "default_filmstrip_count")]
+    pub count: usize,
+}
+
+fn default_filmstrip_count() -> usize {
+    6
+}

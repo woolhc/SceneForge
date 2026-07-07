@@ -15,6 +15,8 @@ export class PreviewEngine {
   private audioCtx: AudioContext | null = null;
   private audioBuffers = new Map<string, AudioBuffer>();
   private activeAudioSources = new Set<AudioBufferSourceNode>();
+  /** T4.9: clipId → 活跃 GainNode，用于播放中实时改音量 */
+  private clipGainNodes = new Map<string, GainNode>();
   /** 视频元素 → Web Audio 路由（让视频自带声音可控） */
   private videoSourceNode: MediaElementAudioSourceNode | null = null;
   private videoGainNode: GainNode | null = null;
@@ -181,7 +183,8 @@ export class PreviewEngine {
     const videoTrack = this.project.tracks.find((t) => t.id === clip.trackId);
     const trackMuted = videoTrack?.muted ?? false;
     if (this.videoGainNode) {
-      this.videoGainNode.gain.value = trackMuted ? 0 : Math.min(1, Math.max(0, clip.volume));
+      // T4.9: 音量上限对齐 UI 的 200%（之前 clamp ≤1）
+      this.videoGainNode.gain.value = trackMuted ? 0 : Math.min(2, Math.max(0, clip.volume));
     }
 
     // 画面裁剪预览：用 transform 模拟（不破坏 position:inset:0）
@@ -324,12 +327,35 @@ export class PreviewEngine {
         node.buffer = buffer;
         node.playbackRate.value = Math.min(4, Math.max(0.25, clip.speed));
         const gain = ctx.createGain();
-        gain.gain.value = Math.min(1, Math.max(0, clip.volume));
+        // T4.9: 音量上限对齐 UI 200%（之前 clamp ≤1）
+        const vol = Math.min(2, Math.max(0, clip.volume));
+        // T4.9: fadeIn/fadeOut 用 linearRampToValueAtTime
+        const fadeIn = Math.max(0, clip.fadeIn ?? 0);
+        const fadeOut = Math.max(0, clip.fadeOut ?? 0);
+        const startAt = now + whenOffset;
+        const endAt = startAt + remainingDuration;
+        if (fadeIn > 0.001 && offsetIntoClip < fadeIn) {
+          // 还在 fadeIn 区间内：从 0 ramp 到 vol
+          gain.gain.setValueAtTime(0, startAt);
+          gain.gain.linearRampToValueAtTime(vol, startAt + fadeIn);
+        } else {
+          gain.gain.value = vol;
+        }
+        if (fadeOut > 0.001 && remainingDuration > fadeOut) {
+          // fadeOut：在 clip 结束前 ramp 到 0
+          gain.gain.setValueAtTime(vol, endAt - fadeOut);
+          gain.gain.linearRampToValueAtTime(0, endAt);
+        }
         node.connect(gain).connect(ctx.destination);
         try {
           node.start(now + whenOffset, sourceOffset, remainingDuration);
           this.activeAudioSources.add(node);
-          node.onended = () => this.activeAudioSources.delete(node);
+          // T4.9: 记录 clipId→gain 映射，播放中可实时改音量
+          this.clipGainNodes.set(clip.id, gain);
+          node.onended = () => {
+            this.activeAudioSources.delete(node);
+            this.clipGainNodes.delete(clip.id);
+          };
         } catch {
           /* scheduling error */
         }
@@ -346,6 +372,15 @@ export class PreviewEngine {
       }
     });
     this.activeAudioSources.clear();
+    this.clipGainNodes.clear();
+  }
+
+  /** T4.9: 播放中实时改某 clip 音量（找到活跃 GainNode 直接赋值） */
+  setClipVolume(clipId: string, volume: number) {
+    const gain = this.clipGainNodes.get(clipId);
+    if (gain) {
+      gain.gain.value = Math.min(2, Math.max(0, volume));
+    }
   }
 
   private publish() {
