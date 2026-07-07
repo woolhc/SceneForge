@@ -509,6 +509,19 @@ pub struct RenderConfig {
     /// 导出码率（Mbps），0 = 用 ffmpeg 默认
     #[serde(default)]
     pub bitrate_mbps: u32,
+    /// T4.10: 视频编码格式："h264"（默认）| "hevc"
+    #[serde(default = "default_codec")]
+    pub codec: String,
+    /// T4.10: 导出模式："video"（默认）| "audio-only"（仅音频）
+    #[serde(default = "default_export_mode")]
+    pub export_mode: String,
+}
+
+fn default_codec() -> String {
+    "h264".to_string()
+}
+fn default_export_mode() -> String {
+    "video".to_string()
 }
 
 impl Default for RenderConfig {
@@ -518,6 +531,8 @@ impl Default for RenderConfig {
             preset: default_render_preset(),
             resolution: default_resolution(),
             bitrate_mbps: 0,
+            codec: default_codec(),
+            export_mode: default_export_mode(),
         }
     }
 }

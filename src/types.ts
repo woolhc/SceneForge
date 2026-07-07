@@ -190,6 +190,10 @@ export type RenderConfig = {
   resolution: string;
   /** 导出码率（Mbps），0 = 默认 */
   bitrateMbps: number;
+  /** T4.10: 视频编码格式：h264 | hevc */
+  codec?: "h264" | "hevc";
+  /** T4.10: 导出模式：video（默认）| audio-only（仅音频 mp3） */
+  exportMode?: "video" | "audio-only";
 };
 
 export type Project = {
@@ -291,4 +295,6 @@ export const DEFAULT_RENDER_CONFIG: RenderConfig = {
   preset: "preview-fast",
   resolution: "1080p",
   bitrateMbps: 0,
+  codec: "h264",
+  exportMode: "video",
 };

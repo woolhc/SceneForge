@@ -1146,6 +1146,45 @@ pub async fn render_project(
 
     let _ = app_handle.emit("render-progress", serde_json::json!({ "progress": 0, "message": "准备渲染..." }));
 
+    // T4.10: 仅导出音频模式 —— 跳过视频管线，直接混音输出 mp3/wav
+    if project.render_config.export_mode == "audio-only" {
+        let _ = app_handle.emit("render-progress", serde_json::json!({ "progress": 30, "message": "正在混音导出..." }));
+        let audio_clips: Vec<&Clip> = project.clips.iter().collect();
+        // 决定输出路径
+        let render_dir = state.paths.projects_dir.join(&project.id).join("renders");
+        tokio::fs::create_dir_all(&render_dir).await.map_err(map_error)?;
+        let audio_out = if let Some(ref user_path) = request.output_path {
+            if !user_path.is_empty() {
+                std::path::PathBuf::from(user_path)
+            } else {
+                render_dir.join("audio-only.mp3")
+            }
+        } else {
+            render_dir.join("audio-only.mp3")
+        };
+        let result = ffmpeg::render_audio_only(
+            &state.paths.cache_dir,
+            &audio_out,
+            &audio_clips,
+            &project,
+            &project.media,
+        )
+        .await;
+        match result {
+            Ok(path) => {
+                let _ = app_handle.emit("render-progress", serde_json::json!({ "progress": 100, "message": "音频导出完成" }));
+                return Ok(RenderResult {
+                    preview_path: path.to_string_lossy().to_string(),
+                    command: "render-audio-only".to_string(),
+                });
+            }
+            Err(e) => {
+                let _ = app_handle.emit("render-progress", serde_json::json!({ "progress": 0, "message": format!("音频导出失败：{e}") }));
+                return Err(map_error(e));
+            }
+        }
+    }
+
     // T3.3: 进度回调，把段级进度通过事件发到前端
     let app_handle_clone = app_handle.clone();
     let progress_cb = move |percent: u32, phase: &str| {

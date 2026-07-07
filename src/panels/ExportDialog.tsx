@@ -125,6 +125,26 @@ export function ExportDialog({
                     onChange={(e) => onConfigChange({ ...config, bitrateMbps: Number(e.target.value) })}
                   />
                 </label>
+                <label>
+                  编码格式
+                  <select
+                    value={config.codec ?? "h264"}
+                    onChange={(e) => onConfigChange({ ...config, codec: e.target.value as "h264" | "hevc" })}
+                  >
+                    <option value="h264">H.264（兼容性好）</option>
+                    <option value="hevc">H.265/HEVC（体积小）</option>
+                  </select>
+                </label>
+                <label>
+                  导出模式
+                  <select
+                    value={config.exportMode ?? "video"}
+                    onChange={(e) => onConfigChange({ ...config, exportMode: e.target.value as "video" | "audio-only" })}
+                  >
+                    <option value="video">视频（含画面）</option>
+                    <option value="audio-only">仅音频（MP3）</option>
+                  </select>
+                </label>
               </div>
             )}
 

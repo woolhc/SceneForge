@@ -84,9 +84,10 @@ pub async fn detect_hw_encoder() -> String {
 
 /// 根据编码器返回 (encoder_name, extra_args)。
 /// 硬件编码器不需要 preset，需要 bitrate 控制。
+/// codec: "h264"（默认）| "hevc"（T4.10）
 pub fn encoder_args(encoder: &str, preview: bool) -> (String, Vec<String>) {
     // 优先用传入的 encoder，回退到全局缓存的硬件编码器
-    let enc = if encoder == "libx264" {
+    let enc = if encoder == "libx264" || encoder == "libx265" {
         HW_ENCODER.get().map(|s| s.as_str()).unwrap_or("libx264")
     } else {
         encoder
@@ -96,10 +97,18 @@ pub fn encoder_args(encoder: &str, preview: bool) -> (String, Vec<String>) {
             let bitrate = if preview { "2M" } else { "8M" };
             (enc.to_string(), vec!["-b:v".to_string(), bitrate.to_string()])
         }
+        "hevc_videotoolbox" | "hevc_nvenc" | "hevc_qsv" | "hevc_vaapi" => {
+            // T4.10: HEVC 硬件编码
+            let bitrate = if preview { "2M" } else { "6M" }; // HEVC 同等质量码率更低
+            (enc.to_string(), vec!["-b:v".to_string(), bitrate.to_string()])
+        }
         _ => {
+            // 软编：libx264 或 libx265
+            let is_hevc = enc.contains("265") || encoder.contains("265") || encoder == "hevc";
+            let lib = if is_hevc { "libx265" } else { "libx264" };
             let preset = if preview { "ultrafast" } else { "veryfast" };
-            let crf = if preview { "30" } else { "23" };
-            ("libx264".to_string(), vec![
+            let crf = if preview { "30" } else { if is_hevc { "28" } else { "23" } };
+            (lib.to_string(), vec![
                 "-preset".to_string(), preset.to_string(),
                 "-crf".to_string(), crf.to_string(),
             ])
@@ -427,7 +436,20 @@ pub async fn render_project_video(
     if HW_ENCODER.get().is_none() {
         init_hw_encoder().await;
     }
-    let hw = HW_ENCODER.get().map(|s| s.as_str()).unwrap_or("libx264");
+    // T4.10: 根据用户选的 codec（h264/hevc）决定编码器
+    let want_hevc = project.render_config.codec == "hevc";
+    let hw = if want_hevc {
+        // HEVC 模式：把 h264 硬件编码器名替换为 hevc 变体
+        match HW_ENCODER.get().map(|s| s.as_str()).unwrap_or("libx264") {
+            "h264_videotoolbox" => "hevc_videotoolbox",
+            "h264_nvenc" => "hevc_nvenc",
+            "h264_qsv" => "hevc_qsv",
+            "h264_vaapi" => "hevc_vaapi",
+            _ => "libx265",
+        }
+    } else {
+        HW_ENCODER.get().map(|s| s.as_str()).unwrap_or("libx264")
+    }.to_string();
     eprintln!("使用编码器: {hw}");
 
     // 统一计算目标尺寸：preview 用 540p 短边，导出用 renderConfig.resolution
@@ -526,7 +548,7 @@ pub async fn render_project_video(
                 seg_duration,
                 seg_index,
                 preview,
-                hw,
+                &hw,
                 target_w,
                 target_h,
             )
@@ -544,7 +566,7 @@ pub async fn render_project_video(
             seg_duration,
             seg_index,
             preview,
-            hw,
+            &hw,
             target_w,
             target_h,
         )
@@ -637,7 +659,7 @@ pub async fn render_project_video(
         args.push("-map".to_string());
         args.push(prev_label);
         // 编码器：统一用 encoder_args（硬件编码器用 bitrate，软编用 preset+crf）
-        let (xfade_enc_name, xfade_enc_extra) = encoder_args(hw, preview);
+        let (xfade_enc_name, xfade_enc_extra) = encoder_args(&hw, preview);
         args.push("-c:v".to_string());
         args.push(xfade_enc_name);
         args.extend(xfade_enc_extra);
@@ -1441,6 +1463,51 @@ fn seconds_to_ass_time(seconds: f64) -> String {
 }
 
 /// 合并配音音频 clip 为一个 wav（按时间线排列，空隙静音）
+/// T4.10: 仅导出音频（跳过视频管线，混音后输出 mp3）。
+pub async fn render_audio_only(
+    cache_dir: &Path,
+    output: &Path,
+    audio_clips: &[&Clip],
+    project: &Project,
+    media: &[crate::models::MediaSource],
+) -> anyhow::Result<PathBuf> {
+    // 先用 merge_audio_clips 生成 wav（复用现有混音逻辑，含 fade/atempo/adelay）
+    let wav_path = cache_dir.join(format!(
+        "audio-only-{}.wav",
+        chrono::Utc::now().timestamp_millis()
+    ));
+    merge_audio_clips(cache_dir, &wav_path, audio_clips, project, media, &[]).await?;
+    // wav → mp3（libmp3lame）
+    let mp3_output = if output.extension().and_then(|e| e.to_str()) == Some("mp3") {
+        output.to_path_buf()
+    } else {
+        // 用户没指定 .mp3 后缀，强制改
+        output.with_extension("mp3")
+    };
+    let convert = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-i",
+            &wav_path.to_string_lossy(),
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "192k",
+            &mp3_output.to_string_lossy(),
+        ])
+        .output()
+        .await?;
+    if !convert.status.success() {
+        anyhow::bail!(
+            "音频转 mp3 失败：{}",
+            String::from_utf8_lossy(&convert.stderr).trim()
+        );
+    }
+    // 清理临时 wav
+    let _ = tokio::fs::remove_file(&wav_path).await;
+    Ok(mp3_output)
+}
+
 /// 构建 atempo 滤镜链（变速保持音高）。
 /// atempo 单次范围 0.5-2.0，超出需串联。speed=1.0 返回空字符串。
 fn build_atempo_chain(speed: f64) -> String {
