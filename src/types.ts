@@ -90,6 +90,12 @@ export type SubtitleStyle = {
   karaoke?: boolean;
   /** 逐字高亮颜色（已播到的字色） */
   highlightColor?: string;
+  /** T4.8: 入场动画：none | fadeIn | slideUp | scaleIn */
+  animationIn?: string;
+  /** T4.8: 出场动画：none | fadeOut | slideDown | scaleOut */
+  animationOut?: string;
+  /** T4.8: 动画时长（秒，默认 0.3） */
+  animationDuration?: number;
 };
 
 /** 单个词/字符的时间戳（用于逐字高亮） */
@@ -279,6 +285,9 @@ export const DEFAULT_SUBTITLE_STYLE: SubtitleStyle = {
   rotation: 0,
   karaoke: true,
   highlightColor: "#FFD700",
+  animationIn: "none",
+  animationOut: "none",
+  animationDuration: 0.3,
 };
 
 export const DEFAULT_TRANSFORM: ClipTransform = {

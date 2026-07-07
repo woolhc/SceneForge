@@ -1388,7 +1388,20 @@ fn generate_ass_subtitles(
             text.replace('{', "\\{").replace('}', "\\}").replace('\n', "\\N")
         };
 
-        ass.push_str(&format!("Dialogue: 0,{start},{end},{style_name},,0,0,0,,{escaped}\n"));
+        // T4.8: 入场/出场动画 → ASS \fad(in,out) 标签（单位厘秒）
+        let style = clip.subtitle_style.as_ref();
+        let anim_dur = (style.map(|s| s.animation_duration).unwrap_or(0.3) * 100.0) as u32;
+        let anim_in = style.map(|s| s.animation_in.as_str()).unwrap_or("");
+        let anim_out = style.map(|s| s.animation_out.as_str()).unwrap_or("");
+        let fade_in_cs = if anim_in == "fadeIn" || anim_in == "slideUp" || anim_in == "scaleIn" { anim_dur } else { 0 };
+        let fade_out_cs = if anim_out == "fadeOut" || anim_out == "slideDown" || anim_out == "scaleOut" { anim_dur } else { 0 };
+        let fade_tag = if fade_in_cs > 0 || fade_out_cs > 0 {
+            format!("{{\\fad({fade_in_cs},{fade_out_cs})}}")
+        } else {
+            String::new()
+        };
+
+        ass.push_str(&format!("Dialogue: 0,{start},{end},{style_name},,0,0,0,,{fade_tag}{escaped}\n"));
     }
     ass
 }

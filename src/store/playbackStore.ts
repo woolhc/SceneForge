@@ -28,6 +28,9 @@ export type SubtitleStyleLite = {
   rotation: number;
   karaoke?: boolean;
   highlightColor?: string;
+  animationIn?: string;
+  animationOut?: string;
+  animationDuration?: number;
 };
 
 export interface PlaybackState {

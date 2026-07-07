@@ -3192,3 +3192,20 @@ textarea {
   opacity: 0.35;
   cursor: not-allowed;
 }
+
+/* T4.8: 字幕入场/出场动画 */
+@keyframes subFadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes subSlideUp {
+  from { opacity: 0; transform: translateY(20px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes subScaleIn {
+  from { opacity: 0; transform: scale(0.6); }
+  to { opacity: 1; transform: scale(1); }
+}
+.anim-fadeIn { animation: subFadeIn var(--sub-anim-dur, 0.3s) ease-out; }
+.anim-slideUp { animation: subSlideUp var(--sub-anim-dur, 0.3s) ease-out; }
+.anim-scaleIn { animation: subScaleIn var(--sub-anim-dur, 0.3s) ease-out; }

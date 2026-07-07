@@ -2215,7 +2215,7 @@ export function App() {
               const karaokeOn = (s?.karaoke ?? true) && (subClip?.words?.length ?? 0) > 0;
               return (
                 <div
-                  className="subtitle-overlay-text"
+                  className={`subtitle-overlay-text ${s?.animationIn && s.animationIn !== "none" ? `anim-${s.animationIn}` : ""}`}
                   style={{
                     position: "absolute",
                     left: `${posX}%`,
@@ -2424,6 +2424,35 @@ export function App() {
                       />
                     </label>
                   ) : null}
+                  {/* T4.8: 入场/出场动画 */}
+                  <label className="style-field">
+                    入场动画
+                    <select
+                      value={selectedClip.subtitleStyle?.animationIn ?? "none"}
+                      onChange={(event) => updateSelectedClip({
+                        subtitleStyle: { ...selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE }, animationIn: event.target.value },
+                      })}
+                    >
+                      <option value="none">无</option>
+                      <option value="fadeIn">淡入</option>
+                      <option value="slideUp">上滑</option>
+                      <option value="scaleIn">缩放</option>
+                    </select>
+                  </label>
+                  <label className="style-field">
+                    出场动画
+                    <select
+                      value={selectedClip.subtitleStyle?.animationOut ?? "none"}
+                      onChange={(event) => updateSelectedClip({
+                        subtitleStyle: { ...selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE }, animationOut: event.target.value },
+                      })}
+                    >
+                      <option value="none">无</option>
+                      <option value="fadeOut">淡出</option>
+                      <option value="slideDown">下滑</option>
+                      <option value="scaleOut">缩放</option>
+                    </select>
+                  </label>
                 </div>
               )}
 

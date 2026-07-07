@@ -92,13 +92,15 @@ export function SubtitleOverlay({
       {/* 字幕文本元素（moveable 的 target） */}
       <div
         ref={textRef}
-        className="subtitle-overlay-text"
+        className={`subtitle-overlay-text ${style.animationIn && style.animationIn !== "none" ? `anim-${style.animationIn}` : ""}`}
         style={{
           position: "absolute",
           left: `${style.x ?? 50}%`,
           top: `${style.y ?? 80}%`,
           transform: `translate(-50%, -50%) rotate(${rotation}deg) scale(${scaleX}, ${scaleY})`,
           transformOrigin: "center center",
+          // T4.8: 动画时长 CSS 变量
+          ["--sub-anim-dur" as string]: `${style.animationDuration ?? 0.3}s`,
           fontFamily: style.fontFamily,
           fontSize,
           fontWeight: 700,

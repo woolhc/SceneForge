@@ -296,6 +296,19 @@ pub struct SubtitleStyle {
     /// 逐字高亮颜色（默认金色）
     #[serde(default = "default_karaoke_color")]
     pub highlight_color: String,
+    /// T4.8: 入场动画："none" | "fadeIn" | "slideUp" | "scaleIn"
+    #[serde(default)]
+    pub animation_in: String,
+    /// T4.8: 出场动画："none" | "fadeOut" | "slideDown" | "scaleOut"
+    #[serde(default)]
+    pub animation_out: String,
+    /// T4.8: 动画时长（秒）
+    #[serde(default = "default_anim_duration")]
+    pub animation_duration: f64,
+}
+
+fn default_anim_duration() -> f64 {
+    0.3
 }
 
 impl Default for SubtitleStyle {
@@ -313,6 +326,9 @@ impl Default for SubtitleStyle {
             rotation: 0.0,
             karaoke: default_true(),
             highlight_color: default_karaoke_color(),
+            animation_in: String::new(),
+            animation_out: String::new(),
+            animation_duration: default_anim_duration(),
         }
     }
 }
