@@ -105,11 +105,17 @@ export function usePreviewEngine(
     else void engine.play();
   }, []);
 
+  /** T4.1: 设置画中画叠加层容器（传给引擎，引擎在里面管理 overlay video DOM） */
+  const setOverlayContainer = useCallback((container: HTMLElement | null) => {
+    engineRef.current?.setOverlayContainer(container);
+  }, []);
+
   return {
     syncProject,
     play,
     pause,
     seek,
     togglePlay,
+    setOverlayContainer,
   };
 }

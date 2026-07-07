@@ -386,6 +386,42 @@ pub struct ClipTransform {
     /// 混合模式："normal" | "overlay" | "screen" | "multiply" 等
     #[serde(default = "default_transform_mix")]
     pub mix: String,
+    /// T4.2: 旋转角度（度，0=不旋转）
+    #[serde(default)]
+    pub rotation: f64,
+}
+
+/// T4.2: 关键帧
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Keyframe {
+    /// 相对 clip 起点的秒数
+    pub time: f64,
+    pub value: f64,
+    #[serde(default = "default_easing")]
+    pub easing: String,
+}
+
+fn default_easing() -> String {
+    "linear".to_string()
+}
+
+/// T4.2: clip 的关键帧集合
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipKeyframes {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<Vec<Keyframe>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<Vec<Keyframe>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<Vec<Keyframe>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<Vec<Keyframe>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<Vec<Keyframe>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<Vec<Keyframe>>,
 }
 
 impl Default for ClipTransform {
@@ -397,6 +433,7 @@ impl Default for ClipTransform {
             opacity: default_transform_opacity(),
             corner_radius: 0,
             mix: default_transform_mix(),
+            rotation: 0.0,
         }
     }
 }
@@ -459,6 +496,9 @@ pub struct Clip {
     /// 画面变换 —— 视频 clip 用（画中画）
     #[serde(default)]
     pub transform: Option<ClipTransform>,
+    /// T4.2: 关键帧动画（位置/缩放/不透明度/旋转/音量）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyframes: Option<ClipKeyframes>,
     /// 画面搜索词 —— 视频 clip 用（AI 生成的英文 Pexels 关键词）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visual_query: Option<String>,

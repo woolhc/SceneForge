@@ -569,6 +569,7 @@ pub async fn detach_audio(
         transition_in: None,
         crop: None,
         transition_out: None,
+        keyframes: None,
     };
     project.clips.push(audio_clip);
 
@@ -664,7 +665,7 @@ pub async fn separate_vocals(
             volume: if name == "人声" { 1.0 } else { 0.5 }, // 伴奏默认半音量
             fade_in: 0.0, fade_out: 0.0,
             filter: None, brightness: 0.0, contrast: 0.0, saturation: 0.0,
-            transform: None, visual_query: None, text: None, subtitle_style: None, words: None,
+            transform: None, visual_query: None, text: None, subtitle_style: None, words: None, keyframes: None,
             transition_in: None,
         crop: None, transition_out: None,
         });
@@ -842,6 +843,7 @@ pub async fn generate_subtitles(
             text: Some(cue.text.clone()),
             subtitle_style: None,
             words,
+            keyframes: None,
             transition_in: None,
             transition_out: None,
         });

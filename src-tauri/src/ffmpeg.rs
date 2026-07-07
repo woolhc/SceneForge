@@ -891,15 +891,25 @@ async fn render_segment_with_overlay(
             // 偏移 = (主画面 - 叠加画面) * 百分比，即 0%=贴左, 50%=居中, 100%=贴右
             let default_tf = crate::models::ClipTransform::default();
             let tf = tf.unwrap_or(&default_tf);
-            let x_pct = (tf.x).clamp(0.0, 100.0) / 100.0;
-            let y_pct = (tf.y).clamp(0.0, 100.0) / 100.0;
-            let overlay_x = format!("(w-W)*{:.4}", x_pct);
-            let overlay_y = format!("(h-H)*{:.4}", y_pct);
+            // T4.2: 关键帧导出 —— x/y 用分段线性表达式（含 t 变量）
+            let kfs = clip.keyframes.as_ref();
+            let x_expr = if let Some(x_kfs) = kfs.and_then(|k| k.x.as_ref()) {
+                keyframes_to_overlay_expr(x_kfs, tf.x, clip.start_on_track - seg_start, "x")
+            } else {
+                let x_pct = (tf.x).clamp(0.0, 100.0) / 100.0;
+                format!("(w-W)*{:.4}", x_pct)
+            };
+            let y_expr = if let Some(y_kfs) = kfs.and_then(|k| k.y.as_ref()) {
+                keyframes_to_overlay_expr(y_kfs, tf.y, clip.start_on_track - seg_start, "y")
+            } else {
+                let y_pct = (tf.y).clamp(0.0, 100.0) / 100.0;
+                format!("(h-H)*{:.4}", y_pct)
+            };
             let this_label = format!("[v{}]", i);
             filter.push_str(&format!("{in_label}{chain}{this_label};"));
             let merged = format!("[m{}]", i);
             filter.push_str(&format!(
-                "{prev_label}{this_label}overlay={overlay_x}:{overlay_y}{merged};"
+                "{prev_label}{this_label}overlay={x_expr}:{y_expr}{merged};"
             ));
             prev_label = merged;
         }
@@ -1779,6 +1789,42 @@ fn export_dimensions_for_project(project: &Project) -> (u32, u32) {
 }
 
 /// 转义 ffmpeg 滤镜参数里的单引号（M14）：' → '\''（用于 subtitles/lut3d 的 file= 路径）
+/// T4.2: 把关键帧序列编译为 ffmpeg overlay 的 x/y 分段线性表达式。
+/// 输出形如：if(lt(t,t0),v0+(t-t0)*(v1-v0)/(t1-t0), if(lt(t,t1),...))
+/// t 是 ffmpeg 内置时间变量（秒）。offset 把关键帧的相对 clip 时间对齐到段内时间。
+/// axis "x" → (w-W)*pct，"y" → (h-H)*pct（把 0-100 值转成像素百分比）
+fn keyframes_to_overlay_expr(
+    kfs: &[crate::models::Keyframe],
+    fallback: f64,
+    offset: f64,
+    axis: &str,
+) -> String {
+    let (dim, dim_cap) = if axis == "x" { ("w", "W") } else { ("h", "H") };
+    if kfs.is_empty() {
+        let pct = fallback.clamp(0.0, 100.0) / 100.0;
+        return format!("({dim}-{dim_cap})*{pct:.4}");
+    }
+    // 按 time 排序
+    let mut sorted: Vec<&crate::models::Keyframe> = kfs.iter().collect();
+    sorted.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
+
+    // 对百分比（0-100 数值）做分段线性插值，默认取末帧值
+    let mut expr = format!("{:.4}", sorted[sorted.len() - 1].value);
+    for i in (1..sorted.len()).rev() {
+        let a = sorted[i - 1];
+        let b = sorted[i];
+        let ta = a.time + offset;
+        let tb = b.time + offset;
+        let span = (tb - ta).max(0.001);
+        expr = format!(
+            "if(lt(t,{tb:.4}),{va:.4}+(t-{ta:.4})*{dv:.4}/{span:.4},{expr})",
+            tb = tb, va = a.value, ta = ta, dv = b.value - a.value, span = span, expr = expr
+        );
+    }
+    // 外层转像素：0-100 百分比 → (主画面-叠加画面) * pct/100
+    format!("({dim}-{dim_cap})*({expr})/100")
+}
+
 fn escape_filter_path(path: &str) -> String {
     path.replace('\'', "'\\''")
 }

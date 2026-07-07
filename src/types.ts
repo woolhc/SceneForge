@@ -133,6 +133,26 @@ export type ClipTransform = {
   cornerRadius: number;
   /** 混合模式："normal" | "overlay" | "screen" | "multiply" 等 */
   mix: string;
+  /** T4.2: 旋转角度（度，0=不旋转） */
+  rotation?: number;
+};
+
+/** T4.2: 关键帧 */
+export type Keyframe = {
+  /** 相对 clip 起点的秒数 */
+  time: number;
+  value: number;
+  easing: "linear" | "easeIn" | "easeOut" | "easeInOut";
+};
+
+/** T4.2: clip 的关键帧集合（每个属性一组按 time 排序的关键帧） */
+export type ClipKeyframes = {
+  x?: Keyframe[];
+  y?: Keyframe[];
+  scale?: Keyframe[];
+  opacity?: Keyframe[];
+  rotation?: Keyframe[];
+  volume?: Keyframe[];
 };
 
 export type Clip = {
@@ -164,6 +184,8 @@ export type Clip = {
   saturation: number;
   /** 画面变换（视频 clip 用，画中画） */
   transform?: ClipTransform | null;
+  /** T4.2: 关键帧动画（位置/缩放/不透明度/旋转/音量） */
+  keyframes?: ClipKeyframes | null;
   /** 画面搜索词（视频 clip 用，AI 生成的英文 Pexels 关键词） */
   visualQuery?: string | null;
   /** 画面裁剪（源帧百分比） */
@@ -297,6 +319,7 @@ export const DEFAULT_TRANSFORM: ClipTransform = {
   opacity: 100,
   cornerRadius: 0,
   mix: "normal",
+  rotation: 0,
 };
 
 export const DEFAULT_RENDER_CONFIG: RenderConfig = {

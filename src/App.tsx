@@ -274,6 +274,8 @@ export function App() {
   const stageVideoRef = useRef<HTMLVideoElement | null>(null);
   const stageVideoBRef = useRef<HTMLVideoElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
+  // T4.1: 画中画叠加层容器（PreviewEngine 在里面动态管理 overlay video）
+  const overlayContainerRef = useRef<HTMLDivElement | null>(null);
   const filterCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const filterRendererRef = useRef<FilterRenderer | null>(null);
   // 始终指向最新的 project，供后台 async 操作读取，避免用闭包里的旧值覆盖用户编辑
@@ -284,7 +286,12 @@ export function App() {
 
   // 实时预览引擎：接管中央预览的 <video>，按时间线同步画面/配音/字幕
   // T2.1: engineState 移到 zustand store，按字段订阅避免 60fps 全树重渲染
-  const { syncProject, togglePlay, seek } = usePreviewEngine(stageVideoRef, stageVideoBRef, view === "editor");
+  const { syncProject, togglePlay, seek, setOverlayContainer } = usePreviewEngine(stageVideoRef, stageVideoBRef, view === "editor");
+
+  // T4.1: 把 overlay 容器 ref 绑定到预览引擎
+  useEffect(() => {
+    setOverlayContainer(overlayContainerRef.current);
+  }, [setOverlayContainer, view]);
   // 高频字段（每帧）：播放头时间
   const playhead = usePlaybackStore((s) => s.currentTime);
   const isPlaying = usePlaybackStore((s) => s.playing);
@@ -328,6 +335,20 @@ export function App() {
     if (!selectedClip) return;
     const nextTransform = { ...overlayTransform, ...patch };
     updateSelectedClip({ transform: nextTransform }, commit);
+  }
+
+  /** T4.2: 在当前播放头位置为指定属性打一个关键帧 */
+  function addKeyframeAtPlayhead(prop: "x" | "y" | "scale" | "opacity" | "rotation" | "volume", value: number) {
+    if (!selectedClip || !project) return;
+    const relTime = Math.max(0, playhead - selectedClip.startOnTrack);
+    const cur = selectedClip.keyframes ?? {};
+    const arr = (cur[prop] ?? []).slice();
+    // 移除同时间点的旧帧（覆盖）
+    const filtered = arr.filter((k) => Math.abs(k.time - relTime) > 0.05);
+    filtered.push({ time: relTime, value, easing: "linear" });
+    filtered.sort((a, b) => a.time - b.time);
+    updateSelectedClip({ keyframes: { ...cur, [prop]: filtered } });
+    setStatus(`已为 ${prop} 在 ${relTime.toFixed(2)}s 打关键帧`);
   }
 
   // 项目总时长 = 所有 clip 的最大结束位置
@@ -2101,27 +2122,8 @@ export function App() {
             {/* WebGL 滤镜 canvas：覆盖在 video 上，GPU shader 实时处理滤镜 */}
             <canvas ref={filterCanvasRef} className="stage-filter-canvas" />
             {/* 画中画叠加层：上层视频轨 clip 按 transform 叠加显示 */}
-            {activeOverlayClips.map((clip) => {
-              const src = project?.media.find((m) => m.id === clip.sourceId);
-              const mediaSrc = desktopApi.mediaSrc(src?.localPath || src?.thumbnailUrl || null);
-              if (!mediaSrc) return null;
-              const tf = clip.transform;
-              return (
-                <div
-                  key={clip.id}
-                  className="stage-overlay-clip"
-                  style={{
-                    left: `${tf?.x ?? 50}%`,
-                    top: `${tf?.y ?? 50}%`,
-                    width: `${tf?.scale ?? 100}%`,
-                    opacity: (tf?.opacity ?? 100) / 100,
-                    mixBlendMode: (tf?.mix ?? "normal") as React.CSSProperties["mixBlendMode"],
-                  }}
-                >
-                  <img src={mediaSrc} alt="" draggable={false} />
-                </div>
-              );
-            })}
+            {/* T4.1: 画中画叠加层容器 —— PreviewEngine 在里面动态管理 overlay <video> */}
+            <div ref={overlayContainerRef} className="stage-overlay-container" />
             {!activeVideoClip && !selectedMediaSrc && (
               <div className="stage-content">
                 <ImagePlay size={46} />
@@ -2805,6 +2807,19 @@ export function App() {
                       <div className="trim-title">
                         <Layers size={15} />
                         画中画变换
+                      </div>
+                      {/* T4.2: 关键帧 —— 在播放头处为属性打关键帧 */}
+                      <div className="keyframe-row">
+                        <span className="kf-label">关键帧（@ {playhead.toFixed(1)}s）</span>
+                        <div className="kf-buttons">
+                          <button title="在播放头处为水平位置打关键帧" onClick={() => addKeyframeAtPlayhead("x", overlayTransform.x)}>◆ X</button>
+                          <button title="在播放头处为垂直位置打关键帧" onClick={() => addKeyframeAtPlayhead("y", overlayTransform.y)}>◆ Y</button>
+                          <button title="在播放头处为缩放打关键帧" onClick={() => addKeyframeAtPlayhead("scale", overlayTransform.scale)}>◆ 缩放</button>
+                          <button title="在播放头处为不透明度打关键帧" onClick={() => addKeyframeAtPlayhead("opacity", overlayTransform.opacity ?? 100)}>◆ 透明</button>
+                          {selectedClip?.keyframes && (
+                            <button title="清除所有关键帧" onClick={() => updateSelectedClip({ keyframes: null })}>✕ 清除</button>
+                          )}
+                        </div>
                       </div>
                       <label>
                         水平位置（{overlayTransform.x.toFixed(0)}%）

@@ -536,6 +536,46 @@ textarea {
   opacity: 0;
 }
 
+/* T4.1: 画中画叠加层容器 + 引擎动态创建的 video */
+.stage-overlay-container {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+.stage-overlay-video {
+  position: absolute;
+  object-fit: contain;
+  pointer-events: none;
+}
+
+/* T4.2: 关键帧操作区 */
+.keyframe-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+  padding: 6px 8px;
+  background: #1a1b1e;
+  border-radius: 4px;
+}
+.kf-label { font-size: 11px; color: #888; }
+.kf-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.kf-buttons button {
+  font-size: 11px;
+  padding: 3px 7px;
+  background: #2a2b2f;
+  border: 1px solid #3a3b40;
+  color: var(--accent);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.kf-buttons button:hover { background: #34353a; }
+
 .stage-content {
   position: absolute;
   inset: 0;

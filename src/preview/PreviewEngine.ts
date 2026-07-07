@@ -1,4 +1,5 @@
 import type { Clip, MediaSource, Project, TrackKind } from "../types";
+import { sampleAllKeyframes } from "../editor/keyframes";
 
 /**
  * 实时预览引擎：按统一的 currentTime 时钟，同步调度
@@ -30,12 +31,28 @@ export class PreviewEngine {
   private currentVideoClipId: string | null = null;
   private preloadedSrc: string | null = null;
 
+  /**
+   * T4.1: 画中画叠加层 video 池。
+   * key = overlay clip.id，value = 独立 <video> 元素（由引擎动态创建/销毁）。
+   * 容器由 App.tsx 通过 overlayContainer 提供；引擎在内部增删 video 子节点。
+   */
+  private overlayContainer: HTMLElement | null = null;
+  private overlayVideoPool = new Map<string, HTMLVideoElement>();
+  private overlaySyncedClips = new Set<string>();
+
   constructor(mainVideo: HTMLVideoElement, preloadVideo: HTMLVideoElement, onTick: (state: EngineState) => void) {
     this.videoEl = mainVideo;
     this.preloader = preloadVideo;
     this.preloader.style.opacity = "0";
     this.preloader.style.pointerEvents = "none";
     this.onTick = onTick;
+  }
+
+  /** T4.1: 设置画中画叠加层容器（引擎在里面动态管理 video 子节点） */
+  setOverlayContainer(container: HTMLElement | null) {
+    this.overlayContainer = container;
+    // 容器变化时清空旧池
+    this.clearOverlayPool();
   }
 
   get activeVideo(): HTMLVideoElement {
@@ -101,6 +118,7 @@ export class PreviewEngine {
     this.currentTime = Math.max(0, Math.min(time, this.getDuration()));
     this.currentVideoClipId = null;
     this.applyVideoAlignment(true);
+    this.syncOverlays();
     if (wasPlaying) {
       this.startAudioScheduling();
       this.lastFrameAt = performance.now();
@@ -121,11 +139,24 @@ export class PreviewEngine {
     });
     this.activeAudioSources.clear();
     this.audioBuffers.clear();
+    this.clearOverlayPool();
     if (this.audioCtx) {
       void this.audioCtx.close();
       this.audioCtx = null;
     }
     this.project = null;
+  }
+
+  /** T4.1: 清空画中画 video 池 */
+  private clearOverlayPool() {
+    this.overlayVideoPool.forEach((v) => {
+      try { v.pause(); } catch { /* ignore */ }
+      v.removeAttribute("src");
+      try { v.load(); } catch { /* ignore */ }
+      v.remove();
+    });
+    this.overlayVideoPool.clear();
+    this.overlaySyncedClips.clear();
   }
 
   private loop = () => {
@@ -143,6 +174,7 @@ export class PreviewEngine {
     }
 
     this.applyVideoAlignment(false);
+    this.syncOverlays();
     this.publish();
     this.rafId = requestAnimationFrame(this.loop);
   };
@@ -222,6 +254,99 @@ export class PreviewEngine {
     }
     if (!this.playing && !this.videoEl.paused) {
       this.videoEl.pause();
+    }
+  }
+
+  /**
+   * T4.1: 同步画中画叠加层 —— 为每个活跃 overlay clip 分配/更新一个 <video>。
+   * 池上限 3，超出的 clip 不渲染（剪映也有类似限制）。
+   * 每个 overlay video 独立执行 seek 追赶 + transform 应用。
+   */
+  private syncOverlays() {
+    if (!this.project) return;
+    const overlays = this.findAllClipsAt(this.currentTime, ["video", "image"]).slice(1);
+    const activeIds = new Set(overlays.map((c) => c.id));
+
+    // 1. 移除不再活跃的 overlay video
+    for (const [clipId, v] of this.overlayVideoPool) {
+      if (!activeIds.has(clipId)) {
+        try { v.pause(); } catch { /* ignore */ }
+        v.style.display = "none";
+        this.overlaySyncedClips.delete(clipId);
+      }
+    }
+
+    // 2. 为活跃 clip 分配 video（上限 3）
+    const MAX_OVERLAYS = 3;
+    let allocated = 0;
+    for (const clip of overlays) {
+      if (allocated >= MAX_OVERLAYS) break;
+      allocated++;
+      const media = this.findMedia(clip.sourceId);
+      const src = media ? this.resolveSrc(media) : null;
+      if (!src) continue;
+
+      let v = this.overlayVideoPool.get(clip.id);
+      if (!v) {
+        // 动态创建 video（需在 overlayContainer 内）
+        if (!this.overlayContainer) continue;
+        v = document.createElement("video");
+        v.className = "stage-overlay-video";
+        v.muted = true; // 叠加层不发声（音频由主混音管）
+        v.playsInline = true;
+        v.style.position = "absolute";
+        v.style.pointerEvents = "none";
+        v.style.transformOrigin = "center center";
+        this.overlayContainer.appendChild(v);
+        this.overlayVideoPool.set(clip.id, v);
+      }
+      v.style.display = "block";
+
+      // 设置 src（仅当变化时）
+      if (!v.src || !v.src.includes(src)) {
+        v.src = src;
+        v.load();
+      }
+
+      // 应用 transform（位置/缩放/不透明度/混合模式）
+      // T4.2: 有 keyframes 时按当前时间采样覆盖
+      const tf = clip.transform;
+      const rel = this.currentTime - clip.startOnTrack;
+      const kf = sampleAllKeyframes(clip.keyframes, rel);
+      const x = kf.x ?? tf?.x ?? 50;
+      const y = kf.y ?? tf?.y ?? 50;
+      const scaleVal = kf.scale ?? tf?.scale ?? 100;
+      const scale = scaleVal / 100;
+      const opacity = (kf.opacity ?? tf?.opacity ?? 100) / 100;
+      const rotation = kf.rotation ?? tf?.rotation ?? 0;
+      v.style.left = `${x}%`;
+      v.style.top = `${y}%`;
+      v.style.width = `${scaleVal}%`;
+      v.style.transform = `translate(-50%, -50%) rotate(${rotation}deg) scale(${scale})`;
+      v.style.opacity = String(opacity);
+      if (tf?.mix) {
+        (v.style.mixBlendMode as string) = tf.mix;
+      }
+
+      // seek 追赶（同主 video 逻辑，rel 已在上面计算）
+      const targetSourceTime = clip.sourceIn + Math.max(0, rel) * clip.speed;
+      const rate = Math.min(4, Math.max(0.25, Math.abs(clip.speed)));
+      v.playbackRate = rate;
+      const seekThreshold = 0.3 + rate * 0.2;
+      if (Math.abs(v.currentTime - targetSourceTime) > seekThreshold) {
+        try {
+          v.currentTime = Math.min(
+            Math.max(0, targetSourceTime),
+            Math.max(0, (media?.duration || 0) - 0.05),
+          );
+        } catch { /* metadata not ready */ }
+      }
+      if (this.playing && v.paused) {
+        void v.play().catch(() => {});
+      }
+      if (!this.playing && !v.paused) {
+        v.pause();
+      }
     }
   }
 
