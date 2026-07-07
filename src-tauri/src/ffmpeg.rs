@@ -372,6 +372,14 @@ pub async fn render_project_video(
     let hw = HW_ENCODER.get().map(|s| s.as_str()).unwrap_or("libx264");
     eprintln!("使用编码器: {hw}");
 
+    // 统一计算目标尺寸：preview 用 540p 短边，导出用 renderConfig.resolution
+    // 保证所有段 + 字幕坐标系 + xfade 合并全部使用同一组尺寸
+    let (target_w, target_h) = if preview {
+        dimensions_for_ratio(&project.ratio, true)
+    } else {
+        export_dimensions_for_project(project)
+    };
+
     // 收集视频轨 + 图片轨（图片轨叠加在视频轨之上）
     let mut video_tracks: Vec<&crate::models::Track> = project
         .tracks
@@ -447,6 +455,9 @@ pub async fn render_project_video(
                 seg_duration,
                 seg_index,
                 preview,
+                hw,
+                target_w,
+                target_h,
             )
             .await?;
             segment_paths.push(path);
@@ -462,6 +473,9 @@ pub async fn render_project_video(
             seg_duration,
             seg_index,
             preview,
+            hw,
+            target_w,
+            target_h,
         )
         .await?;
         segment_paths.push(path);
@@ -551,12 +565,11 @@ pub async fn render_project_video(
         args.push(filter.to_string());
         args.push("-map".to_string());
         args.push(prev_label);
+        // 编码器：统一用 encoder_args（硬件编码器用 bitrate，软编用 preset+crf）
+        let (xfade_enc_name, xfade_enc_extra) = encoder_args(hw, preview);
         args.push("-c:v".to_string());
-        args.push(HW_ENCODER.get().map(|s| s.as_str()).unwrap_or("libx264").to_string());
-        args.push("-preset".to_string());
-        args.push(if preview { "ultrafast" } else { "veryfast" }.to_string());
-        args.push("-crf".to_string());
-        args.push(if preview { "30" } else { "23" }.to_string());
+        args.push(xfade_enc_name);
+        args.extend(xfade_enc_extra);
         args.push("-r".to_string());
         args.push(format!("{}", project.render_config.fps));
         args.push("-an".to_string());
@@ -581,7 +594,34 @@ pub async fn render_project_video(
     }
 
     // 第二遍：叠加配音轨 + 烧录字幕轨
-    burn_subtitle_and_mix_audio(cache_dir, projects_dir, project, &raw_output, preview).await
+    // 转场偏移表：xfade 会让视频总长缩短，音频/字幕需要同步平移
+    // 收集所有转场的发生时间点（转场前一段的结束时间）和缩短量
+    let transition_shrink_points = if has_transitions && segments.len() > 1 {
+        let td = 0.5_f64;
+        let mut points: Vec<(f64, f64)> = Vec::new();
+        let mut acc = segments[0].1 - segments[0].0; // 第一段时长
+        for i in 1..segments.len() {
+            let seg_start = segments[i].0;
+            let has_trans = video_clips.iter().any(|c| {
+                (c.start_on_track - seg_start).abs() < 0.5
+                    && c.transition_in.is_some()
+                    && c.transition_in.as_deref() != Some("none")
+            });
+            if has_trans {
+                // 转场在 acc - td 处发生（前一段末尾开始重叠）
+                // 该转场使后续时间线累计缩短 td
+                points.push((acc, td));
+                acc += (segments[i].1 - segments[i].0) - td;
+            } else {
+                acc += segments[i].1 - segments[i].0;
+            }
+        }
+        points
+    } else {
+        Vec::new()
+    };
+
+    burn_subtitle_and_mix_audio(cache_dir, projects_dir, project, &raw_output, preview, &transition_shrink_points).await
 }
 
 /// 渲染纯黑背景段（无活跃 clip 的时间段，保证时间线连续）。
@@ -591,34 +631,27 @@ async fn render_black_segment(
     seg_duration: f64,
     seg_index: usize,
     preview: bool,
+    encoder: &str,
+    width: u32,
+    height: u32,
 ) -> anyhow::Result<PathBuf> {
-    let (width, height) = dimensions_for_ratio(&project.ratio, preview);
-    let (enc_name, enc_args) = encoder_args("libx264", preview); let preset = if preview { "ultrafast" } else { "veryfast" };
-    let crf = if preview { "30" } else { "23" };
+    let (enc_name, enc_extra) = encoder_args(encoder, preview);
     let output_path = segment_dir.join(format!("seg-{:03}.mp4", seg_index));
     let filter = format!("color=c=black:s={width}x{height}:r={},format=yuv420p", project.render_config.fps);
-    let output = Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            &filter,
-            "-t",
-            &format!("{:.3}", seg_duration),
-            "-c:v",
-            "libx264",
-            "-preset",
-            preset,
-            "-crf",
-            crf,
-            "-an",
-            "-movflags",
-            "+faststart",
-            &output_path.to_string_lossy(),
-        ])
-        .output()
-        .await?;
+    let mut args: Vec<String> = vec![
+        "-y".to_string(),
+        "-f".to_string(), "lavfi".to_string(),
+        "-i".to_string(), filter,
+        "-t".to_string(), format!("{:.3}", seg_duration),
+        "-c:v".to_string(), enc_name,
+    ];
+    args.extend(enc_extra);
+    args.extend([
+        "-an".to_string(),
+        "-movflags".to_string(), "+faststart".to_string(),
+        output_path.to_string_lossy().to_string(),
+    ]);
+    let output = Command::new("ffmpeg").args(&args).output().await?;
     if !output.status.success() {
         anyhow::bail!(
             "渲染黑屏段 {} 失败：{}",
@@ -640,17 +673,17 @@ async fn render_segment_with_overlay(
     seg_duration: f64,
     seg_index: usize,
     preview: bool,
+    encoder: &str,
+    width: u32,
+    height: u32,
 ) -> anyhow::Result<PathBuf> {
-    let (width, height) = dimensions_for_ratio(&project.ratio, preview);
-    let (enc_name, enc_args) = encoder_args("libx264", preview); let preset = if preview { "ultrafast" } else { "veryfast" };
-    let crf = if preview { "30" } else { "23" };
     let fps = project.render_config.fps;
 
     // 单 clip 的情况：直接渲染（无需 overlay）
     if active_clips.len() == 1 {
         let clip = active_clips[0];
         return render_single_clip_for_segment(
-            cache_dir, segment_dir, project, clip, seg_start, seg_duration, seg_index, preview,
+            cache_dir, segment_dir, project, clip, seg_start, seg_duration, seg_index, preview, encoder, width, height,
         )
         .await;
     }
@@ -725,14 +758,16 @@ async fn render_segment_with_overlay(
         } else {
             format!("{}{}", source_crop.trim_start_matches(','), scale_expr)
         };
-        // 圆角：用 alphaextract + geq 做四角圆切（简化版，radius 像素）
+        // 圆角：用 geq 在 alpha 通道上做四角圆切（radius 像素）
         if let Some(t) = tf {
             if t.corner_radius > 0 {
                 let r = t.corner_radius as f64;
-                // geq 在 yuva420p 的 alpha 通道上操作：四角做距离判断
+                // 四角圆心距离判断：到任一角圆心距离 > r 则透明。
+                // 四个 gt(...) 分别对应四个角，任一超出圆弧（距离平方 > r²）即 alpha=0。
                 chain.push_str(&format!(
-                    ",format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X.Y)':a='if(gt(lt(min(min(pow(max({r}-X,0)+pow(max({r}-Y,0),2),0.5),pow(max(X-(W-{r}),0)+pow(max({r}-Y,0),2),0.5)),min(pow(max({r}-X,0)+pow(max(Y-(H-{r}),0),2),0.5),pow(max(X-(W-{r}),0)+pow(max(Y-(H-{r}),0),2),0.5)))*{r},1),255,0)'",
-                    r = r
+                    ",format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(gt(pow(max({r}-X,0),2)+pow(max({r}-Y,0),2),{r2})+gt(pow(max(X-(W-1-{r}),0),2)+pow(max({r}-Y,0),2),{r2})+gt(pow(max({r}-X,0),2)+pow(max(Y-(H-1-{r}),0),2),{r2})+gt(pow(max(X-(W-1-{r}),0),2)+pow(max(Y-(H-1-{r}),0),2),{r2}),0,255)'",
+                    r = r,
+                    r2 = r * r
                 ));
             }
         }
@@ -776,12 +811,11 @@ async fn render_segment_with_overlay(
     args.push(prev_label);
     args.push("-r".to_string());
     args.push(format!("{}", fps));
+    // 编码器：统一用 encoder_args
+    let (ovl_enc_name, ovl_enc_extra) = encoder_args(encoder, preview);
     args.push("-c:v".to_string());
-    args.push(HW_ENCODER.get().map(|s| s.as_str()).unwrap_or("libx264").to_string());
-    args.push("-preset".to_string());
-    args.push(preset.to_string());
-    args.push("-crf".to_string());
-    args.push(crf.to_string());
+    args.push(ovl_enc_name);
+    args.extend(ovl_enc_extra);
     args.push("-an".to_string());
     args.push("-movflags".to_string());
     args.push("+faststart".to_string());
@@ -810,6 +844,9 @@ async fn render_single_clip_for_segment(
     seg_duration: f64,
     seg_index: usize,
     preview: bool,
+    encoder: &str,
+    width: u32,
+    height: u32,
 ) -> anyhow::Result<PathBuf> {
     let source = match project
         .media
@@ -818,11 +855,10 @@ async fn render_single_clip_for_segment(
         Some(s) => s,
         None => {
             // 未绑定素材 → 渲染纯黑段（避免崩溃）
-            return render_black_segment(segment_dir, project, seg_duration, seg_index, preview).await;
+            return render_black_segment(segment_dir, project, seg_duration, seg_index, preview, encoder, width, height).await;
         }
     };
     let local_path = ensure_media_local(cache_dir, source).await?;
-    let (width, height) = dimensions_for_ratio(&project.ratio, preview);
     let scale_filter = format!(
         "scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},format=yuv420p"
     );
@@ -846,8 +882,6 @@ async fn render_single_clip_for_segment(
 
     let offset_into_clip = (seg_start - clip.start_on_track).max(0.0);
     let source_time = clip.source_in + offset_into_clip * speed_abs;
-    let (enc_name, enc_args) = encoder_args("libx264", preview); let preset = if preview { "ultrafast" } else { "veryfast" };
-    let crf = if preview { "30" } else { "23" };
     let output_path = segment_dir.join(format!("seg-{:03}.mp4", seg_index));
 
     let is_image = source.kind == "image";
@@ -874,12 +908,11 @@ async fn render_single_clip_for_segment(
     args.push(video_filter);
     args.push("-r".to_string());
     args.push(format!("{}", project.render_config.fps));
+    // 编码器：统一用 encoder_args
+    let (sc_enc_name, sc_enc_extra) = encoder_args(encoder, preview);
     args.push("-c:v".to_string());
-    args.push(HW_ENCODER.get().map(|s| s.as_str()).unwrap_or("libx264").to_string());
-    args.push("-preset".to_string());
-    args.push(preset.to_string());
-    args.push("-crf".to_string());
-    args.push(crf.to_string());
+    args.push(sc_enc_name);
+    args.extend(sc_enc_extra);
     args.push("-an".to_string());
     args.push("-movflags".to_string());
     args.push("+faststart".to_string());
@@ -904,6 +937,8 @@ async fn burn_subtitle_and_mix_audio(
     project: &Project,
     video_input: &Path,
     preview: bool,
+    // 转场偏移表：(转场发生时间点, 缩短量)。音频/字幕按此平移以对齐 xfade 后的视频
+    transition_shrink_points: &[(f64, f64)],
 ) -> anyhow::Result<PathBuf> {
     let render_dir = projects_dir.join(&project.id).join("renders");
     let output_path = render_dir.join(if preview { "preview.mp4" } else { "final.mp4" });
@@ -957,7 +992,7 @@ async fn burn_subtitle_and_mix_audio(
 
     // 生成 .ass 字幕文件
     let ass_path = if has_subtitles {
-        let ass = generate_ass_subtitles(&subtitle_clips, project);
+        let ass = generate_ass_subtitles(&subtitle_clips, project, transition_shrink_points);
         let ass_file = cache_dir.join(format!(
             "subtitles-{}-{}.ass",
             project.id,
@@ -976,7 +1011,7 @@ async fn burn_subtitle_and_mix_audio(
             project.id,
             chrono::Utc::now().timestamp_millis()
         ));
-        match merge_audio_clips(cache_dir, &merged, &audio_clips, project, &project.media).await {
+        match merge_audio_clips(cache_dir, &merged, &audio_clips, project, &project.media, transition_shrink_points).await {
             Ok(p) => Some(p),
             Err(e) => {
                 eprintln!("音频混音失败，导出将无音轨：{e}");
@@ -988,7 +1023,6 @@ async fn burn_subtitle_and_mix_audio(
     };
 
     // 构造 ffmpeg 命令：烧录字幕 + 混入配音
-    let (width, height) = dimensions_for_ratio(&project.ratio, preview);
     let mut args: Vec<String> = vec!["-y".to_string(), "-i".to_string(), video_input.to_string_lossy().to_string()];
 
     // 如果有配音，加入第二个输入
@@ -1021,11 +1055,13 @@ async fn burn_subtitle_and_mix_audio(
     }
 
     args.push("-c:v".to_string());
-    args.push(HW_ENCODER.get().map(|s| s.as_str()).unwrap_or("libx264").to_string());
-    args.push("-preset".to_string());
-    args.push(if preview { "ultrafast" } else { "veryfast" }.to_string());
-    args.push("-crf".to_string());
-    args.push(if preview { "30" } else { "23" }.to_string());
+    // 编码器：统一用 encoder_args（硬件用 bitrate，软编用 preset+crf）
+    let (burn_enc_name, burn_enc_extra) = encoder_args(
+        HW_ENCODER.get().map(|s| s.as_str()).unwrap_or("libx264"),
+        preview,
+    );
+    args.push(burn_enc_name);
+    args.extend(burn_enc_extra);
 
     if merged_audio_path.is_some() {
         args.push("-c:a".to_string());
@@ -1058,11 +1094,13 @@ async fn burn_subtitle_and_mix_audio(
             retry_args.push("1:a".to_string());
         }
         retry_args.push("-c:v".to_string());
-        retry_args.push("libx264".to_string());
-        retry_args.push("-preset".to_string());
-        retry_args.push(if preview { "ultrafast" } else { "veryfast" }.to_string());
-        retry_args.push("-crf".to_string());
-        retry_args.push(if preview { "30" } else { "23" }.to_string());
+        // 重试也用 encoder_args（保持编码器一致，避免 concat 花屏）
+        let (retry_enc_name, retry_enc_extra) = encoder_args(
+            HW_ENCODER.get().map(|s| s.as_str()).unwrap_or("libx264"),
+            preview,
+        );
+        retry_args.push(retry_enc_name);
+        retry_args.extend(retry_enc_extra);
         if merged_audio_path.is_some() {
             retry_args.push("-c:a".to_string());
             retry_args.push("aac".to_string());
@@ -1083,7 +1121,12 @@ async fn burn_subtitle_and_mix_audio(
 }
 
 /// 生成 .ass 字幕文件内容（含样式：字体/字号/颜色/位置/描边）
-fn generate_ass_subtitles(subtitle_clips: &[&Clip], project: &Project) -> String {
+fn generate_ass_subtitles(
+    subtitle_clips: &[&Clip],
+    project: &Project,
+    // 转场偏移表：字幕时间戳按此平移以对齐 xfade 后的视频
+    transition_shrink_points: &[(f64, f64)],
+) -> String {
     let (width, height) = export_dimensions_for_project(project);
     let default_style = crate::models::SubtitleStyle::default();
 
@@ -1174,8 +1217,14 @@ fn generate_ass_subtitles(subtitle_clips: &[&Clip], project: &Project) -> String
         if text.trim().is_empty() {
             continue;
         }
-        let start = seconds_to_ass_time(clip.start_on_track);
-        let end = seconds_to_ass_time(clip.start_on_track + clip.duration);
+        // 转场偏移：字幕时间戳减去它之前所有转场的累计缩短量
+        let shrink_before: f64 = transition_shrink_points
+            .iter()
+            .filter(|(t, _)| *t <= clip.start_on_track)
+            .map(|(_, d)| *d)
+            .sum();
+        let start = seconds_to_ass_time((clip.start_on_track - shrink_before).max(0.0));
+        let end = seconds_to_ass_time((clip.start_on_track + clip.duration - shrink_before).max(0.0));
 
         let style_name = if let Some(ref s) = clip.subtitle_style {
             style_names.iter()
@@ -1293,6 +1342,8 @@ async fn merge_audio_clips(
     audio_clips: &[&Clip],
     project: &Project,
     media: &[crate::models::MediaSource],
+    // 转场偏移表：(转场发生时间点, 缩短量)。clip 的 adelay 减去它之前所有转场的累计缩短量
+    transition_shrink_points: &[(f64, f64)],
 ) -> anyhow::Result<PathBuf> {
     let total_duration = audio_clips
         .iter()
@@ -1359,7 +1410,14 @@ async fn merge_audio_clips(
     // 默认最小淡入淡出 30ms（消除 clip 首尾波形硬切导致的爆音，借鉴 video-use 的切点交叉淡入淡出）
     const DEFAULT_FADE: f64 = 0.03;
     for (i, clip) in audio_clips.iter().enumerate().take(n) {
-        let delay_ms = (clip.start_on_track * 1000.0).round() as u64;
+        // 转场偏移：clip 起点之前所有转场累计缩短的时长，adelay 要减去它
+        let shrink_before: f64 = transition_shrink_points
+            .iter()
+            .filter(|(t, _)| *t <= clip.start_on_track)
+            .map(|(_, d)| *d)
+            .sum();
+        let adjusted_start = (clip.start_on_track - shrink_before).max(0.0);
+        let delay_ms = (adjusted_start * 1000.0).round() as u64;
         let dur = clip.duration;
         // 用户没设 fade 时给 30ms 默认值（足够消除爆音，听感上无感知）
         let fade_in = if clip.fade_in > 0.001 {

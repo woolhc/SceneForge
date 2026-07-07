@@ -27,6 +27,7 @@ export function ContextMenu({
     onReverse: () => void;
     onEnableToggle: () => void;
     onAddSubtitle: () => void;
+    onEditText?: () => void;
   };
 }) {
   const ref = useRef<HTMLDivElement | null>(null);
@@ -103,7 +104,7 @@ export function ContextMenu({
 
       {/* 字幕专用 */}
       {isSubtitle && (
-        <button onClick={() => { actions.onSplit(); onClose(); }}>
+        <button onClick={() => { actions.onEditText?.(); onClose(); }}>
           <EditIcon /> 编辑文字
         </button>
       )}

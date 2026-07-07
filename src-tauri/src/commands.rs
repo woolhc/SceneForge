@@ -372,6 +372,9 @@ pub async fn generate_audio(
     }
 
     let audio_dir = state.paths.projects_dir.join(&project.id).join("audio");
+    // T1.10: 收集本次产物，await 后重读最新 project 定向合并（避免覆盖用户并发编辑）
+    let mut generated_media: Vec<(String, MediaSource)> = Vec::new();
+    let mut generated_clip_updates: Vec<(String, f64)> = Vec::new();
     for clip_id in voiceover_clips {
         let clip = project
             .clips
@@ -407,8 +410,8 @@ pub async fn generate_audio(
             existing = Some(idx);
         }
         match existing {
-            Some(idx) => project.media[idx] = audio_source,
-            None => project.media.push(audio_source),
+            Some(idx) => project.media[idx] = audio_source.clone(),
+            None => project.media.push(audio_source.clone()),
         }
 
         // 更新配音 clip：duration 对齐真实时长，绑定素材。
@@ -421,10 +424,39 @@ pub async fn generate_audio(
                 c.source_out = real_duration.max(1.0);
             }
         });
+
+        // 记录本次产物，稍后合并到最新 project（避免覆盖用户并发编辑）
+        generated_media.push((source_id.clone(), audio_source));
+        generated_clip_updates.push((clip_id.clone(), real_duration));
     }
 
+    // T1.10 修复：重读最新 project（用户可能在 TTS 期间编辑过），定向合并本次产物
     let conn = state.db.lock().map_err(map_error)?;
-    storage::save_project(&conn, &project).map_err(map_error)
+    let mut latest = storage::get_project(&conn, &request.project_id).map_err(map_error)?;
+    // 合并 media
+    for (sid, src) in &generated_media {
+        if let Some(idx) = latest.media.iter().position(|m| m.id == *sid) {
+            latest.media[idx] = src.clone();
+        } else {
+            latest.media.push(src.clone());
+        }
+    }
+    // 合并 clip 更新（按 clip_id 定位；若用户已删除该 clip 则跳过）
+    for (clip_id, real_duration) in &generated_clip_updates {
+        latest.clips.iter_mut().for_each(|c| {
+            if c.id == *clip_id {
+                c.duration = real_duration.max(1.0);
+                c.source_out = real_duration.max(1.0);
+                // source_id 已在上面 media 合并时记录，这里补绑
+                for (sid, _) in &generated_media {
+                    if sid.contains(clip_id) {
+                        c.source_id = Some(sid.clone());
+                    }
+                }
+            }
+        });
+    }
+    storage::save_project(&conn, &latest).map_err(map_error)
 }
 
 // ============================================================================

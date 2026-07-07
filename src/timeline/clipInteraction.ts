@@ -14,11 +14,14 @@ export type DragState = {
     duration: number;
     sourceIn: number;
     sourceOut: number;
+    speed: number;
   };
   /** 拖拽开始时同轨道其他 clip（用于吸附参考） */
   peers: Clip[];
   /** 当前播放头位置（用于吸附） */
   playhead?: number;
+  /** 拖拽过程中最后一次计算的 patch（endDrag 时用它 commit=true） */
+  lastPatch?: Partial<Clip>;
 };
 
 /** 像素 → 秒换算 */
@@ -112,13 +115,15 @@ export function computeDraggedClip(
       }
     }
 
-    // 受源媒体时长限制
+    // 受源媒体时长限制（源区间 = 时间线时长 × speed）
+    const speed = initial.speed || 1;
     if (sourceDuration !== undefined) {
-      const maxBySource = sourceDuration - initial.sourceIn;
+      const maxBySource = (sourceDuration - initial.sourceIn) / speed;
       if (newDuration > maxBySource) newDuration = Math.max(0.2, maxBySource);
     }
     result.duration = newDuration;
-    result.sourceOut = initial.sourceIn + newDuration;
+    // sourceOut 必须乘 speed：时间线缩短 1s → 源区间变化 speed 秒
+    result.sourceOut = initial.sourceIn + newDuration * speed;
   } else {
     // 左边缘
     let deltaStart = deltaSeconds;
@@ -141,10 +146,12 @@ export function computeDraggedClip(
       }
     }
 
-    result.sourceIn = initial.sourceIn + (newStart - initial.startOnTrack);
+    // 左手柄 trim：时间线 delta → 源区间 delta × speed
+    const speed = initial.speed || 1;
+    result.sourceIn = initial.sourceIn + (newStart - initial.startOnTrack) * speed;
     result.startOnTrack = Math.max(0, newStart);
     result.duration = Math.max(0.2, newDuration);
-    result.sourceOut = result.sourceIn + result.duration;
+    result.sourceOut = result.sourceIn + result.duration * speed;
   }
 
   return result;

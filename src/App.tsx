@@ -308,10 +308,10 @@ export function App() {
   // 选中 clip 的变换（带默认值兜底）
   const overlayTransform: ClipTransform = selectedClip?.transform ?? DEFAULT_TRANSFORM;
 
-  function updateOverlayTransform(patch: Partial<ClipTransform>) {
+  function updateOverlayTransform(patch: Partial<ClipTransform>, commit: boolean = true) {
     if (!selectedClip) return;
     const nextTransform = { ...overlayTransform, ...patch };
-    updateSelectedClip({ transform: nextTransform });
+    updateSelectedClip({ transform: nextTransform }, commit);
   }
 
   // 项目总时长 = 所有 clip 的最大结束位置
@@ -344,10 +344,14 @@ export function App() {
     };
   }, []);
 
-  // 每帧渲染滤镜（跟随预览引擎的 currentTime）
+  // 每帧渲染滤镜：用"播放头所在的活跃视频 clip"，而非 selectedClip
+  // 这样播放跨片段时滤镜正确切换；选中 A 播放 B 时显示 B 的滤镜
   useEffect(() => {
-    if (!filterRendererRef.current || !selectedClip) return;
-    filterRendererRef.current.render(selectedClip);
+    if (!filterRendererRef.current) return;
+    // 优先用引擎提供的活跃视频 clip；回退到 selectedClip（暂停时）
+    const target = engineState.activeVideoClip || selectedClip;
+    if (!target) return;
+    filterRendererRef.current.render(target);
   });
 
   useEffect(() => {
@@ -540,6 +544,16 @@ export function App() {
 
   async function persist(next: Project, message = "已保存") {
     pushUndo(projectRef.current); // 修改前保存撤销快照
+    setProject(next);
+    const saved = await desktopApi.saveProject(next);
+    setProject(saved);
+    await refreshProjects(saved.id);
+    setStatus(message);
+  }
+
+  /** persist 变体：用外部提供的"操作前快照"压入撤销栈（用于拖拽等交互式编辑） */
+  async function persistWithSnapshot(next: Project, snapshot: Project | null, message = "已保存") {
+    pushUndo(snapshot); // 用拖拽开始时的快照，而非中间态
     setProject(next);
     const saved = await desktopApi.saveProject(next);
     setProject(saved);
@@ -1314,8 +1328,17 @@ export function App() {
     setProject({ ...project, ...patch });
   }
 
-  function updateSelectedClip(patch: Partial<Clip>) {
+  /**
+   * 更新选中 clip 的属性。
+   * commit=true（默认）：持久化 + 压入撤销栈。
+   * commit=false：只更新本地 state（滑块拖动中用），配合后续 commit=true 提交。
+   */
+  function updateSelectedClip(patch: Partial<Clip>, commit: boolean = true) {
     if (!project || !selectedClip) return;
+    // 交互式编辑开始（首次非 commit 调用）→ 记录操作前快照
+    if (!commit && !interactiveEditSnapshotRef.current) {
+      interactiveEditSnapshotRef.current = structuredClone(project);
+    }
     const next: Project = {
       ...project,
       clips: project.clips.map((clip) =>
@@ -1323,6 +1346,19 @@ export function App() {
       ),
     };
     setProject(next);
+    if (commit) {
+      const snapshot = interactiveEditSnapshotRef.current;
+      interactiveEditSnapshotRef.current = null;
+      void persistWithSnapshot(next, snapshot, "已更新属性");
+    }
+  }
+
+  /** 提交交互式编辑（滑块释放时调用）：用开始时的快照压入撤销栈并持久化 */
+  function commitInteractiveEdit(message = "已更新属性") {
+    if (!project || !interactiveEditSnapshotRef.current) return;
+    const snapshot = interactiveEditSnapshotRef.current;
+    interactiveEditSnapshotRef.current = null;
+    void persistWithSnapshot(project, snapshot, message);
   }
 
   /** 工具栏分割：在 playhead 处把当前选中的 clip 一分为二。 */
@@ -1454,20 +1490,29 @@ export function App() {
   }
 
   /** 时间线拖拽回写：拖动中只更新本地 state（不保存），释放时提交。 */
+  // 交互式编辑（拖拽/滑块）开始时记录快照，commit 时用它压入撤销栈（避免中间态污染）
+  const interactiveEditSnapshotRef = useRef<Project | null>(null);
   function handleClipDrag(clipId: string, patch: Partial<Clip>, commit: boolean) {
     if (!project) return;
+    // 拖拽开始（首次非 commit 调用，且还没记录快照）→ 记录操作前快照
+    if (!commit && !interactiveEditSnapshotRef.current) {
+      interactiveEditSnapshotRef.current = structuredClone(project);
+    }
     const next: Project = {
       ...project,
       clips: project.clips.map((c) => (c.id === clipId ? { ...c, ...patch } : c)),
     };
     setProject(next);
     if (commit) {
-      void persist(next, "已调整片段");
+      // 用拖拽开始时的快照压入撤销栈，而非当前（已被中间态污染的）project
+      const snapshot = interactiveEditSnapshotRef.current;
+      interactiveEditSnapshotRef.current = null;
+      void persistWithSnapshot(next, snapshot, "已调整片段");
     }
   }
 
   function handleClipCommit(_clipId: string) {
-    // handleClipDrag 已经在 commit=true 时持久化，这里保留钩子供未来撤销栈
+    // 兼容旧调用点（已由 handleClipDrag commit=true 取代）
   }
 
   /**
@@ -2361,7 +2406,8 @@ export function App() {
                   max={200}
                   step={1}
                   value={Math.round((selectedClip.volume ?? 1) * 100)}
-                  onChange={(e) => updateSelectedClip({ volume: Number(e.target.value) / 100 })}
+                  onChange={(e) => updateSelectedClip({ volume: Number(e.target.value) / 100 }, false)}
+                  onPointerUp={() => commitInteractiveEdit()}
                   style={{ flex: 1 }}
                 />
                 <small style={{ minWidth: 50 }}>
@@ -2518,8 +2564,9 @@ export function App() {
                         <input type="range" min={0} max={100} step={1} value={selectedClip.crop?.x ?? 0}
                           onChange={(e) => {
                             const cur = selectedClip.crop ?? { ...DEFAULT_CROP };
-                            updateSelectedClip({ crop: { ...cur, x: Number(e.target.value) } });
+                            updateSelectedClip({ crop: { ...cur, x: Number(e.target.value) } }, false);
                           }}
+                          onPointerUp={() => commitInteractiveEdit()}
                         />
                       </label>
                       <label className="style-field">
@@ -2527,8 +2574,9 @@ export function App() {
                         <input type="range" min={0} max={100} step={1} value={selectedClip.crop?.y ?? 0}
                           onChange={(e) => {
                             const cur = selectedClip.crop ?? { ...DEFAULT_CROP };
-                            updateSelectedClip({ crop: { ...cur, y: Number(e.target.value) } });
+                            updateSelectedClip({ crop: { ...cur, y: Number(e.target.value) } }, false);
                           }}
+                          onPointerUp={() => commitInteractiveEdit()}
                         />
                       </label>
                       <label className="style-field">
@@ -2536,8 +2584,9 @@ export function App() {
                         <input type="range" min={10} max={100} step={1} value={selectedClip.crop?.width ?? 100}
                           onChange={(e) => {
                             const cur = selectedClip.crop ?? { ...DEFAULT_CROP };
-                            updateSelectedClip({ crop: { ...cur, width: Number(e.target.value) } });
+                            updateSelectedClip({ crop: { ...cur, width: Number(e.target.value) } }, false);
                           }}
+                          onPointerUp={() => commitInteractiveEdit()}
                         />
                       </label>
                       <label className="style-field">
@@ -2545,8 +2594,9 @@ export function App() {
                         <input type="range" min={10} max={100} step={1} value={selectedClip.crop?.height ?? 100}
                           onChange={(e) => {
                             const cur = selectedClip.crop ?? { ...DEFAULT_CROP };
-                            updateSelectedClip({ crop: { ...cur, height: Number(e.target.value) } });
+                            updateSelectedClip({ crop: { ...cur, height: Number(e.target.value) } }, false);
                           }}
+                          onPointerUp={() => commitInteractiveEdit()}
                         />
                       </label>
                       <button
@@ -2571,7 +2621,8 @@ export function App() {
                           max={selectedSource.duration || 20}
                           step={0.1}
                           value={selectedClip.sourceIn}
-                          onChange={(event) => updateSelectedClip({ sourceIn: Number(event.target.value) })}
+                          onChange={(event) => updateSelectedClip({ sourceIn: Number(event.target.value) }, false)}
+                          onPointerUp={() => commitInteractiveEdit()}
                         />
                       </label>
                       <label>
@@ -2582,7 +2633,8 @@ export function App() {
                           max={selectedSource.duration || 20}
                           step={0.1}
                           value={selectedClip.sourceOut}
-                          onChange={(event) => updateSelectedClip({ sourceOut: Number(event.target.value) })}
+                          onChange={(event) => updateSelectedClip({ sourceOut: Number(event.target.value) }, false)}
+                          onPointerUp={() => commitInteractiveEdit()}
                         />
                       </label>
                       {/* 变速：预设按钮 + 自定义输入 */}
@@ -2652,17 +2704,20 @@ export function App() {
                       <label className="style-field">
                         亮度
                         <input type="range" min={-100} max={100} step={1} value={selectedClip.brightness ?? 0}
-                          onChange={(e) => updateSelectedClip({ brightness: Number(e.target.value) })} />
+                          onChange={(e) => updateSelectedClip({ brightness: Number(e.target.value) }, false)}
+                          onPointerUp={() => commitInteractiveEdit()} />
                       </label>
                       <label className="style-field">
                         对比度
                         <input type="range" min={-100} max={100} step={1} value={selectedClip.contrast ?? 0}
-                          onChange={(e) => updateSelectedClip({ contrast: Number(e.target.value) })} />
+                          onChange={(e) => updateSelectedClip({ contrast: Number(e.target.value) }, false)}
+                          onPointerUp={() => commitInteractiveEdit()} />
                       </label>
                       <label className="style-field">
                         饱和度
                         <input type="range" min={-100} max={100} step={1} value={selectedClip.saturation ?? 0}
-                          onChange={(e) => updateSelectedClip({ saturation: Number(e.target.value) })} />
+                          onChange={(e) => updateSelectedClip({ saturation: Number(e.target.value) }, false)}
+                          onPointerUp={() => commitInteractiveEdit()} />
                       </label>
                     </div>
 
@@ -2680,7 +2735,8 @@ export function App() {
                           max={100}
                           step={1}
                           value={overlayTransform.x}
-                          onChange={(event) => updateOverlayTransform({ x: Number(event.target.value) })}
+                          onChange={(event) => updateOverlayTransform({ x: Number(event.target.value) }, false)}
+                          onPointerUp={() => commitInteractiveEdit()}
                         />
                       </label>
                       <label>
@@ -2691,7 +2747,8 @@ export function App() {
                           max={100}
                           step={1}
                           value={overlayTransform.y}
-                          onChange={(event) => updateOverlayTransform({ y: Number(event.target.value) })}
+                          onChange={(event) => updateOverlayTransform({ y: Number(event.target.value) }, false)}
+                          onPointerUp={() => commitInteractiveEdit()}
                         />
                       </label>
                       <label>
@@ -2702,7 +2759,8 @@ export function App() {
                           max={100}
                           step={1}
                           value={overlayTransform.scale}
-                          onChange={(event) => updateOverlayTransform({ scale: Number(event.target.value) })}
+                          onChange={(event) => updateOverlayTransform({ scale: Number(event.target.value) }, false)}
+                          onPointerUp={() => commitInteractiveEdit()}
                         />
                       </label>
                       <label>
@@ -2713,7 +2771,8 @@ export function App() {
                           max={100}
                           step={1}
                           value={overlayTransform.opacity}
-                          onChange={(event) => updateOverlayTransform({ opacity: Number(event.target.value) })}
+                          onChange={(event) => updateOverlayTransform({ opacity: Number(event.target.value) }, false)}
+                          onPointerUp={() => commitInteractiveEdit()}
                         />
                       </label>
                       <label>
@@ -2972,6 +3031,11 @@ export function App() {
               updateSelectedClip({ volume: selectedClip.volume > 0 ? 0 : 1 });
             },
             onAddSubtitle: () => handleRecognizeSubtitles(false),
+            onEditText: () => {
+              // 字幕"编辑文字"：进入字幕编辑模式（textarea 直接改 text）
+              setSelectedClipId(contextMenu.clip.id);
+              setSubtitleEditing(true);
+            },
           }}
         />
       )}

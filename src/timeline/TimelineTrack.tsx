@@ -70,6 +70,7 @@ export function TimelineTrack({
         duration: clip.duration,
         sourceIn: clip.sourceIn,
         sourceOut: clip.sourceOut,
+        speed: clip.speed,
       },
       peers,
       playhead,
@@ -86,6 +87,8 @@ export function TimelineTrack({
     const source = clip.sourceId ? media.find((m) => m.id === clip.sourceId) : null;
     const sourceDuration = source?.duration;
     const next = computeDraggedClip(drag, deltaSeconds, sourceDuration);
+    // 存最后一次 patch，endDrag 时用它提交
+    drag.lastPatch = next;
     onClipDrag(drag.clipId, next, false);
   }
 
@@ -93,8 +96,11 @@ export function TimelineTrack({
     const drag = dragRef.current;
     if (!drag) return;
     (event.currentTarget as HTMLDivElement).releasePointerCapture(event.pointerId);
+    // 用最后一次 patch 提交（commit=true 触发持久化 + 撤销快照）
+    if (drag.lastPatch) {
+      onClipDrag(drag.clipId, drag.lastPatch, true);
+    }
     dragRef.current = null;
-    onClipCommit(drag.clipId);
   }
 
   /** 素材库拖拽放置：按轨道类型判断是否接受该素材 */
