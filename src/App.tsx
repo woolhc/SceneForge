@@ -3125,6 +3125,7 @@ export function App() {
           }
         }}
         onExport={(outputPath) => { setExportProgress(0); setExportMessage(""); handleRenderFinal(outputPath); }}
+        onCancel={() => { void desktopApi.cancelRender(); }}
         exportState={exportState}
         exportProgress={exportProgress}
         exportMessage={exportMessage}

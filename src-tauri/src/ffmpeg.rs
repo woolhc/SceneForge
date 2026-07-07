@@ -363,6 +363,10 @@ pub async fn render_project_video(
     projects_dir: &Path,
     project: &Project,
     preview: bool,
+    // T3.3: 进度回调 (percent 0-100, phase 文案)，需 Send + Sync 以跨 await
+    progress_cb: Option<&(dyn Fn(u32, &str) + Send + Sync)>,
+    // T3.3: 取消标志（为 true 时中断渲染）
+    cancel_flag: Option<&std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<PathBuf> {
     // 首次渲染时检测硬件编码器（GPU 加速），后续从缓存读取
     if HW_ENCODER.get().is_none() {
@@ -433,7 +437,19 @@ pub async fn render_project_video(
 
     // 渲染每一段
     let mut segment_paths = Vec::new();
+    let total_segs = segments.len();
     for (seg_index, (seg_start, seg_end)) in segments.iter().enumerate() {
+        // T3.3: 检查取消标志
+        if let Some(flag) = cancel_flag {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                anyhow::bail!("渲染已取消");
+            }
+        }
+        // T3.3: 段级进度（0-70% 分配给段渲染）
+        if let Some(cb) = progress_cb {
+            let percent = ((seg_index as f64 / total_segs.max(1) as f64) * 70.0) as u32;
+            cb(percent, &format!("渲染片段 {}/{total_segs}", seg_index + 1));
+        }
         let seg_duration = seg_end - seg_start;
         // 找到该段内活跃的 clip（按轨道层次顺序：底层在前）
         let mut active_clips: Vec<&Clip> = video_clips
@@ -594,6 +610,10 @@ pub async fn render_project_video(
     }
 
     // 第二遍：叠加配音轨 + 烧录字幕轨
+    // T3.3: 进度 70→85%（视频拼接完成）
+    if let Some(cb) = progress_cb {
+        cb(70, "视频拼接完成，正在烧录字幕和混音...");
+    }
     // 转场偏移表：xfade 会让视频总长缩短，音频/字幕需要同步平移
     // 收集所有转场的发生时间点（转场前一段的结束时间）和缩短量
     let transition_shrink_points = if has_transitions && segments.len() > 1 {
@@ -621,7 +641,12 @@ pub async fn render_project_video(
         Vec::new()
     };
 
-    burn_subtitle_and_mix_audio(cache_dir, projects_dir, project, &raw_output, preview, &transition_shrink_points).await
+    let result = burn_subtitle_and_mix_audio(cache_dir, projects_dir, project, &raw_output, preview, &transition_shrink_points).await?;
+    // T3.3: 进度 100%
+    if let Some(cb) = progress_cb {
+        cb(100, "渲染完成");
+    }
+    Ok(result)
 }
 
 /// 渲染纯黑背景段（无活跃 clip 的时间段，保证时间线连续）。

@@ -2404,6 +2404,20 @@ textarea {
   font-weight: 700;
 }
 
+.export-cancel-btn {
+  margin-top: 8px;
+  padding: 6px 16px;
+  background: transparent;
+  border: 1px solid #5a3a3a;
+  color: #ff8888;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.export-cancel-btn:hover {
+  background: #2a1818;
+}
+
 /* 预览视口 + 缩放 */
 .preview-viewport {
   position: relative;

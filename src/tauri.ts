@@ -510,4 +510,6 @@ export const desktopApi = {
   }) => call<AiSegment[]>("enrich_segments", { request }),
   renderProject: (request: { projectId: string; preview: boolean; outputPath?: string | null }) =>
     call<RenderResult>("render_project", { request }),
+  /** T3.3: 取消正在进行的渲染任务 */
+  cancelRender: () => call<void>("cancel_render"),
 };

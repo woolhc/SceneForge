@@ -11,6 +11,7 @@ export function ExportDialog({
   config,
   onConfigChange,
   onExport,
+  onCancel,
   exportState,
   exportProgress,
   exportMessage,
@@ -23,6 +24,7 @@ export function ExportDialog({
   config: RenderConfig;
   onConfigChange: (config: RenderConfig) => void;
   onExport: (outputPath: string | null) => void;
+  onCancel?: () => void;
   exportState: ExportState;
   exportProgress?: number;
   exportMessage?: string;
@@ -146,6 +148,11 @@ export function ExportDialog({
               <div className="export-progress-fill" style={{ width: `${exportProgress ?? 0}%` }} />
             </div>
             <span className="export-progress-pct">{exportProgress ?? 0}%</span>
+            {onCancel && (
+              <button className="export-cancel-btn" onClick={onCancel}>
+                取消导出
+              </button>
+            )}
           </div>
         )}
 

@@ -23,6 +23,10 @@ pub struct AppPaths {
 pub struct AppState {
     pub db: Mutex<Connection>,
     pub paths: AppPaths,
+    /// T3.3: 渲染互斥锁（同时只允许一个导出任务）
+    pub render_lock: tokio::sync::Mutex<()>,
+    /// T3.3: 取消标志（render_project 每段检查，cancel_render 置位）
+    pub render_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppState {
@@ -50,6 +54,8 @@ impl AppState {
                 voices_dir,
                 database_path,
             },
+            render_lock: tokio::sync::Mutex::new(()),
+            render_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 

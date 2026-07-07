@@ -53,6 +53,7 @@ pub fn run() {
             commands::import_media,
             commands::generate_thumbnail,
             commands::render_project,
+            commands::cancel_render,
         ])
         .run(tauri::generate_context!())
         .expect("error while running SceneScript Desktop");

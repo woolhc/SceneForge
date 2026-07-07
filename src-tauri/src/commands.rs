@@ -1112,27 +1112,44 @@ pub async fn render_project(
     app_handle: tauri::AppHandle,
     request: RenderProjectRequest,
 ) -> Result<RenderResult, String> {
+    // T3.3: 渲染互斥锁（同时只允许一个导出任务）
+    let _render_guard = match state.render_lock.try_lock() {
+        Ok(g) => g,
+        Err(_) => return Err("已有导出任务进行中，请等待完成或取消".to_string()),
+    };
+    // 重置取消标志
+    state.render_cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+
     let project = {
         let conn = state.db.lock().map_err(map_error)?;
         storage::get_project(&conn, &request.project_id).map_err(map_error)?
     };
 
-    // 发进度事件
     let _ = app_handle.emit("render-progress", serde_json::json!({ "progress": 0, "message": "准备渲染..." }));
+
+    // T3.3: 进度回调，把段级进度通过事件发到前端
+    let app_handle_clone = app_handle.clone();
+    let progress_cb = move |percent: u32, phase: &str| {
+        let _ = app_handle_clone.emit(
+            "render-progress",
+            serde_json::json!({ "progress": percent, "message": phase }),
+        );
+    };
+    let cancel_flag = &state.render_cancel;
 
     let render_output = ffmpeg::render_project_video(
         &state.paths.cache_dir,
         &state.paths.projects_dir,
         &project,
         request.preview,
+        Some(&progress_cb),
+        Some(cancel_flag),
     )
     .await
     .map_err(|e| {
         let _ = app_handle.emit("render-progress", serde_json::json!({ "progress": 0, "message": format!("渲染失败：{e}") }));
         map_error(e)
     })?;
-
-    let _ = app_handle.emit("render-progress", serde_json::json!({ "progress": 90, "message": "正在烧录字幕和混音..." }));
 
     // 如果用户选择了导出路径，复制到用户路径
     let final_output_path = if let Some(ref user_path) = request.output_path {
@@ -1173,6 +1190,13 @@ pub async fn render_project(
             "render-final".to_string()
         },
     })
+}
+
+/// T3.3: 取消正在进行的渲染任务
+#[tauri::command]
+pub async fn cancel_render(state: State<'_, AppState>) -> Result<(), String> {
+    state.render_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
 }
 
 fn sanitize_file_stem(value: &str) -> String {
