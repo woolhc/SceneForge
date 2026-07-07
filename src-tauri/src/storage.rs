@@ -85,6 +85,13 @@ fn initialize_schema(conn: &Connection) -> anyhow::Result<()> {
         );
         "#,
     )?;
+    // T3.5: 冗余列迁移（兼容旧库，SQLite 没有 ADD COLUMN IF NOT EXISTS，用 try 忽略重复列错误）
+    let _ = conn.execute_batch("ALTER TABLE projects ADD COLUMN clip_count INTEGER NOT NULL DEFAULT 0");
+    // schema 版本
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES ('schema_version', '1')",
+        [],
+    );
     Ok(())
 }
 
@@ -179,21 +186,24 @@ pub fn save_project(conn: &Connection, project: &Project) -> anyhow::Result<Proj
         next.created_at = next.updated_at.clone();
     }
     let raw = serde_json::to_string(&next)?;
+    let clip_count = next.clips.len() as i64;
     conn.execute(
-        "INSERT INTO projects (id, title, ratio, payload_json, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "INSERT INTO projects (id, title, ratio, payload_json, created_at, updated_at, clip_count)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(id) DO UPDATE SET
             title = excluded.title,
             ratio = excluded.ratio,
             payload_json = excluded.payload_json,
-            updated_at = excluded.updated_at",
+            updated_at = excluded.updated_at,
+            clip_count = excluded.clip_count",
         params![
             next.id,
             next.title,
             next.ratio,
             raw,
             next.created_at,
-            next.updated_at
+            next.updated_at,
+            clip_count
         ],
     )?;
     Ok(next)
@@ -209,25 +219,22 @@ pub fn get_project(conn: &Connection, id: &str) -> anyhow::Result<Project> {
 }
 
 pub fn list_projects(conn: &Connection) -> anyhow::Result<Vec<ProjectSummary>> {
+    // T3.5: 只查冗余摘要列，不反序列化 payload_json（大项目提速明显）
     let mut stmt = conn.prepare(
-        "SELECT payload_json FROM projects ORDER BY datetime(updated_at) DESC, updated_at DESC",
+        "SELECT id, title, ratio, clip_count, updated_at FROM projects ORDER BY datetime(updated_at) DESC, updated_at DESC",
     )?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let rows = stmt.query_map([], |row| {
+        Ok(ProjectSummary {
+            id: row.get::<_, String>(0)?,
+            title: row.get::<_, String>(1)?,
+            ratio: row.get::<_, String>(2)?,
+            clip_count: row.get::<_, i64>(3).unwrap_or(0) as usize,
+            updated_at: row.get::<_, String>(4)?,
+        })
+    })?;
     let mut projects = Vec::new();
     for row in rows {
-        let raw = row?;
-        // 单条项目反序列化失败时跳过，避免一条坏数据让整个列表瘫痪
-        let project: Project = match serde_json::from_str(&raw) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        projects.push(ProjectSummary {
-            id: project.id,
-            title: project.title,
-            ratio: project.ratio,
-            clip_count: project.clips.len(),
-            updated_at: project.updated_at,
-        });
+        projects.push(row?);
     }
     Ok(projects)
 }

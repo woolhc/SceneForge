@@ -6,6 +6,7 @@ mod lut_data;
 mod models;
 mod pexels;
 mod storage;
+mod temp;
 mod tts;
 
 use storage::AppState;

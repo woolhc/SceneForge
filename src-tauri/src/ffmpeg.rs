@@ -425,10 +425,11 @@ pub async fn render_project_video(
         }
     }
 
-    let segment_dir = projects_dir
-        .join(&project.id)
-        .join("segments")
-        .join(if preview { "preview" } else { "final" });
+    // T2.5: 用 TempDirGuard 管理段渲染临时目录，函数返回时自动清理
+    let render_tmp_base = std::path::PathBuf::from("/tmp/scenescript-render");
+    tokio::fs::create_dir_all(&render_tmp_base).await.ok();
+    let segment_guard = crate::temp::TempDirGuard::new(&render_tmp_base, "segments")?;
+    let segment_dir = segment_guard.path().to_path_buf();
     tokio::fs::create_dir_all(&segment_dir).await?;
 
     // 渲染每一段
@@ -944,16 +945,40 @@ async fn burn_subtitle_and_mix_audio(
     let output_path = render_dir.join(if preview { "preview.mp4" } else { "final.mp4" });
 
     // 收集配音轨 clip 的音频文件（按时间顺序），用于混音
-    let voiceover_track_ids: Vec<String> = project
-        .tracks
-        .iter()
-        .filter(|t| t.kind == TrackKind::Voiceover || t.kind == TrackKind::Audio)
-        .map(|t| t.id.clone())
-        .collect();
+    // 收集音频源 clip：配音轨 + 音频轨 + 未静音的视频轨（视频原声）
+    // TrackKind::Video/Image 的 clip 如果 track.muted=false 且 clip.volume>0，
+    // 其视频文件的音频流也参与混音（T3.4：视频原声参与导出）
+    let mut audio_track_ids: Vec<String> = Vec::new();
+    let mut muted_track_ids: Vec<String> = Vec::new();
+    for t in &project.tracks {
+        match t.kind {
+            TrackKind::Voiceover | TrackKind::Audio => {
+                audio_track_ids.push(t.id.clone());
+            }
+            TrackKind::Video | TrackKind::Image => {
+                if !t.muted {
+                    audio_track_ids.push(t.id.clone());
+                } else {
+                    muted_track_ids.push(t.id.clone());
+                }
+            }
+            TrackKind::Subtitle => {}
+        }
+    }
     let mut audio_clips: Vec<&Clip> = project
         .clips
         .iter()
-        .filter(|c| voiceover_track_ids.contains(&c.track_id))
+        .filter(|c| {
+            // 排除静音轨 + 排除 clip.volume==0 的视频 clip
+            if muted_track_ids.contains(&c.track_id) {
+                return false;
+            }
+            if audio_track_ids.contains(&c.track_id) {
+                // 视频轨 clip 只在 volume > 0 时参与（volume=0 表示用户单独静音了该 clip）
+                return c.volume > 0.0;
+            }
+            false
+        })
         .collect();
     audio_clips.sort_by(|a, b| {
         a.start_on_track
@@ -1336,6 +1361,26 @@ fn seconds_to_ass_time(seconds: f64) -> String {
 }
 
 /// 合并配音音频 clip 为一个 wav（按时间线排列，空隙静音）
+/// 构建 atempo 滤镜链（变速保持音高）。
+/// atempo 单次范围 0.5-2.0，超出需串联。speed=1.0 返回空字符串。
+fn build_atempo_chain(speed: f64) -> String {
+    if (speed - 1.0).abs() < 0.001 {
+        return String::new();
+    }
+    let mut s = speed.max(0.0625); // ffmpeg atempo 下限
+    let mut parts: Vec<String> = Vec::new();
+    while s > 2.0 {
+        parts.push("atempo=2.0".to_string());
+        s /= 2.0;
+    }
+    while s < 0.5 {
+        parts.push("atempo=0.5".to_string());
+        s /= 0.5;
+    }
+    parts.push(format!("atempo={:.4}", s));
+    parts.join(",")
+}
+
 async fn merge_audio_clips(
     cache_dir: &Path,
     output: &Path,
@@ -1365,8 +1410,17 @@ async fn merge_audio_clips(
 
         let seg_path = tmp_dir.join(format!("audio-{i}.wav"));
         let start = clip.source_in;
-        let dur = clip.duration;
-        // 提取该段音频
+        let speed = clip.speed.abs().max(0.25);
+        // 变速视频原声：源时长 = 时间线时长 × speed（T3.4）
+        let source_dur = clip.duration * speed;
+        // atempo 链：变速后保持音高（atempo 范围 0.5-2.0，超出串联多个）
+        let atempo_filter = build_atempo_chain(speed);
+        // 提取该段音频（按源时长提取，再 atempo 变速到时间线时长）
+        let af = if atempo_filter.is_empty() {
+            "anull".to_string()
+        } else {
+            atempo_filter
+        };
         let extract = Command::new("ffmpeg")
             .args([
                 "-y",
@@ -1375,7 +1429,9 @@ async fn merge_audio_clips(
                 "-i",
                 &local_path.clone(),
                 "-t",
-                &format!("{dur:.3}"),
+                &format!("{source_dur:.3}"),
+                "-af",
+                &af,
                 "-ar",
                 "44100",
                 "-ac",
