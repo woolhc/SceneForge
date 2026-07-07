@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { PreviewEngine, type EngineState } from "./PreviewEngine";
 import { desktopApi } from "../tauri";
 import type { Project } from "../types";
+import { usePlaybackStore } from "../store/playbackStore";
 
 export function usePreviewEngine(
   videoARef: React.RefObject<HTMLVideoElement | null>,
@@ -11,15 +12,20 @@ export function usePreviewEngine(
   const engineRef = useRef<PreviewEngine | null>(null);
   // 缓存最新的 project，引擎创建后立即同步
   const pendingProjectRef = useRef<Project | null>(null);
-  const [engineState, setEngineState] = useState<EngineState>({
-    currentTime: 0,
-    playing: false,
-    activeSubtitle: null,
-    activeSubtitleStyle: null,
-    activeSubtitleClip: null,
-    activeVideoClip: null,
-    activeOverlayClips: [],
-  });
+
+  // T2.1: 引擎 tick 直接写入 zustand store（不经过 React setState），
+  // 只有订阅了对应字段的组件才会重渲染，避免整棵树 60fps 全量更新
+  const onTick = useCallback((state: EngineState) => {
+    usePlaybackStore.getState().tick({
+      currentTime: state.currentTime,
+      playing: state.playing,
+      activeVideoClip: state.activeVideoClip,
+      activeOverlayClips: state.activeOverlayClips,
+      activeSubtitle: state.activeSubtitle,
+      activeSubtitleStyle: state.activeSubtitleStyle,
+      activeSubtitleClip: state.activeSubtitleClip,
+    });
+  }, []);
 
   // active 变化时创建/销毁引擎
   useEffect(() => {
@@ -29,6 +35,16 @@ export function usePreviewEngine(
         engineRef.current.dispose();
         engineRef.current = null;
       }
+      // 重置 store（避免残留状态）
+      usePlaybackStore.getState().tick({
+        currentTime: 0,
+        playing: false,
+        activeVideoClip: null,
+        activeOverlayClips: [],
+        activeSubtitle: null,
+        activeSubtitleStyle: null,
+        activeSubtitleClip: null,
+      });
       return;
     }
 
@@ -37,7 +53,7 @@ export function usePreviewEngine(
     function tryInit() {
       if (disposed || engineRef.current) return;
       if (!videoARef.current || !videoBRef.current) return;
-      const engine = new PreviewEngine(videoARef.current, videoBRef.current, setEngineState);
+      const engine = new PreviewEngine(videoARef.current, videoBRef.current, onTick);
       engine.resolveLocal = (localPath: string) =>
         desktopApi.mediaSrc(localPath) ?? localPath;
       engineRef.current = engine;
@@ -55,7 +71,7 @@ export function usePreviewEngine(
       clearInterval(timer);
       clearTimeout(stop);
     };
-  }, [active]);
+  }, [active, onTick]);
 
   const syncProject = useCallback(async (project: Project | null) => {
     // 缓存 project，供引擎创建后同步
@@ -90,7 +106,6 @@ export function usePreviewEngine(
   }, []);
 
   return {
-    engineState,
     syncProject,
     play,
     pause,

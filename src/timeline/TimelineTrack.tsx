@@ -1,7 +1,8 @@
 import { ArrowDown, ArrowUp, Clock3, Image as ImageIcon, Lock, Mic2, MicOff, Unlock, Video } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import type { Clip, MediaSource, Track } from "../types";
 import { desktopApi } from "../tauri";
+import { usePlaybackStore } from "../store/playbackStore";
 import {
   computeDraggedClip,
   pxToSeconds,
@@ -9,7 +10,7 @@ import {
   type DragState,
 } from "./clipInteraction";
 
-export function TimelineTrack({
+function TimelineTrackInner({
   track,
   clips,
   media,
@@ -22,7 +23,6 @@ export function TimelineTrack({
   onClipCommit,
   onDropAsset,
   onContextMenu,
-  playhead,
   onToggleMute,
   onToggleLock,
   onMoveUp,
@@ -41,7 +41,6 @@ export function TimelineTrack({
   onClipCommit: (clipId: string) => void;
   onDropAsset: (trackId: string, assetId: string, startOnTrack: number) => void;
   onContextMenu: (clip: Clip, trackKind: string, x: number, y: number) => void;
-  playhead: number;
   onToggleMute: (trackId: string) => void;
   onToggleLock: (trackId: string) => void;
   onMoveUp: (trackId: string) => void;
@@ -73,7 +72,8 @@ export function TimelineTrack({
         speed: clip.speed,
       },
       peers,
-      playhead,
+      // T2.2: playhead 从 store 按需读（拖拽时才用），避免每帧 prop 变化导致重渲染
+      playhead: usePlaybackStore.getState().currentTime,
     };
     (event.currentTarget as HTMLDivElement).setPointerCapture(event.pointerId);
   }
@@ -339,3 +339,6 @@ function WaveformCanvas({
     </div>
   );
 }
+
+// T2.2: memo 化，props 不变时不重渲染（播放头已从 store 读，不再触发）
+export const TimelineTrack = React.memo(TimelineTrackInner);

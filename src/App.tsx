@@ -59,6 +59,7 @@ import { EdlPreview } from "./panels/EdlPreview";
 import { FilterRenderer } from "./preview/FilterRenderer";
 import { LUT_FILTERS, getLutData } from "./luts";
 import { usePreviewEngine } from "./preview/usePreviewEngine";
+import { usePlaybackStore } from "./store/playbackStore";
 import { Ruler } from "./timeline/Ruler";
 import { TimelineTrack } from "./timeline/TimelineTrack";
 import { removeClip, splitClipAt } from "./timeline/clipInteraction";
@@ -245,6 +246,11 @@ export function App() {
   const previewViewportRef = useRef<HTMLDivElement | null>(null);
   const [exportMessage, setExportMessage] = useState("");
 
+  // T2.3: 进入首页时刷新项目列表（persist 不再每次刷新）
+  useEffect(() => {
+    if (view === "home") void refreshProjects();
+  }, [view]);
+
   // 监听导出进度事件
   useEffect(() => {
     let unlisten: (() => void) | null = null;
@@ -277,7 +283,17 @@ export function App() {
   }, [project]);
 
   // 实时预览引擎：接管中央预览的 <video>，按时间线同步画面/配音/字幕
-  const { engineState, syncProject, togglePlay, seek } = usePreviewEngine(stageVideoRef, stageVideoBRef, view === "editor");
+  // T2.1: engineState 移到 zustand store，按字段订阅避免 60fps 全树重渲染
+  const { syncProject, togglePlay, seek } = usePreviewEngine(stageVideoRef, stageVideoBRef, view === "editor");
+  // 高频字段（每帧）：播放头时间
+  const playhead = usePlaybackStore((s) => s.currentTime);
+  const isPlaying = usePlaybackStore((s) => s.playing);
+  // 中频字段（clip 切换时）
+  const activeVideoClip = usePlaybackStore((s) => s.activeVideoClip);
+  const activeOverlayClips = usePlaybackStore((s) => s.activeOverlayClips);
+  const activeSubtitle = usePlaybackStore((s) => s.activeSubtitle);
+  const activeSubtitleStyle = usePlaybackStore((s) => s.activeSubtitleStyle);
+  const activeSubtitleClip = usePlaybackStore((s) => s.activeSubtitleClip);
 
   const selectedClip = useMemo(() => {
     if (!project) return null;
@@ -320,8 +336,7 @@ export function App() {
     return Math.max(1, ...project.clips.map((clip) => clip.startOnTrack + clip.duration));
   }, [project]);
 
-  // 播放头由预览引擎驱动（单一时钟源）
-  const playhead = engineState.currentTime;
+  // playhead 已从 usePlaybackStore 订阅（T2.1）
 
   useEffect(() => {
     if (bootstrapped.current) return;
@@ -349,7 +364,7 @@ export function App() {
   useEffect(() => {
     if (!filterRendererRef.current) return;
     // 优先用引擎提供的活跃视频 clip；回退到 selectedClip（暂停时）
-    const target = engineState.activeVideoClip || selectedClip;
+    const target = activeVideoClip || selectedClip;
     if (!target) return;
     filterRendererRef.current.render(target);
   });
@@ -367,9 +382,32 @@ export function App() {
     }
   }, [selectedClip?.id, selectedClipTrack?.kind]);
 
+  // T2.4: 键盘 handler 通过 ref 读易变值/函数，effect 只挂载一次（不每帧重订阅）
+  const kbStateRef = useRef<{
+    project: Project | null;
+    selectedClip: Clip | null;
+    selectedClipId: string | null;
+    totalDuration: number;
+    deleteSelectedClip: () => void;
+    undo: () => void;
+    redo: () => void;
+    duplicateSelectedClip: () => void;
+    pasteClip: () => void;
+    togglePlay: () => void;
+    splitAtPlayhead: () => void;
+    seek: (t: number) => void;
+  } | null>(null);
+  kbStateRef.current = {
+    project, selectedClip, selectedClipId, totalDuration,
+    deleteSelectedClip, undo, redo, duplicateSelectedClip, pasteClip,
+    togglePlay, splitAtPlayhead, seek,
+  };
+
   // 全局键盘快捷键：Delete/Backspace 删除选中 clip（输入框聚焦时不触发）
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
+      const s = kbStateRef.current;
+      if (!s) return;
       // 排除输入框/文本域/内容可编辑元素里的按键
       const target = event.target as HTMLElement;
       if (
@@ -382,64 +420,64 @@ export function App() {
         return;
       }
       // Delete 或 Backspace 删除选中 clip
-      if ((event.key === "Delete" || event.key === "Backspace") && selectedClipId) {
+      if ((event.key === "Delete" || event.key === "Backspace") && s.selectedClipId) {
         event.preventDefault();
-        deleteSelectedClip();
+        s.deleteSelectedClip();
       }
       // Ctrl+Z 撤销，Ctrl+Shift+Z 或 Ctrl+Y 重做
       if ((event.ctrlKey || event.metaKey) && event.key === "z") {
         event.preventDefault();
-        if (event.shiftKey) redo();
-        else undo();
+        if (event.shiftKey) s.redo();
+        else s.undo();
       }
       if ((event.ctrlKey || event.metaKey) && event.key === "y") {
         event.preventDefault();
-        redo();
+        s.redo();
       }
       // Ctrl+D 复制选中 clip
-      if ((event.ctrlKey || event.metaKey) && event.key === "d" && selectedClip) {
+      if ((event.ctrlKey || event.metaKey) && event.key === "d" && s.selectedClip) {
         event.preventDefault();
-        duplicateSelectedClip();
+        s.duplicateSelectedClip();
       }
       // Ctrl+C / Ctrl+V 复制粘贴 clip
-      if ((event.ctrlKey || event.metaKey) && event.key === "c" && selectedClip) {
+      if ((event.ctrlKey || event.metaKey) && event.key === "c" && s.selectedClip) {
         event.preventDefault();
-        clipboardRef.current = JSON.parse(JSON.stringify(selectedClip));
+        clipboardRef.current = structuredClone(s.selectedClip);
         setStatus("已复制片段");
       }
-      if ((event.ctrlKey || event.metaKey) && event.key === "v" && clipboardRef.current && project) {
+      if ((event.ctrlKey || event.metaKey) && event.key === "v" && clipboardRef.current && s.project) {
         event.preventDefault();
-        pasteClip();
+        s.pasteClip();
       }
       // 空格 播放/暂停
-      if (event.key === " " && project) {
+      if (event.key === " " && s.project) {
         event.preventDefault();
-        togglePlay();
+        s.togglePlay();
       }
       // Ctrl+B 分割（在播放头处）
-      if ((event.ctrlKey || event.metaKey) && event.key === "b" && project) {
+      if ((event.ctrlKey || event.metaKey) && event.key === "b" && s.project) {
         event.preventDefault();
-        splitAtPlayhead();
+        s.splitAtPlayhead();
       }
       // 方向键：帧级步进 / 秒级步进
       if (event.key === "ArrowLeft") {
         event.preventDefault();
         const step = event.shiftKey ? 1 : 1 / 30;
-        seek(Math.max(0, engineState.currentTime - step));
+        s.seek(Math.max(0, usePlaybackStore.getState().currentTime - step));
       }
       if (event.key === "ArrowRight") {
         event.preventDefault();
         const step = event.shiftKey ? 1 : 1 / 30;
-        seek(engineState.currentTime + step);
+        s.seek(usePlaybackStore.getState().currentTime + step);
       }
       // Home/End 跳到开头/结尾
       if (event.key === "Home") {
         event.preventDefault();
-        seek(0);
+        s.seek(0);
       }
       if (event.key === "End") {
         event.preventDefault();
-        seek(totalDuration);
+        s.seek(s.totalDuration);
       }
       // +/- 缩放时间线
       if (event.key === "+" || event.key === "=") {
@@ -451,7 +489,7 @@ export function App() {
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  });
+  }, []);
 
   async function bootstrap() {
     setBusy("init");
@@ -511,7 +549,8 @@ export function App() {
   /** 把当前 project 推入撤销栈（在修改前调用） */
   function pushUndo(current: Project | null) {
     if (!current) return;
-    undoStack.current.push(JSON.parse(JSON.stringify(current)));
+    // T2.3: structuredClone 比 JSON.parse(JSON.stringify()) 快 ~3x
+    undoStack.current.push(structuredClone(current));
     if (undoStack.current.length > 50) undoStack.current.shift(); // 限制 50 步
     redoStack.current = []; // 新操作清空重做栈
     setCanUndo(undoStack.current.length > 0);
@@ -522,7 +561,7 @@ export function App() {
   function undo() {
     const prev = undoStack.current.pop();
     if (!prev || !project) return;
-    redoStack.current.push(JSON.parse(JSON.stringify(project)));
+    redoStack.current.push(structuredClone(project));
     setProject(prev);
     void desktopApi.saveProject(prev);
     setCanUndo(undoStack.current.length > 0);
@@ -534,7 +573,7 @@ export function App() {
   function redo() {
     const next = redoStack.current.pop();
     if (!next || !project) return;
-    undoStack.current.push(JSON.parse(JSON.stringify(project)));
+    undoStack.current.push(structuredClone(project));
     setProject(next);
     void desktopApi.saveProject(next);
     setCanUndo(true);
@@ -542,12 +581,25 @@ export function App() {
     setStatus("已重做");
   }
 
+  // T2.3: 落盘防抖 ref（500ms trailing edge），高频编辑时不每秒写盘
+  const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingSaveRef = useRef<Project | null>(null);
+  function debouncedSaveProject(project: Project) {
+    pendingSaveRef.current = project;
+    if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
+    saveDebounceRef.current = setTimeout(async () => {
+      const toSave = pendingSaveRef.current;
+      saveDebounceRef.current = null;
+      if (toSave) {
+        await desktopApi.saveProject(toSave);
+      }
+    }, 500);
+  }
+
   async function persist(next: Project, message = "已保存") {
     pushUndo(projectRef.current); // 修改前保存撤销快照
     setProject(next);
-    const saved = await desktopApi.saveProject(next);
-    setProject(saved);
-    await refreshProjects(saved.id);
+    debouncedSaveProject(next); // 防抖落盘（不再每秒写）
     setStatus(message);
   }
 
@@ -555,9 +607,7 @@ export function App() {
   async function persistWithSnapshot(next: Project, snapshot: Project | null, message = "已保存") {
     pushUndo(snapshot); // 用拖拽开始时的快照，而非中间态
     setProject(next);
-    const saved = await desktopApi.saveProject(next);
-    setProject(saved);
-    await refreshProjects(saved.id);
+    debouncedSaveProject(next); // 防抖落盘
     setStatus(message);
   }
 
@@ -2051,7 +2101,7 @@ export function App() {
             {/* WebGL 滤镜 canvas：覆盖在 video 上，GPU shader 实时处理滤镜 */}
             <canvas ref={filterCanvasRef} className="stage-filter-canvas" />
             {/* 画中画叠加层：上层视频轨 clip 按 transform 叠加显示 */}
-            {engineState.activeOverlayClips.map((clip) => {
+            {activeOverlayClips.map((clip) => {
               const src = project?.media.find((m) => m.id === clip.sourceId);
               const mediaSrc = desktopApi.mediaSrc(src?.localPath || src?.thumbnailUrl || null);
               if (!mediaSrc) return null;
@@ -2072,7 +2122,7 @@ export function App() {
                 </div>
               );
             })}
-            {!engineState.activeVideoClip && !selectedMediaSrc && (
+            {!activeVideoClip && !selectedMediaSrc && (
               <div className="stage-content">
                 <ImagePlay size={46} />
                 <strong>{selectedSource?.title || "选择片段后在这里预览画面"}</strong>
@@ -2151,9 +2201,9 @@ export function App() {
               }
               // 编辑态
               // 未选中：引擎实时字幕（纯渲染，无控制点）
-              const subText = engineState.activeSubtitle;
-              const subStyle = engineState.activeSubtitleStyle;
-              const subClip = engineState.activeSubtitleClip;
+              const subText = activeSubtitle;
+              const subStyle = activeSubtitleStyle;
+              const subClip = activeSubtitleClip;
               if (!subText || !subText.trim()) return null;
               const s = subStyle;
               const isCustom = s?.position === "custom";
@@ -2220,15 +2270,15 @@ export function App() {
                 const videoClips = project.clips
                   .filter((c) => project.tracks.some((t) => t.id === c.trackId && t.kind === "video"))
                   .sort((a, b) => a.startOnTrack - b.startOnTrack);
-                const prev = videoClips.filter((c) => c.startOnTrack + c.duration <= engineState.currentTime - 0.05)
+                const prev = videoClips.filter((c) => c.startOnTrack + c.duration <= playhead - 0.05)
                   .pop();
                 seek(prev ? prev.startOnTrack : 0);
               }}
             >
               <ChevronLeft size={16} />
             </button>
-            <button className="round-button" title={engineState.playing ? "暂停" : "播放"} onClick={togglePlay}>
-              {engineState.playing ? <Pause size={18} /> : <Play size={18} />}
+            <button className="round-button" title={isPlaying ? "暂停" : "播放"} onClick={togglePlay}>
+              {isPlaying ? <Pause size={18} /> : <Play size={18} />}
             </button>
             <button
               className="round-button sm"
@@ -2238,7 +2288,7 @@ export function App() {
                 const videoClips = project.clips
                   .filter((c) => project.tracks.some((t) => t.id === c.trackId && t.kind === "video"))
                   .sort((a, b) => a.startOnTrack - b.startOnTrack);
-                const next = videoClips.find((c) => c.startOnTrack > engineState.currentTime + 0.05);
+                const next = videoClips.find((c) => c.startOnTrack > playhead + 0.05);
                 seek(next ? next.startOnTrack : totalDuration);
               }}
             >
@@ -2922,7 +2972,6 @@ export function App() {
                     setSelectedClipId(clip.id);
                     setContextMenu({ x, y, clip, trackKind: trackKind as TrackKind });
                   }}
-                  playhead={playhead}
                   onToggleMute={(trackId) => {
                     if (!project) return;
                     const tracks = project.tracks.map((t) =>
