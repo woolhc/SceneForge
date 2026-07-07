@@ -114,16 +114,9 @@ export function SubtitleOverlay({
           cursor: isSelected ? "move" : "default",
           userSelect: "none",
         }}
-        onPointerDown={(e) => {
-          if (!isSelected) return;
-          // 双击检测：两次 pointerdown 间隔 < 300ms → 编辑
-          const now = Date.now();
-          const last = (e.currentTarget as HTMLElement & { _lastClick?: number })._lastClick ?? 0;
-          (e.currentTarget as HTMLElement & { _lastClick?: number })._lastClick = now;
-          if (now - last < 300) {
-            e.stopPropagation();
-            onEditStart();
-          }
+        // M21: 用标准 onDoubleClick 替代 DOM expando _lastClick 双击检测
+        onDoubleClick={() => {
+          if (isSelected) onEditStart();
         }}
       >
         {karaokeEnabled && clip.words

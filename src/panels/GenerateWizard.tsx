@@ -22,6 +22,7 @@ export function GenerateWizard({
   hasPexelsKey,
   pipeline,
   onStart,
+  onError,
 }: {
   open: boolean;
   onClose: () => void;
@@ -30,6 +31,7 @@ export function GenerateWizard({
   hasPexelsKey: boolean;
   pipeline: PipelineState;
   onStart: (input: { script: string; ratio: string; voiceId: string; translate: boolean; audioPath?: string | null }) => void;
+  onError?: (message: string) => void;
 }) {
   const [mode, setMode] = useState<"script" | "audio">("script");
   const [script, setScript] = useState("");
@@ -63,7 +65,9 @@ export function GenerateWizard({
       setScript(text);
     } catch (e) {
       setScript("");
-      alert("音频识别失败：" + (e instanceof Error ? e.message : String(e)));
+      const msg = e instanceof Error ? e.message : String(e);
+      // M3: 用 onError 回调替代 alert，由父组件统一用 status 条提示
+      onError?.("音频识别失败：" + msg);
     } finally {
       setTranscribing(false);
     }

@@ -38,7 +38,6 @@ export const FONT_OPTIONS: FontOption[] = [
   { family: "LXGW WenKai", label: "霞鹜文楷", googleFontUrl: "LXGW+WenKai+TC:wght@400;700" },
 
   // ========== 中文 - 圆润/可爱 ==========
-  { family: "ZCOOL XiaoWei", label: "小薇LOGO体", googleFontUrl: "ZCOOL+XiaoWei" },
 
   // ========== 英文 - 无衬线 ==========
   { family: "Roboto", label: "Roboto", googleFontUrl: "Roboto:wght@400;700;900" },

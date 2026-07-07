@@ -151,7 +151,8 @@ print(json.dumps({"path": str(pathlib.Path(path).resolve())}, ensure_ascii=False
 
 fn estimate_duration(text: &str) -> f64 {
     let count = text.chars().count() as f64;
-    (count / 5.2).clamp(2.0, 30.0)
+    // M11: 上限从 30s 提高到 120s，避免长文本被截断时长估算
+    (count / 5.2).clamp(2.0, 120.0)
 }
 
 async fn probe_duration(path: &Path) -> anyhow::Result<f64> {

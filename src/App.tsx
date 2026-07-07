@@ -2934,7 +2934,7 @@ export function App() {
           onWheel={handleTimelineWheel}
         >
           <div className="timeline-canvas" style={{ width: timelineWidth }}>
-            <Ruler totalDuration={totalDuration} pxPerSecond={pxPerSecond} onSeek={seek} />
+            <Ruler totalDuration={totalDuration} pxPerSecond={pxPerSecond} onSeek={seek} fps={project?.renderConfig?.fps ?? 30} />
             {/*
               playhead 坐标系对齐 ruler/clip：
               canvas 有 padding-left:44px(标签栏) + padding-right:14px，
@@ -3099,6 +3099,7 @@ export function App() {
         hasPexelsKey={!!settings.pexelsApiKey}
         pipeline={pipeline}
         onStart={(input) => handleGeneratePipeline(input)}
+        onError={(msg) => setStatus(msg)}
       />
 
       {/* EDL 预览：AI 分段后先让用户确认/编辑，再执行编排 */}

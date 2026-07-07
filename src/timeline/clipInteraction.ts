@@ -29,15 +29,17 @@ export function pxToSeconds(deltaPx: number, pxPerSecond: number) {
   return deltaPx / pxPerSecond;
 }
 
-/** 吸附阈值（秒） */
-const SNAP_THRESHOLD = 0.3;
+/** 吸附阈值（像素）—— M5: 不再固定秒数，按 8px 像素阈值换算 */
+const SNAP_THRESHOLD_PX = 8;
 
 /**
  * 尝试吸附到一个参考点列表。返回吸附后的值或原值。
+ * pxPerSecond 用于把像素阈值换算成秒阈值（缩放级别相关）。
  */
-function snap(value: number, snapPoints: number[]): number {
+function snap(value: number, snapPoints: number[], pxPerSecond: number = 64): number {
+  const thresholdSec = SNAP_THRESHOLD_PX / pxPerSecond;
   for (const sp of snapPoints) {
-    if (Math.abs(value - sp) < SNAP_THRESHOLD) return sp;
+    if (Math.abs(value - sp) < thresholdSec) return sp;
   }
   return value;
 }
@@ -50,6 +52,7 @@ export function computeDraggedClip(
   drag: DragState,
   deltaSeconds: number,
   sourceDuration?: number,
+  pxPerSecond: number = 64,
 ): Pick<Clip, "startOnTrack" | "duration" | "sourceIn" | "sourceOut"> {
   const { initial, handle, peers, playhead } = drag;
   const result = {
@@ -72,9 +75,9 @@ export function computeDraggedClip(
     const newEnd = newStart + initial.duration;
 
     // 吸附：start 吸附到 peer 边缘/playhead
-    newStart = snap(newStart, snapPoints);
+    newStart = snap(newStart, snapPoints, pxPerSecond);
     // 吸附：end 吸附到 peer 边缘/playhead
-    const snappedEnd = snap(newEnd, snapPoints);
+    const snappedEnd = snap(newEnd, snapPoints, pxPerSecond);
     if (snappedEnd !== newEnd) {
       newStart = snappedEnd - initial.duration;
     }
@@ -102,7 +105,7 @@ export function computeDraggedClip(
     const newEnd = initial.startOnTrack + newDuration;
 
     // 吸附：右边缘吸附到 peer 边缘/playhead
-    const snappedEnd = snap(newEnd, snapPoints);
+    const snappedEnd = snap(newEnd, snapPoints, pxPerSecond);
     if (snappedEnd !== newEnd) {
       newDuration = Math.max(0.2, snappedEnd - initial.startOnTrack);
     }
@@ -134,7 +137,7 @@ export function computeDraggedClip(
     let newDuration = Math.max(0.2, initial.duration - deltaStart);
 
     // 吸附：左边缘吸附
-    newStart = snap(newStart, snapPoints);
+    newStart = snap(newStart, snapPoints, pxPerSecond);
     newDuration = initial.duration - (newStart - initial.startOnTrack);
 
     // 碰撞：不能覆盖前一个 clip

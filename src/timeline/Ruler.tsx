@@ -8,10 +8,12 @@ export function Ruler({
   totalDuration,
   pxPerSecond,
   onSeek,
+  fps = 30,
 }: {
   totalDuration: number;
   pxPerSecond: number;
   onSeek: (time: number) => void;
+  fps?: number;
 }) {
   const ref = useRef<HTMLDivElement | null>(null);
   const dragging = useRef(false);
@@ -41,7 +43,7 @@ export function Ruler({
   const formatTime = (seconds: number): string => {
     if (interval < 0.1) {
       // 帧级别：显示帧号
-      const frame = Math.round(seconds * 30); // 假设 30fps
+      const frame = Math.round(seconds * fps); // M4: 读 renderConfig.fps（默认 30）
       return `${frame}f`;
     }
     if (seconds >= 60) {

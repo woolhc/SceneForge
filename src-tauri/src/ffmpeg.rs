@@ -56,31 +56,30 @@ pub async fn detect_hw_encoder() -> String {
         "h264_qsv",           // Intel QuickSync
         "h264_vaapi",         // Linux
     ];
+    // M15: -encoders 只跑一次（之前循环内重复跑）
+    let encoders_text = match Command::new("ffmpeg").args(["-hide_banner", "-encoders"]).output().await {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).to_string(),
+        Err(_) => return "libx264".to_string(),
+    };
     for &encoder in candidates {
-        let result = Command::new("ffmpeg")
-            .args(["-hide_banner", "-encoders"])
+        if !encoders_text.contains(encoder) {
+            continue;
+        }
+        // 验证能否真正工作（快速测试编码）
+        let test = Command::new("ffmpeg")
+            .args([
+                "-y", "-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.1",
+                "-c:v", encoder, "-f", "null", "-",
+            ])
             .output()
             .await;
-        if let Ok(out) = result {
-            let text = String::from_utf8_lossy(&out.stdout);
-            if text.contains(encoder) {
-                // 验证能否真正工作（快速测试编码）
-                let test = Command::new("ffmpeg")
-                    .args([
-                        "-y", "-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.1",
-                        "-c:v", encoder, "-f", "null", "-",
-                    ])
-                    .output()
-                    .await;
-                if let Ok(t) = test {
-                    if t.status.success() {
-                        return encoder.to_string();
-                    }
-                }
+        if let Ok(t) = test {
+            if t.status.success() {
+                return encoder.to_string();
             }
         }
     }
-    HW_ENCODER.get().map(|s| s.as_str()).unwrap_or("libx264").to_string() // CPU 回退
+    "libx264".to_string() // CPU 回退（M15: 删除读未初始化 OnceLock 的死代码）
 }
 
 /// 根据编码器返回 (encoder_name, extra_args)。
@@ -1060,7 +1059,8 @@ async fn burn_subtitle_and_mix_audio(
     let mut vf = String::new();
     if let Some(ref ass_file) = ass_path {
         // subtitles 滤镜烧录 .ass；force_style 可覆盖样式（.ass 内已含样式）
-        let ass_str = ass_file.to_string_lossy().replace('\\', "/").replace(':', "\\:");
+        // M14: 转义单引号 + 冒号（ffmpeg 滤镜路径语法）
+        let ass_str = escape_filter_path(&ass_file.to_string_lossy().replace('\\', "/")).replace(':', "\\:");
         vf = format!("subtitles='{}'", ass_str);
     }
 
@@ -1564,7 +1564,8 @@ fn clip_color_filter(clip: &Clip) -> String {
                 if let Ok(temp_dir) = std::env::temp_dir().canonicalize() {
                     let lut_path = temp_dir.join(format!("scenescript-lut-{filter_name}.cube"));
                     if std::fs::write(&lut_path, lut_content).is_ok() {
-                        let lut_str = lut_path.to_string_lossy().replace('\\', "/");
+                        // M14: 统一路径转义（单引号 + 冒号）
+                        let lut_str = escape_filter_path(&lut_path.to_string_lossy().replace('\\', "/")).replace(':', "\\:");
                         parts.push(format!("lut3d=file='{lut_str}'"));
                     }
                 }
@@ -1615,6 +1616,11 @@ fn export_dimensions_for_project(project: &Project) -> (u32, u32) {
         _ => 1080,
     };
     dims_for_ratio(&project.ratio, short_edge)
+}
+
+/// 转义 ffmpeg 滤镜参数里的单引号（M14）：' → '\''（用于 subtitles/lut3d 的 file= 路径）
+fn escape_filter_path(path: &str) -> String {
+    path.replace('\'', "'\\''")
 }
 
 fn sanitize_file_stem(value: &str) -> String {

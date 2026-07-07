@@ -86,7 +86,7 @@ function TimelineTrackInner({
     if (!clip) return;
     const source = clip.sourceId ? media.find((m) => m.id === clip.sourceId) : null;
     const sourceDuration = source?.duration;
-    const next = computeDraggedClip(drag, deltaSeconds, sourceDuration);
+    const next = computeDraggedClip(drag, deltaSeconds, sourceDuration, pxPerSecond);
     // 存最后一次 patch，endDrag 时用它提交
     drag.lastPatch = next;
     onClipDrag(drag.clipId, next, false);
