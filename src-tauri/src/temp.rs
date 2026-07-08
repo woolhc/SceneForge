@@ -13,7 +13,10 @@ impl TempDirGuard {
     pub fn new(base: &std::path::Path, prefix: &str) -> std::io::Result<Self> {
         let dir = base.join(format!("{}-{}", prefix, uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
-        Ok(Self { path: dir, cleanup: true })
+        Ok(Self {
+            path: dir,
+            cleanup: true,
+        })
     }
 
     pub fn path(&self) -> &std::path::Path {

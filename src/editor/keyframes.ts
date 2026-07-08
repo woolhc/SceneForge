@@ -75,6 +75,53 @@ export function sampleAllKeyframes(
   };
 }
 
+// ===== 关键帧 CRUD 工具函数（纯函数，不可变）=====
+
+/** 在指定时间添加/覆盖关键帧。同时间点（±tol）的旧帧被移除。返回新数组。 */
+export function addKeyframe(
+  kfs: Keyframe[] | undefined,
+  time: number,
+  value: number,
+  easing: Keyframe["easing"] = "linear",
+  tol = 0.05,
+): Keyframe[] {
+  const arr = (kfs ?? []).filter((k) => Math.abs(k.time - time) > tol);
+  arr.push({ time, value, easing });
+  arr.sort((a, b) => a.time - b.time);
+  return arr;
+}
+
+/** 删除指定时间（±tol）的关键帧。返回新数组。 */
+export function removeKeyframeAt(
+  kfs: Keyframe[] | undefined,
+  time: number,
+  tol = 0.05,
+): Keyframe[] {
+  return (kfs ?? []).filter((k) => Math.abs(k.time - time) > tol);
+}
+
+/** 查找指定时间（±tol）的关键帧。命中返回该帧，否则 null。 */
+export function findKeyframeAt(
+  kfs: Keyframe[] | undefined,
+  time: number,
+  tol = 0.1,
+): Keyframe | null {
+  if (!kfs || kfs.length === 0) return null;
+  return kfs.find((k) => Math.abs(k.time - time) <= tol) ?? null;
+}
+
+/** 修改指定时间（±tol）关键帧的 easing。返回新数组。 */
+export function updateKeyframeEasing(
+  kfs: Keyframe[] | undefined,
+  time: number,
+  easing: Keyframe["easing"],
+  tol = 0.05,
+): Keyframe[] {
+  return (kfs ?? []).map((k) =>
+    Math.abs(k.time - time) <= tol ? { ...k, easing } : k,
+  );
+}
+
 // ===== 手工验证用例（文件底部，方便核对，不自动执行）=====
 // sampleKeyframes([{time:0,value:0,easing:"linear"},{time:1,value:100,easing:"linear"}], 0.5) === 50
 // sampleKeyframes([{time:0,value:0,easing:"linear"},{time:1,value:100,easing:"linear"}], -1) === 0

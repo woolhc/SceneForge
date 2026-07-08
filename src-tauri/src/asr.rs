@@ -117,7 +117,7 @@ fn whisper_install_hint() -> String {
 /// 调用 whisper-cli 识别音频，返回带时间戳的原始片段。
 pub async fn transcribe_audio(
     settings: &AppSettings,
-    cache_dir: &Path,
+    _cache_dir: &Path,
     audio_path: &Path,
 ) -> anyhow::Result<Vec<SubtitleCue>> {
     let model = settings.whisper_model.trim();
@@ -149,34 +149,34 @@ pub async fn transcribe_audio(
     // 所以输出到系统临时目录（无空格），跑完再读 JSON。
     let out_dir = std::env::temp_dir().join("scenescript-whisper");
     tokio::fs::create_dir_all(&out_dir).await?;
-    let out_prefix = out_dir.join(format!(
-        "asr-{}",
-        chrono::Utc::now().timestamp_millis()
-    ));
+    let out_prefix = out_dir.join(format!("asr-{}", chrono::Utc::now().timestamp_millis()));
 
     // whisper-cli -ml 1 -oj：max-len=1 强制每段一个词/字 → 得到词级时间戳
     // offsets.from/to 是毫秒整数，比 timestamps 字符串精度更高
     // 注意：whisper.cpp 1.7+ 移除了 --no-print-progress，改用 -np（--no-prints）
-    let output = Command::new(&whisper_bin)
-        .args([
-            "-m",
-            model,
-            "-f",
-            &audio_path.to_string_lossy(),
-            "-ml", "1", // 词级时间戳（max-len=1）
-            "-oj",
-            "-of",
-            &out_prefix.to_string_lossy(),
-            "-l",
-            "auto",
-            "-np", // 不打印进度（替代旧版 --no-print-progress）
-        ])
-        .output()
+    let mut cmd = Command::new(&whisper_bin);
+    cmd.args([
+        "-m",
+        model,
+        "-f",
+        &audio_path.to_string_lossy(),
+        "-ml",
+        "1", // 词级时间戳（max-len=1）
+        "-oj",
+        "-of",
+        &out_prefix.to_string_lossy(),
+        "-l",
+        "auto",
+        "-np", // 不打印进度（替代旧版 --no-print-progress）
+    ]);
+    let output = crate::ffmpeg::run_with_timeout(&mut cmd, 1800)
         .await
-        .map_err(|e| anyhow::anyhow!(
-            "调用 whisper 失败：{e}\n可执行文件：{whisper_bin}\n{}",
-            whisper_install_hint()
-        ))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "调用 whisper 失败：{e}\n可执行文件：{whisper_bin}\n{}",
+                whisper_install_hint()
+            )
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -208,6 +208,7 @@ pub async fn transcribe_audio(
         }
     };
 
+    let _ = tokio::fs::remove_file(&json_path).await;
     let result: WhisperResult = serde_json::from_str(&json_content)
         .map_err(|e| anyhow::anyhow!("whisper JSON 解析失败：{e}"))?;
 
@@ -238,17 +239,39 @@ pub async fn transcribe_to_sentences(
     let mut last_word_end: Option<f64> = None;
 
     for cue in &cues {
+        // M13: 大停顿表示上一句已结束，必须在追加当前 cue 之前切分；
+        // 否则停顿后的第一段会被错误并入上一句。
+        let big_gap = last_word_end.map(|e| cue.start - e > 0.8).unwrap_or(false);
+        if big_gap {
+            let text = current_text.trim().to_string();
+            if !text.is_empty() {
+                if let Some(s) = current_start {
+                    sentences.push(crate::models::TimedSentence {
+                        start: s,
+                        end: current_end,
+                        text,
+                    });
+                }
+            }
+            current_start = None;
+            current_text.clear();
+        }
+
         if current_start.is_none() {
             current_start = Some(cue.start);
         }
         current_end = cue.end;
         current_text.push_str(&cue.text);
 
-        // 判断是否该断句：cue 文本以句末标点结尾，或与下一 cue 间隔 > 0.8s
-        let ends_with_sentence = cue.text.chars().last().map(|c| sentence_enders.contains(&c)).unwrap_or(false);
-        let big_gap = last_word_end.map(|e| cue.start - e > 0.8).unwrap_or(false);
+        // 判断是否该断句：cue 文本以句末标点结尾。
+        let ends_with_sentence = cue
+            .text
+            .chars()
+            .last()
+            .map(|c| sentence_enders.contains(&c))
+            .unwrap_or(false);
 
-        if ends_with_sentence || big_gap {
+        if ends_with_sentence {
             let text = current_text.trim().to_string();
             if !text.is_empty() {
                 if let Some(s) = current_start {
@@ -339,15 +362,17 @@ fn words_to_cues(segments: Vec<WhisperSegment>) -> Vec<SubtitleCue> {
         // 判断是否该断句
         let char_count: usize = current_words.iter().map(|w| w.text.chars().count()).sum();
         let new_char_count = char_count + word.text.chars().count();
-        let duration = word.end
-            - current_words
-                .first()
-                .map(|w| w.start)
-                .unwrap_or(word.start);
+        let duration = word.end - current_words.first().map(|w| w.start).unwrap_or(word.start);
 
         let prev_ends_sentence = current_words
             .last()
-            .map(|w| w.text.chars().last().map(|c| sentence_enders.contains(&c)).unwrap_or(false))
+            .map(|w| {
+                w.text
+                    .chars()
+                    .last()
+                    .map(|c| sentence_enders.contains(&c))
+                    .unwrap_or(false)
+            })
             .unwrap_or(false);
 
         let should_break = !current_words.is_empty()
@@ -471,7 +496,7 @@ pub async fn refine_subtitles(
         )
     };
 
-    let client = reqwest::Client::new();
+    let client = crate::ffmpeg::http_client();
     let response = client
         .post("https://api.deepseek.com/chat/completions")
         .bearer_auth(api_key)
@@ -494,8 +519,8 @@ pub async fn refine_subtitles(
         return Ok(segment_subtitles_rules(cues));
     }
 
-    let parsed: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| anyhow::anyhow!("DeepSeek 返回解析失败：{e}"))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| anyhow::anyhow!("DeepSeek 返回解析失败：{e}"))?;
     let content = parsed["choices"][0]["message"]["content"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("DeepSeek 返回为空"))?;
@@ -518,12 +543,12 @@ pub fn segment_subtitles_rules(cues: &[SubtitleCue]) -> Vec<SubtitleCue> {
     }
 
     // 阈值
-    const MAX_CHARS: usize = 30;       // 每段最大字符数
-    const MAX_DURATION: f64 = 6.0;     // 每段最大时长（秒）
-    const MIN_DURATION: f64 = 0.8;     // 每段最小时长（秒）
-    const MERGE_GAP: f64 = 0.5;        // 合并间隔阈值（秒）
-    const MIN_GAP: f64 = 0.1;          // 段间最小间隔（秒）
-    const MAX_CPS: f64 = 14.0;         // 最大字符/秒（中文）
+    const MAX_CHARS: usize = 30; // 每段最大字符数
+    const MAX_DURATION: f64 = 6.0; // 每段最大时长（秒）
+    const MIN_DURATION: f64 = 0.8; // 每段最小时长（秒）
+    const MERGE_GAP: f64 = 0.5; // 合并间隔阈值（秒）
+    const MIN_GAP: f64 = 0.1; // 段间最小间隔（秒）
+    const MAX_CPS: f64 = 14.0; // 最大字符/秒（中文）
 
     // Pass 1: 合并太短的段（间隔 < MERGE_GAP 且合并后不超限）
     let mut merged: Vec<SubtitleCue> = Vec::new();
@@ -692,17 +717,22 @@ fn extract_subtitle_array(content: &str) -> anyhow::Result<Vec<SubtitleCue>> {
         .trim();
 
     // 找到第一个 [ 和最后一个 ]
-    let start = text.find('[').ok_or_else(|| anyhow::anyhow!("未找到字幕数组"))?;
-    let end = text.rfind(']').ok_or_else(|| anyhow::anyhow!("未找到字幕数组结尾"))?;
+    let start = text
+        .find('[')
+        .ok_or_else(|| anyhow::anyhow!("未找到字幕数组"))?;
+    let end = text
+        .rfind(']')
+        .ok_or_else(|| anyhow::anyhow!("未找到字幕数组结尾"))?;
     let array_str = &text[start..=end];
 
-    let arr: Vec<serde_json::Value> = serde_json::from_str(array_str)
-        .map_err(|e| anyhow::anyhow!("字幕数组解析失败：{e}"))?;
+    let arr: Vec<serde_json::Value> =
+        serde_json::from_str(array_str).map_err(|e| anyhow::anyhow!("字幕数组解析失败：{e}"))?;
 
     let cues = arr
         .into_iter()
         .map(|item| {
-            let text = item.get("translated")
+            let text = item
+                .get("translated")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .or_else(|| item.get("text").and_then(|v| v.as_str()))

@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { ArrowLeftRight, Sparkles } from "lucide-react";
 
 /**
@@ -29,22 +30,45 @@ const TRANSITIONS = [
   { id: "radial", name: "径向", desc: "径向擦除", cat: "缩放" },
 ];
 
+type Direction = "in" | "out";
+
 /**
  * 转场 Tab：分类展示转场效果 + 时长滑块。
+ * 支持入场/出场切换（transitionOut 为可选，未传则只显示入场）。
  */
 export function TransitionPanel({
   selectedClipId,
-  currentTransition,
-  currentDuration,
-  onApply,
-  onDurationChange,
+  currentTransitionIn,
+  currentTransitionOut,
+  currentDurationIn,
+  currentDurationOut,
+  onApplyIn,
+  onApplyOut,
+  onDurationChangeIn,
+  onDurationCommitIn,
+  onDurationChangeOut,
+  onDurationCommitOut,
 }: {
   selectedClipId: string | null;
-  currentTransition?: string | null;
-  currentDuration?: number;
-  onApply: (transitionId: string) => void;
-  onDurationChange?: (duration: number) => void;
+  currentTransitionIn?: string | null;
+  currentTransitionOut?: string | null;
+  currentDurationIn?: number;
+  currentDurationOut?: number;
+  onApplyIn: (transitionId: string) => void;
+  onApplyOut?: (transitionId: string) => void;
+  onDurationChangeIn?: (duration: number) => void;
+  onDurationCommitIn?: () => void;
+  onDurationChangeOut?: (duration: number) => void;
+  onDurationCommitOut?: () => void;
 }) {
+  const [mode, setMode] = useState<Direction>("in");
+  const showOutTab = !!onApplyOut;
+  const currentTransition = mode === "in" ? currentTransitionIn : currentTransitionOut;
+  const currentDuration = mode === "in" ? currentDurationIn : currentDurationOut;
+  const onApply = mode === "in" ? onApplyIn : onApplyOut;
+  const onDurationChange = mode === "in" ? onDurationChangeIn : onDurationChangeOut;
+  const onDurationCommit = mode === "in" ? onDurationCommitIn : onDurationCommitOut;
+
   // 按分类分组
   const categories = [...new Set(TRANSITIONS.map((t) => t.cat))];
 
@@ -53,10 +77,27 @@ export function TransitionPanel({
       <p className="transition-hint">
         <Sparkles size={13} />
         {selectedClipId
-          ? "点击转场应用到当前选中片段的入场（与下一片段交叠过渡）"
+          ? "点击转场应用到当前选中片段"
           : "请先在时间线选中一个片段"}
       </p>
-      {/* T4.5: 转场时长滑块 */}
+      {/* 入场/出场切换 */}
+      {showOutTab && (
+        <div className="transition-mode-tabs">
+          <button
+            className={`transition-mode-tab ${mode === "in" ? "active" : ""}`}
+            onClick={() => setMode("in")}
+          >
+            入场
+          </button>
+          <button
+            className={`transition-mode-tab ${mode === "out" ? "active" : ""}`}
+            onClick={() => setMode("out")}
+          >
+            出场
+          </button>
+        </div>
+      )}
+      {/* 转场时长滑块 */}
       {selectedClipId && currentTransition && currentTransition !== "none" && onDurationChange && (
         <label className="transition-duration-row">
           <span>转场时长（{(currentDuration ?? 0.5).toFixed(2)}s）</span>
@@ -64,6 +105,8 @@ export function TransitionPanel({
             type="range" min={0.1} max={2.0} step={0.1}
             value={currentDuration ?? 0.5}
             onChange={(e) => onDurationChange(Number(e.target.value))}
+            onPointerUp={() => onDurationCommit?.()}
+            onKeyUp={() => onDurationCommit?.()}
           />
         </label>
       )}
@@ -75,8 +118,8 @@ export function TransitionPanel({
               <button
                 key={t.id}
                 className={`transition-card ${currentTransition === t.id ? "active" : ""}`}
-                disabled={!selectedClipId}
-                onClick={() => onApply(t.id)}
+                disabled={!selectedClipId || !onApply}
+                onClick={() => onApply?.(t.id)}
               >
                 <ArrowLeftRight size={20} />
                 <span>{t.name}</span>

@@ -2,6 +2,7 @@ import Moveable from "react-moveable";
 import { useEffect, useRef, useState } from "react";
 import type { Clip, SubtitleStyle, WordCue } from "../types";
 import { DEFAULT_SUBTITLE_STYLE } from "../types";
+import { usePlaybackStore } from "../store/playbackStore";
 
 /**
  * 字幕叠层组件（剪映式）：用 react-moveable 实现
@@ -22,6 +23,9 @@ export function SubtitleOverlay({
   onMove,
   onScale,
   onRotate,
+  onMoveEnd,
+  onScaleEnd,
+  onRotateEnd,
   onEditStart,
 }: {
   clip: Clip;
@@ -33,6 +37,9 @@ export function SubtitleOverlay({
   onMove: (x: number, y: number) => void;
   onScale: (scaleX: number, scaleY: number) => void;
   onRotate: (rotation: number) => void;
+  onMoveEnd?: () => void;
+  onScaleEnd?: () => void;
+  onRotateEnd?: () => void;
   onEditStart: () => void;
 }) {
   const textRef = useRef<HTMLDivElement | null>(null);
@@ -46,9 +53,26 @@ export function SubtitleOverlay({
   const rotation = style.rotation ?? 0;
   const fontSize = `${Math.max(12, (style.fontSize ?? 48) * 0.35)}px`;
   const strokeColor = style.strokeColor ?? "#000";
+  const strokeWidth = style.strokeWidth ?? 2;
   const baseColor = style.color ?? "#FFFFFF";
   const highlightColor = style.highlightColor ?? "#FFD700";
-  const strokeShadow = `1px 1px 0 ${strokeColor}, -1px -1px 0 ${strokeColor}, 1px -1px 0 ${strokeColor}, -1px 1px 0 ${strokeColor}`;
+  const bgColor = style.backgroundColor ?? "none";
+  const bgPadding = style.backgroundPadding ?? 4;
+  const shadowColor = style.shadowColor ?? "#000";
+  const shadowBlur = style.shadowBlur ?? 0;
+  const letterSpacing = style.letterSpacing ?? 0;
+  const lineHeight = style.lineHeight ?? 1.4;
+  const storeTime = usePlaybackStore((s) => s.currentTime);
+  const effectiveTime = currentTime ?? storeTime;
+  // 描边粗细随 strokeWidth 调整（用多个 textShadow 模拟描边）
+  const strokeShadow = strokeWidth > 0
+    ? `${strokeWidth}px ${strokeWidth}px 0 ${strokeColor}, -${strokeWidth}px -${strokeWidth}px 0 ${strokeColor}, ${strokeWidth}px -${strokeWidth}px 0 ${strokeColor}, -${strokeWidth}px ${strokeWidth}px 0 ${strokeColor}`
+    : "none";
+  // 阴影（叠加在描边之后）
+  const shadow = shadowBlur > 0 ? `, 0 ${Math.round(shadowBlur / 3)}px ${shadowBlur}px ${shadowColor}` : "";
+  const finalTextShadow = strokeShadow === "none" && shadow
+    ? shadow.slice(2)
+    : (strokeShadow === "none" ? "none" : strokeShadow + shadow);
 
   // 逐字高亮：判断是否启用
   const karaokeEnabled = (style.karaoke ?? true) && (clip.words?.length ?? 0) > 0;
@@ -56,7 +80,7 @@ export function SubtitleOverlay({
   // （ASR 音频从配音轨起始合并；为简化，假设 word.start/end 已与 startOnTrack 同坐标系，
   //   实际播放验证若不对再补偏移）
   const renderWords = (words: WordCue[]) => {
-    const t = currentTime ?? -1;
+    const t = effectiveTime;
     return words.map((w, i) => {
       // 已播到：word.end <= t 或 word.start <= t < word.end（正在播）
       // 未播到：t < word.start
@@ -87,16 +111,32 @@ export function SubtitleOverlay({
     }
   }, [isSelected]);
 
+  // 出场动画窗口判断：剩余时长 <= animationDuration 时进入出场
+  const animDur = style.animationDuration ?? 0.3;
+  const clipEnd = clip.startOnTrack + clip.duration;
+  const remaining = clipEnd - effectiveTime;
+  const inOutro = remaining <= animDur && remaining >= 0;
+  const animClass = inOutro
+    ? (style.animationOut && style.animationOut !== "none" ? `anim-${style.animationOut}` : "")
+    : (style.animationIn && style.animationIn !== "none" ? `anim-${style.animationIn}` : "");
+
+  // 选中字幕但播放头不在该 clip 时间范围内时，文字半透明（表示这不是当前播放的字幕，仅作编辑预览）
+  const rel = effectiveTime - clip.startOnTrack;
+  const isActive = rel >= 0 && rel < clip.duration;
+  const editPreviewOpacity = isActive ? 1 : 0.35;
+
   return (
     <>
       {/* 字幕文本元素（moveable 的 target） */}
       <div
         ref={textRef}
-        className={`subtitle-overlay-text ${style.animationIn && style.animationIn !== "none" ? `anim-${style.animationIn}` : ""}`}
+        className={`subtitle-overlay-text ${animClass}`}
         style={{
           position: "absolute",
-          left: `${style.x ?? 50}%`,
-          top: `${style.y ?? 80}%`,
+          left: `${style.position === "custom" ? (style.x ?? 50) : 50}%`,
+          top: `${style.position === "custom"
+            ? (style.y ?? 80)
+            : style.position === "top" ? 20 : style.position === "center" ? 50 : 80}%`,
           transform: `translate(-50%, -50%) rotate(${rotation}deg) scale(${scaleX}, ${scaleY})`,
           transformOrigin: "center center",
           // T4.8: 动画时长 CSS 变量
@@ -104,10 +144,13 @@ export function SubtitleOverlay({
           fontFamily: style.fontFamily,
           fontSize,
           fontWeight: 700,
-          lineHeight: 1.4,
+          lineHeight,
           color: style.color,
-          textShadow: strokeShadow,
-          padding: "4px 10px",
+          textShadow: finalTextShadow,
+          letterSpacing: `${letterSpacing}px`,
+          background: bgColor === "none" ? "transparent" : bgColor,
+          padding: bgColor === "none" ? "4px 10px" : `${bgPadding}px ${bgPadding * 2}px`,
+          borderRadius: bgColor === "none" ? 0 : 4,
           textAlign: "center",
           whiteSpace: "pre-wrap",
           wordBreak: "break-word",
@@ -115,6 +158,8 @@ export function SubtitleOverlay({
           zIndex: 7,
           cursor: isSelected ? "move" : "default",
           userSelect: "none",
+          // 选中但非活跃时半透明（编辑预览模式）
+          opacity: editPreviewOpacity,
         }}
         // M21: 用标准 onDoubleClick 替代 DOM expando _lastClick 双击检测
         onDoubleClick={() => {
@@ -148,6 +193,7 @@ export function SubtitleOverlay({
             const y = ((e.top + e.height / 2) / rect.height) * 100;
             onMove(Math.max(0, Math.min(100, x)), Math.max(0, Math.min(100, y)));
           }}
+          onDragEnd={() => onMoveEnd?.()}
           onScaleStart={() => {
             // 记录拖动开始时的 scaleX/scaleY
             startScaleXRef.current = style.scaleX ?? 100;
@@ -161,9 +207,11 @@ export function SubtitleOverlay({
             const newScaleY = Math.max(10, Math.min(500, startScaleYRef.current * ratioY));
             onScale(newScaleX, newScaleY);
           }}
+          onScaleEnd={() => onScaleEnd?.()}
           onRotate={(e) => {
             onRotate(e.rotation);
           }}
+          onRotateEnd={() => onRotateEnd?.()}
         />
       )}
     </>

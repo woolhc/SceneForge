@@ -44,6 +44,27 @@ export function ExportDialog({
     { v: "4k", label: "4K · 超高清", w: "3840×2160" },
   ];
 
+  // 导出预设（剪映式一键配置）
+  type Preset = {
+    id: string;
+    name: string;
+    desc: string;
+    patch: Partial<RenderConfig>;
+  };
+  const presets: Preset[] = [
+    { id: "draft", name: "草稿预览", desc: "720p · 30fps · 2Mbps", patch: { resolution: "720p", fps: 30, bitrateMbps: 2, codec: "h264" } },
+    { id: "sd", name: "标清发布", desc: "720p · 30fps · 4Mbps", patch: { resolution: "720p", fps: 30, bitrateMbps: 4, codec: "h264" } },
+    { id: "hd", name: "高清发布", desc: "1080p · 30fps · 8Mbps", patch: { resolution: "1080p", fps: 30, bitrateMbps: 8, codec: "h264" } },
+    { id: "hd60", name: "高清高帧率", desc: "1080p · 60fps · 12Mbps", patch: { resolution: "1080p", fps: 60, bitrateMbps: 12, codec: "h264" } },
+    { id: "uhd", name: "4K 超清", desc: "4K · 30fps · 25Mbps", patch: { resolution: "4k", fps: 30, bitrateMbps: 25, codec: "hevc" } },
+    { id: "tiktok", name: "短视频", desc: "1080p · 30fps · 6Mbps", patch: { resolution: "1080p", fps: 30, bitrateMbps: 6, codec: "h264" } },
+  ];
+
+  // 判断当前是否命中某个预设
+  const matchedPreset = presets.find((p) =>
+    Object.entries(p.patch).every(([k, v]) => (config as Record<string, unknown>)[k] === v),
+  );
+
   return (
     <div className="modal-backdrop" onClick={exportState === "exporting" ? undefined : onClose}>
       <div className="export-dialog" onClick={(e) => e.stopPropagation()}>
@@ -76,6 +97,24 @@ export function ExportDialog({
                   <FolderOpen size={14} />
                   浏览
                 </button>
+              </div>
+            </div>
+
+            {/* 导出预设（剪映式一键配置） */}
+            <div className="export-section">
+              <div className="export-section-title">导出预设</div>
+              <div className="preset-grid">
+                {presets.map((p) => (
+                  <button
+                    key={p.id}
+                    className={`preset-card ${matchedPreset?.id === p.id ? "active" : ""}`}
+                    onClick={() => onConfigChange({ ...config, ...p.patch })}
+                    title={p.desc}
+                  >
+                    <strong>{p.name}</strong>
+                    <small>{p.desc}</small>
+                  </button>
+                ))}
               </div>
             </div>
 
@@ -143,6 +182,28 @@ export function ExportDialog({
                   >
                     <option value="video">视频（含画面）</option>
                     <option value="audio-only">仅音频（MP3）</option>
+                  </select>
+                </label>
+                <label>
+                  默认转场时长（秒）
+                  <input
+                    type="number"
+                    min={0.1}
+                    max={2.0}
+                    step={0.1}
+                    value={config.transitionDuration ?? 0.5}
+                    onChange={(e) => onConfigChange({ ...config, transitionDuration: Number(e.target.value) })}
+                  />
+                </label>
+                <label>
+                  字幕处理
+                  <select
+                    value={config.subtitleMode ?? "burn"}
+                    onChange={(e) => onConfigChange({ ...config, subtitleMode: e.target.value as "burn" | "srt" | "none" })}
+                  >
+                    <option value="burn">烧录到画面</option>
+                    <option value="srt">导出 .srt 文件</option>
+                    <option value="none">不包含字幕</option>
                   </select>
                 </label>
               </div>

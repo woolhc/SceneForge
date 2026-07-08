@@ -3,9 +3,12 @@ import {
   Clapperboard,
   ChevronLeft,
   ChevronRight,
+  ClipboardPaste,
   Copy,
+  CopyPlus,
   Crop as CropIcon,
   Download,
+  Bookmark,
   ImagePlay,
   Layers,
   Loader2,
@@ -18,6 +21,7 @@ import {
   Undo2,
   Save,
   Scissors,
+  Search,
   SkipBack,
   SkipForward,
   Settings as SettingsIcon,
@@ -30,12 +34,14 @@ import {
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { desktopApi } from "./tauri";
 import type {
   AppInfo,
   AppSettings,
+  Chapter,
   Clip,
+  ClipKeyframes,
   ClipTransform,
   FfmpegStatus,
   MediaSource,
@@ -51,19 +57,55 @@ import type { AiSegment } from "./types";
 import { FONT_OPTIONS } from "./fonts";
 import { SubtitleOverlay } from "./preview/SubtitleOverlay";
 import { Panel, Group as PanelGroup, Separator as PanelResizeHandle } from "react-resizable-panels";
-import { ContextMenu, type ContextMenuState } from "./timeline/ContextMenu";
-import { ExportDialog, type ExportState } from "./panels/ExportDialog";
+import { ContextMenu } from "./timeline/ContextMenu";
+import { ExportDialog } from "./panels/ExportDialog";
 import { HomeScreen } from "./panels/HomeScreen";
-import { GenerateWizard, type PipelineState } from "./panels/GenerateWizard";
+import { GenerateWizard } from "./panels/GenerateWizard";
 import { EdlPreview } from "./panels/EdlPreview";
 import { FilterRenderer } from "./preview/FilterRenderer";
 import { LUT_FILTERS, getLutData } from "./luts";
 import { usePreviewEngine } from "./preview/usePreviewEngine";
+import { useProxyBackfill } from "./preview/useProxyBackfill";
 import { usePlaybackStore } from "./store/playbackStore";
+import { useExportAction } from "./store/exportAction";
+import { usePipelineStore } from "./store/pipelineStore";
+import { useProjectHistory } from "./store/projectHistory";
+import { useProjectStore } from "./store/projectStore";
+import { useUiStore } from "./store/uiStore";
 import { SPEED_PRESETS } from "./editor/speedCurve";
+import { SpeedCurveEditor } from "./components/SpeedCurveEditor";
+import { MaskPreview } from "./components/MaskPreview";
+import {
+  TRACK_KIND_LABELS,
+  deleteTrack,
+  moveTrack,
+  nextTrackName,
+  toggleTrackHidden,
+  toggleTrackLocked,
+  toggleTrackMuted,
+} from "./editor/timelineActions";
+import { runGeneratePipeline, type GeneratePipelineInput } from "./editor/pipeline";
+import { makeTransition, transitionDuration, transitionName } from "./editor/transitions";
+import {
+  applySpeedCurvePreset as buildSpeedCurvePresetChange,
+  changeClipSpeed as buildClipSpeedChange,
+  deleteClip as buildDeleteClipChange,
+  deleteClips as buildDeleteClipsChange,
+  duplicateClip as buildDuplicateClipChange,
+  pasteClipAtTrackEnd,
+  selectClipIds,
+  selectClipIdsByBox,
+  splitVisualClipAtPlayhead,
+  type OperationResult,
+} from "./editor/clipOperations";
+import {
+  addKeyframe,
+  findKeyframeAt,
+  removeKeyframeAt,
+  updateKeyframeEasing,
+} from "./editor/keyframes";
 import { Ruler } from "./timeline/Ruler";
 import { TimelineTrack } from "./timeline/TimelineTrack";
-import { removeClip, splitClipAt } from "./timeline/clipInteraction";
 import { realignTimeline } from "./timeline/realignTimeline";
 import { MediaPanel } from "./panels/MediaPanel";
 import { TextPanel } from "./panels/TextPanel";
@@ -71,8 +113,6 @@ import { AudioPanel } from "./panels/AudioPanel";
 import { TransitionPanel } from "./panels/TransitionPanel";
 import { ProjectMenu } from "./panels/ProjectMenu";
 // PanelTitle 已不再直接使用（各 Tab 自带标题）；TimelineTrack/Track 类型保留供时间线渲染
-
-type TabKind = "media" | "text" | "audio" | "transition";
 
 const ratios = ["9:16", "16:9", "1:1"];
 
@@ -84,6 +124,137 @@ function formatTC(seconds: number, fps = 30): string {
   const sec = totalSec % 60;
   const min = Math.floor(totalSec / 60);
   return `${String(min).padStart(2, "0")}:${String(sec).padStart(2, "0")}.${String(frame).padStart(2, "0")}`;
+}
+
+function PlayPauseButton({ onToggle }: { onToggle: () => void }) {
+  const playing = usePlaybackStore((s) => s.playing);
+  return (
+    <button className="round-button" title={playing ? "暂停" : "播放"} onClick={onToggle}>
+      {playing ? <Pause size={18} /> : <Play size={18} />}
+    </button>
+  );
+}
+
+function PreviewProgress({ totalDuration, onSeek }: { totalDuration: number; onSeek: (time: number) => void }) {
+  const currentTime = usePlaybackStore((s) => s.currentTime);
+  const percent = totalDuration > 0 ? Math.min(100, (currentTime / totalDuration) * 100) : 0;
+  return (
+    <input
+      type="range"
+      min={0}
+      max={100}
+      value={percent}
+      onChange={(event) => onSeek((Number(event.target.value) / 100) * totalDuration)}
+    />
+  );
+}
+
+function TimecodeDisplay({ totalDuration, fps }: { totalDuration: number; fps: number }) {
+  const currentTime = usePlaybackStore((s) => s.currentTime);
+  return (
+    <span className="timecode">
+      {formatTC(currentTime, fps)} / {formatTC(totalDuration, fps)}
+    </span>
+  );
+}
+
+function PlayheadLine({ totalDuration }: { totalDuration: number }) {
+  const currentTime = usePlaybackStore((s) => s.currentTime);
+  const percent = totalDuration > 0 ? Math.min(100, (currentTime / totalDuration) * 100) : 0;
+  return (
+    <div
+      className="playhead"
+      style={{ left: `calc(44px + (100% - 58px) * ${percent / 100})` }}
+    />
+  );
+}
+
+function KeyframeLabel() {
+  const currentTime = usePlaybackStore((s) => s.currentTime);
+  return <span className="kf-label">关键帧（@ {currentTime.toFixed(1)}s）</span>;
+}
+
+function StageSubtitleLayer({ excludeClipId }: { excludeClipId?: string } = {}) {
+  const currentTime = usePlaybackStore((s) => s.currentTime);
+  const subText = usePlaybackStore((s) => s.activeSubtitle);
+  const subStyle = usePlaybackStore((s) => s.activeSubtitleStyle);
+  const subClip = usePlaybackStore((s) => s.activeSubtitleClip);
+  // 选中字幕编辑时，由 SubtitleOverlay 渲染该 clip，这里跳过避免重复
+  if (subClip && subClip.id === excludeClipId) return null;
+  if (!subText || !subText.trim()) return null;
+  const s = subStyle;
+  const isCustom = s?.position === "custom";
+  const posX = isCustom ? (s?.x ?? 50) : 50;
+  const posY = isCustom ? (s?.y ?? 80) : (s?.position === "top" ? 12 : s?.position === "center" ? 50 : 88);
+  const baseColor = s?.color ?? "#FFFFFF";
+  const highlightColor = s?.highlightColor ?? "#FFD700";
+  const karaokeOn = (s?.karaoke ?? true) && (subClip?.words?.length ?? 0) > 0;
+  // 出场动画窗口判断：剩余时长 <= animationDuration 时进入出场
+  const animDur = s?.animationDuration ?? 0.3;
+  const clipEnd = subClip ? subClip.startOnTrack + subClip.duration : Infinity;
+  const remaining = clipEnd - currentTime;
+  const inOutro = remaining <= animDur && remaining >= 0;
+  const animClass = inOutro
+    ? (s?.animationOut && s.animationOut !== "none" ? `anim-${s.animationOut}` : "")
+    : (s?.animationIn && s.animationIn !== "none" ? `anim-${s.animationIn}` : "");
+  // 描边/阴影/背景/字间距/行高
+  const strokeWidth = s?.strokeWidth ?? 2;
+  const strokeColor = s?.strokeColor ?? "#000";
+  const strokeShadow = strokeWidth > 0
+    ? `${strokeWidth}px ${strokeWidth}px 0 ${strokeColor}, -${strokeWidth}px -${strokeWidth}px 0 ${strokeColor}, ${strokeWidth}px -${strokeWidth}px 0 ${strokeColor}, -${strokeWidth}px ${strokeWidth}px 0 ${strokeColor}`
+    : "none";
+  const shadowBlur = s?.shadowBlur ?? 0;
+  const shadowColor = s?.shadowColor ?? "#000";
+  const shadow = shadowBlur > 0 ? `, 0 ${Math.round(shadowBlur / 3)}px ${shadowBlur}px ${shadowColor}` : "";
+  const finalTextShadow = strokeShadow === "none" && shadow ? shadow.slice(2) : (strokeShadow === "none" ? "none" : strokeShadow + shadow);
+  const bgColor = s?.backgroundColor ?? "none";
+  const bgPadding = s?.backgroundPadding ?? 4;
+  const letterSpacing = s?.letterSpacing ?? 0;
+  const lineHeight = s?.lineHeight ?? 1.4;
+  return (
+    <div
+      className={`subtitle-overlay-text ${animClass}`}
+      style={{
+        position: "absolute",
+        left: `${posX}%`,
+        top: `${posY}%`,
+        transform: `translate(-50%, -50%) rotate(${s?.rotation ?? 0}deg) scale(${(s?.scaleX ?? 100) / 100}, ${(s?.scaleY ?? 100) / 100})`,
+        transformOrigin: "center",
+        fontFamily: s?.fontFamily,
+        fontSize: `${Math.max(12, (s?.fontSize ?? 48) * 0.35)}px`,
+        fontWeight: 700,
+        lineHeight,
+        color: baseColor,
+        textShadow: finalTextShadow,
+        letterSpacing: `${letterSpacing}px`,
+        background: bgColor === "none" ? "transparent" : bgColor,
+        padding: bgColor === "none" ? "4px 10px" : `${bgPadding}px ${bgPadding * 2}px`,
+        borderRadius: bgColor === "none" ? 0 : 4,
+        textAlign: "center",
+        whiteSpace: "pre-wrap",
+        maxWidth: "calc(100% - 24px)",
+        zIndex: 7,
+        pointerEvents: "none",
+      }}
+    >
+      {karaokeOn && subClip?.words
+        ? subClip.words.map((w, i, arr) => {
+            const prev = arr[i - 1];
+            const needSpace =
+              i > 0 &&
+              prev &&
+              /[A-Za-z0-9]$/.test(prev.text) &&
+              /^[A-Za-z0-9]/.test(w.text);
+            return (
+              <span key={i} style={{ color: currentTime >= w.start ? highlightColor : baseColor }}>
+                {needSpace ? " " : ""}
+                {w.text}
+              </span>
+            );
+          })
+        : subText}
+    </div>
+  );
 }
 
 // 跨平台检测：Windows / macOS / Linux
@@ -107,6 +278,49 @@ const whisperDefaultModel = isMac
 
 function newClipId() {
   return `clip_${Math.random().toString(16).slice(2)}_${Date.now()}`;
+}
+
+function newTrackId(kind: TrackKind) {
+  return `track_${kind}_${Math.random().toString(16).slice(2)}_${Date.now()}`;
+}
+
+function preferredTrackKindForAsset(asset: MediaSource): TrackKind {
+  if (asset.kind === "audio") return "audio";
+  if (asset.kind === "image") return "image";
+  return "video";
+}
+
+function assetFitsTrack(asset: MediaSource, track: Track) {
+  if (asset.kind === "audio") return track.kind === "audio" || track.kind === "voiceover";
+  if (asset.kind === "image") return track.kind === "image" || track.kind === "video";
+  return track.kind === "video";
+}
+
+function isVisualTrackKind(kind: TrackKind) {
+  return kind === "video" || kind === "image";
+}
+
+function ensureTrackForAsset(project: Project, asset: MediaSource): { project: Project; track: Track } {
+  const kind = preferredTrackKindForAsset(asset);
+  const existing = project.tracks.find((track) => track.kind === kind);
+  if (existing) return { project, track: existing };
+
+  const maxOrder = project.tracks.reduce((max, track) => Math.max(max, track.order), -1);
+  const baseVisualOrder = project.tracks
+    .filter((track) => track.kind === "video" || track.kind === "image")
+    .reduce((max, track) => Math.max(max, track.order), -Infinity);
+  const order = kind === "image" && Number.isFinite(baseVisualOrder)
+    ? baseVisualOrder - 0.1
+    : maxOrder + 1;
+  const track: Track = {
+    id: newTrackId(kind),
+    kind,
+    name: nextTrackName(project, kind),
+    order,
+    muted: false,
+    locked: false,
+  };
+  return { project: { ...project, tracks: [...project.tracks, track] }, track };
 }
 
 /**
@@ -185,9 +399,17 @@ function arrangeSegmentsToClips(
 export function App() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [project, setProject] = useState<Project | null>(null);
-  const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   /** T4.6: 多选 clip id 集合（Ctrl/Cmd+点击加选） */
-  const [selectedClipIds, setSelectedClipIds] = useState<string[]>([]);
+  const selectedClipIds = useProjectStore((s) => s.selectedClipIds);
+  const setSelectedClipIds = useProjectStore((s) => s.setSelectedClipIds);
+  const selectedClipId = useMemo(() => selectedClipIds[0] ?? null, [selectedClipIds]);
+  function setSelectedClipId(next: string | null | ((previous: string | null) => string | null)) {
+    setSelectedClipIds((previousIds) => {
+      const previous = previousIds[0] ?? null;
+      const resolved = typeof next === "function" ? next(previous) : next;
+      return resolved ? [resolved] : [];
+    });
+  }
   const [settings, setSettings] = useState<AppSettings>({
     deepseekApiKey: "",
     pexelsApiKey: "",
@@ -200,7 +422,8 @@ export function App() {
   });
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [ffmpeg, setFfmpeg] = useState<FfmpegStatus | null>(null);
-  const [showSettings, setShowSettings] = useState(false);
+  const showSettings = useUiStore((s) => s.showSettings);
+  const setShowSettings = useUiStore((s) => s.setShowSettings);
   const [busy, setBusy] = useState<string | null>(null);
   // 时间线缩放：pxPerSecond 驱动（4=超小看全局，1200=帧级细节）
   const [pxPerSecond, setPxPerSecond] = useState(64);
@@ -217,37 +440,51 @@ export function App() {
   const [assetQueryDraft, setAssetQueryDraft] = useState("");
   const [assetCachingIds, setAssetCachingIds] = useState<Set<string>>(new Set());
   // 剪映式 Tab 切换 + 新建字幕的默认样式草稿
-  const [activeTab, setActiveTab] = useState<TabKind>("text");
+  const activeTab = useUiStore((s) => s.activeTab);
+  const setActiveTab = useUiStore((s) => s.setActiveTab);
   const [subtitleStyleDraft, setSubtitleStyleDraft] = useState<SubtitleStyle>({ ...DEFAULT_SUBTITLE_STYLE });
-  const [showAddTrackMenu, setShowAddTrackMenu] = useState(false);
+  const showAddTrackMenu = useUiStore((s) => s.showAddTrackMenu);
+  const setShowAddTrackMenu = useUiStore((s) => s.setShowAddTrackMenu);
   // 素材库悬停预览：非 null 时中央预览区显示该素材
   const [previewingAsset, setPreviewingAsset] = useState<MediaSource | null>(null);
   const [subtitleEditing, setSubtitleEditing] = useState(false);
-  // 撤销/重做历史栈
-  const undoStack = useRef<Project[]>([]);
-  const redoStack = useRef<Project[]>([]);
-  const [canUndo, setCanUndo] = useState(false);
-  const [canRedo, setCanRedo] = useState(false);
+  // 字幕轨统一调整样式：浮动面板编辑状态
+  const [subtitleTrackStyleEditing, setSubtitleTrackStyleEditing] = useState<{
+    trackId: string;
+    draft: SubtitleStyle;
+  } | null>(null);
   // 剪贴板（clip 复制/粘贴用）
   const clipboardRef = useRef<Clip | null>(null);
   // 右键菜单
-  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const contextMenu = useUiStore((s) => s.contextMenu);
+  const setContextMenu = useUiStore((s) => s.setContextMenu);
   // 导出弹窗
-  const [showExport, setShowExport] = useState(false);
-  const [exportState, setExportState] = useState<ExportState>("idle");
-  const [exportPath, setExportPath] = useState<string | null>(null);
-  const [exportError, setExportError] = useState<string>("");
-  const [exportProgress, setExportProgress] = useState(0);
+  const showExport = useUiStore((s) => s.showExport);
+  const setShowExport = useUiStore((s) => s.setShowExport);
+  const exportState = useUiStore((s) => s.exportState);
+  const setExportState = useUiStore((s) => s.setExportState);
+  const exportPath = useUiStore((s) => s.exportPath);
+  const exportError = useUiStore((s) => s.exportError);
+  const exportProgress = useUiStore((s) => s.exportProgress);
+  const setExportProgress = useUiStore((s) => s.setExportProgress);
+  const exportMessage = useUiStore((s) => s.exportMessage);
+  const setExportMessage = useUiStore((s) => s.setExportMessage);
   // 预览窗口缩放
-  const [previewZoom, setPreviewZoom] = useState(100); // 百分比，100=适配
+  const previewZoom = useUiStore((s) => s.previewZoom);
+  const setPreviewZoom = useUiStore((s) => s.setPreviewZoom);
+  const [showPreviewDebug, setShowPreviewDebug] = useState(false);
+  const [previewDebugInfo, setPreviewDebugInfo] = useState<Record<string, string>>({});
   const [view, setView] = useState<"home" | "editor">("home");
   const [showGenerate, setShowGenerate] = useState(false);
-  const [pipeline, setPipeline] = useState<PipelineState>({ active: false, steps: [], error: null });
+  const pipeline = usePipelineStore((s) => s.pipeline);
+  const startPipeline = usePipelineStore((s) => s.startPipeline);
+  const updatePipelineStep = usePipelineStore((s) => s.updateStep);
+  const failRunningPipelineStep = usePipelineStore((s) => s.failRunningStep);
+  const resetPipeline = usePipelineStore((s) => s.resetPipeline);
   // EDL 预览（AI 分段后先让用户确认/编辑，再执行编排）
   const [edlSegments, setEdlSegments] = useState<AiSegment[] | null>(null);
   const [edlBusy, setEdlBusy] = useState(false);
   const previewViewportRef = useRef<HTMLDivElement | null>(null);
-  const [exportMessage, setExportMessage] = useState("");
 
   // T2.3: 进入首页时刷新项目列表（persist 不再每次刷新）
   useEffect(() => {
@@ -274,8 +511,6 @@ export function App() {
   const bootstrapped = useRef(false);
   const timelineScrollRef = useRef<HTMLDivElement | null>(null);
   const timelineDrag = useRef({ active: false, x: 0, left: 0 });
-  const stageVideoRef = useRef<HTMLVideoElement | null>(null);
-  const stageVideoBRef = useRef<HTMLVideoElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   // T4.1: 画中画叠加层容器（PreviewEngine 在里面动态管理 overlay video）
   const overlayContainerRef = useRef<HTMLDivElement | null>(null);
@@ -286,28 +521,49 @@ export function App() {
   useEffect(() => {
     projectRef.current = project;
   }, [project]);
+  const {
+    canUndo,
+    canRedo,
+    pushUndo,
+    undo,
+    redo,
+    persist,
+    persistWithSnapshot,
+  } = useProjectHistory({
+    getCurrentProject: () => projectRef.current,
+    setProject,
+    setStatus,
+  });
+  const handleRenderFinal = useExportAction({
+    project,
+    refreshProjects,
+    setBusy,
+    setStatus,
+  });
+
+  useProxyBackfill({ project, setProject, setAssetCachingIds, setStatus });
 
   // 实时预览引擎：接管中央预览的 <video>，按时间线同步画面/配音/字幕
   // T2.1: engineState 移到 zustand store，按字段订阅避免 60fps 全树重渲染
-  const { syncProject, togglePlay, seek, setOverlayContainer } = usePreviewEngine(stageVideoRef, stageVideoBRef, view === "editor");
+  const { syncProject, togglePlay, seek, setClipVolume, setOverlayContainer, setActiveVideoChangeCallback } = usePreviewEngine(stageRef, view === "editor");
 
   // T4.1: 把 overlay 容器 ref 绑定到预览引擎
   useEffect(() => {
     setOverlayContainer(overlayContainerRef.current);
   }, [setOverlayContainer, view]);
-  // 高频字段（每帧）：播放头时间
-  const playhead = usePlaybackStore((s) => s.currentTime);
-  const isPlaying = usePlaybackStore((s) => s.playing);
+  // 双缓冲切换：活跃 video 变化时通知 FilterRenderer 更新读取的 video
+  useEffect(() => {
+    setActiveVideoChangeCallback((el) => {
+      filterRendererRef.current?.setVideo(el);
+    });
+    return () => setActiveVideoChangeCallback(null);
+  }, [setActiveVideoChangeCallback]);
   // 中频字段（clip 切换时）
   const activeVideoClip = usePlaybackStore((s) => s.activeVideoClip);
-  const activeOverlayClips = usePlaybackStore((s) => s.activeOverlayClips);
-  const activeSubtitle = usePlaybackStore((s) => s.activeSubtitle);
-  const activeSubtitleStyle = usePlaybackStore((s) => s.activeSubtitleStyle);
-  const activeSubtitleClip = usePlaybackStore((s) => s.activeSubtitleClip);
 
   const selectedClip = useMemo(() => {
     if (!project) return null;
-    return project.clips.find((clip) => clip.id === selectedClipId) || project.clips[0] || null;
+    return project.clips.find((clip) => clip.id === selectedClipId) || null;
   }, [project, selectedClipId]);
 
   // ref 始终指向最新 selectedClip，供拖拽闭包读取
@@ -321,13 +577,13 @@ export function App() {
     return project.tracks.find((t) => t.id === selectedClip.trackId) || null;
   }, [project, selectedClip]);
 
-  // 判断选中 clip 是否是"画中画层"（视频轨但非底层）。
-  // 底层视频轨 = order 最大的那条；其他视频轨都是叠加层。
+  // 判断选中 clip 是否是"画中画层"（视觉轨但非底层）。
+  // 底层视觉轨 = order 最大的那条；其他视觉轨都是叠加层。
   const isOverlayClip = useMemo(() => {
-    if (!project || !selectedClipTrack || selectedClipTrack.kind !== "video") return false;
-    const videoTracks = project.tracks.filter((t) => t.kind === "video");
-    if (videoTracks.length <= 1) return false;
-    const maxOrder = Math.max(...videoTracks.map((t) => t.order));
+    if (!project || !selectedClipTrack || !isVisualTrackKind(selectedClipTrack.kind)) return false;
+    const visualTracks = project.tracks.filter((t) => isVisualTrackKind(t.kind));
+    if (visualTracks.length <= 1) return false;
+    const maxOrder = Math.max(...visualTracks.map((t) => t.order));
     return selectedClipTrack.order < maxOrder;
   }, [project, selectedClipTrack]);
 
@@ -343,15 +599,77 @@ export function App() {
   /** T4.2: 在当前播放头位置为指定属性打一个关键帧 */
   function addKeyframeAtPlayhead(prop: "x" | "y" | "scale" | "opacity" | "rotation" | "volume", value: number) {
     if (!selectedClip || !project) return;
-    const relTime = Math.max(0, playhead - selectedClip.startOnTrack);
+    const currentTime = usePlaybackStore.getState().currentTime;
+    const relTime = Math.max(0, currentTime - selectedClip.startOnTrack);
     const cur = selectedClip.keyframes ?? {};
-    const arr = (cur[prop] ?? []).slice();
-    // 移除同时间点的旧帧（覆盖）
-    const filtered = arr.filter((k) => Math.abs(k.time - relTime) > 0.05);
-    filtered.push({ time: relTime, value, easing: "linear" });
-    filtered.sort((a, b) => a.time - b.time);
-    updateSelectedClip({ keyframes: { ...cur, [prop]: filtered } });
+    const next = addKeyframe(cur[prop], relTime, value);
+    updateSelectedClip({ keyframes: { ...cur, [prop]: next } });
     setStatus(`已为 ${prop} 在 ${relTime.toFixed(2)}s 打关键帧`);
+  }
+
+  /** 删除播放头处的关键帧（遍历所有属性） */
+  function removeKeyframeAtPlayhead() {
+    if (!selectedClip) return;
+    const currentTime = usePlaybackStore.getState().currentTime;
+    const relTime = Math.max(0, currentTime - selectedClip.startOnTrack);
+    const cur = selectedClip.keyframes ?? {};
+    const props = ["x", "y", "scale", "opacity", "rotation", "volume"] as const;
+    let removed = false;
+    const next = { ...cur };
+    for (const prop of props) {
+      if (findKeyframeAt(cur[prop], relTime)) {
+        next[prop] = removeKeyframeAt(cur[prop], relTime);
+        removed = true;
+      }
+    }
+    if (removed) {
+      updateSelectedClip({ keyframes: next });
+      setStatus(`已删除 ${relTime.toFixed(2)}s 处的关键帧`);
+    }
+  }
+
+  /** 修改播放头处关键帧的 easing（遍历所有属性） */
+  function setKeyframeEasingAtPlayhead(easing: "linear" | "easeIn" | "easeOut" | "easeInOut") {
+    if (!selectedClip) return;
+    const currentTime = usePlaybackStore.getState().currentTime;
+    const relTime = Math.max(0, currentTime - selectedClip.startOnTrack);
+    const cur = selectedClip.keyframes ?? {};
+    const props = ["x", "y", "scale", "opacity", "rotation", "volume"] as const;
+    let changed = false;
+    const next = { ...cur };
+    for (const prop of props) {
+      if (findKeyframeAt(cur[prop], relTime)) {
+        next[prop] = updateKeyframeEasing(cur[prop], relTime, easing);
+        changed = true;
+      }
+    }
+    if (changed) {
+      updateSelectedClip({ keyframes: next });
+    }
+  }
+
+  /** 查找播放头处是否有任何关键帧（用于 UI 显示 easing 选择器） */
+  function hasKeyframeAtPlayhead(): boolean {
+    if (!selectedClip) return false;
+    const currentTime = usePlaybackStore.getState().currentTime;
+    const relTime = Math.max(0, currentTime - selectedClip.startOnTrack);
+    const cur = selectedClip.keyframes ?? {};
+    const props = ["x", "y", "scale", "opacity", "rotation", "volume"] as const;
+    return props.some((prop) => findKeyframeAt(cur[prop], relTime) !== null);
+  }
+
+  /** 获取播放头处关键帧的 easing（取第一个命中的） */
+  function getKeyframeEasingAtPlayhead(): "linear" | "easeIn" | "easeOut" | "easeInOut" | null {
+    if (!selectedClip) return null;
+    const currentTime = usePlaybackStore.getState().currentTime;
+    const relTime = Math.max(0, currentTime - selectedClip.startOnTrack);
+    const cur = selectedClip.keyframes ?? {};
+    const props = ["x", "y", "scale", "opacity", "rotation", "volume"] as const;
+    for (const prop of props) {
+      const kf = findKeyframeAt(cur[prop], relTime);
+      if (kf) return kf.easing;
+    }
+    return null;
   }
 
   // 项目总时长 = 所有 clip 的最大结束位置
@@ -375,23 +693,44 @@ export function App() {
 
   // 初始化 WebGL 滤镜渲染器
   useEffect(() => {
-    if (!filterCanvasRef.current || !stageVideoRef.current) return;
-    filterRendererRef.current = new FilterRenderer(filterCanvasRef.current, stageVideoRef.current);
+    if (!filterCanvasRef.current) return;
+    filterRendererRef.current = new FilterRenderer(filterCanvasRef.current);
     return () => {
       filterRendererRef.current?.dispose();
       filterRendererRef.current = null;
     };
   }, []);
 
-  // 每帧渲染滤镜：用"播放头所在的活跃视频 clip"，而非 selectedClip
-  // 这样播放跨片段时滤镜正确切换；选中 A 播放 B 时显示 B 的滤镜
-  useEffect(() => {
-    if (!filterRendererRef.current) return;
-    // 优先用引擎提供的活跃视频 clip；回退到 selectedClip（暂停时）
-    const target = activeVideoClip || selectedClip;
-    if (!target) return;
-    filterRendererRef.current.render(target);
-  });
+ // 每帧渲染滤镜：用"播放头所在的活跃视频 clip"，而非 selectedClip
+ // 这样播放跨片段时滤镜正确切换；选中 A 播放 B 时显示 B 的滤镜
+ useEffect(() => {
+   if (!filterRendererRef.current) return;
+   // 优先用引擎提供的活跃视频 clip；回退到 selectedClip（暂停时）
+   const target = selectedClip && (!activeVideoClip || activeVideoClip.id === selectedClip.id)
+     ? selectedClip
+     : activeVideoClip || selectedClip;
+   if (!target) return;
+    // T1.9 修复：只设置 clip（低频），FilterRenderer 内部 rAF 循环负责每帧绘制
+    // 这样 T2.1 的 zustand 解耦不会导致播放时画布冻结
+    filterRendererRef.current.setClip(target);
+    if (!target.filter || target.filter === "none") {
+      filterRendererRef.current.clearLut();
+      return;
+    }
+    let cancelled = false;
+    void getLutData(target.filter).then((data) => {
+      if (cancelled || !data || !filterRendererRef.current) return;
+      const current = selectedClip && (!activeVideoClip || activeVideoClip.id === selectedClip.id)
+        ? selectedClip
+        : activeVideoClip || selectedClip;
+      if (current?.id === target.id && current.filter === target.filter) {
+        void filterRendererRef.current.loadLut(target.filter!, data);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeVideoClip, selectedClip]);
 
   useEffect(() => {
     if (!selectedClip) {
@@ -399,12 +738,36 @@ export function App() {
       return;
     }
     // 视频 clip 优先用 visualQuery（AI 生成的搜索词）；字幕/配音 clip 用 text
-    if (selectedClipTrack?.kind === "video") {
+    if (selectedClipTrack && isVisualTrackKind(selectedClipTrack.kind)) {
       setAssetQueryDraft(selectedClip.visualQuery || selectedClip.text || "");
     } else {
       setAssetQueryDraft(selectedClip.text || selectedClip.visualQuery || "");
     }
   }, [selectedClip?.id, selectedClipTrack?.kind]);
+
+  useEffect(() => {
+    if (!showPreviewDebug) return;
+    const collect = () => {
+      const stage = stageRef.current;
+      const activeMedia = stage?.querySelector(".stage-pooled-media[style*=\"opacity: 1\"]") as HTMLElement | null
+        ?? stage?.querySelector(".stage-pooled-media") as HTMLElement | null;
+      setPreviewDebugInfo({
+        selectedClip: selectedClip ? `${selectedClip.id} / ${selectedClip.filter ?? "no-filter"}` : "none",
+        activeClip: activeVideoClip ? `${activeVideoClip.id} / ${activeVideoClip.filter ?? "no-filter"}` : "none",
+        selectedTrack: selectedClipTrack ? `${selectedClipTrack.kind} / order ${selectedClipTrack.order}` : "none",
+        filterCanvas: filterCanvasRef.current
+          ? `display=${filterCanvasRef.current.style.display || getComputedStyle(filterCanvasRef.current).display}, size=${filterCanvasRef.current.width}x${filterCanvasRef.current.height}`
+          : "missing",
+        activeMedia: activeMedia
+          ? `${activeMedia.tagName.toLowerCase()} filter=${activeMedia.style.filter || "none"} opacity=${activeMedia.style.opacity || "unset"}`
+          : "missing",
+        renderer: stage?.querySelector(".webcodecs-preview-canvas") ? "WebCodecsRenderer" : "PreviewEngine",
+      });
+    };
+    collect();
+    const timer = window.setInterval(collect, 500);
+    return () => window.clearInterval(timer);
+  }, [activeVideoClip, selectedClip, selectedClipTrack, showPreviewDebug]);
 
   // T2.4: 键盘 handler 通过 ref 读易变值/函数，effect 只挂载一次（不每帧重订阅）
   const kbStateRef = useRef<{
@@ -413,8 +776,9 @@ export function App() {
     selectedClipId: string | null;
     selectedClipIds: string[];
     totalDuration: number;
-    deleteSelectedClip: () => void;
-    deleteSelectedClips: () => void;
+    fps: number;
+    deleteSelectedClip: (ripple?: boolean) => void;
+    deleteSelectedClips: (ripple?: boolean) => void;
     undo: () => void;
     redo: () => void;
     duplicateSelectedClip: () => void;
@@ -425,6 +789,7 @@ export function App() {
   } | null>(null);
   kbStateRef.current = {
     project, selectedClip, selectedClipId, selectedClipIds, totalDuration,
+    fps: project?.renderConfig?.fps ?? 30,
     deleteSelectedClip, deleteSelectedClips, undo, redo, duplicateSelectedClip, pasteClip,
     togglePlay, splitAtPlayhead, seek,
   };
@@ -446,12 +811,14 @@ export function App() {
         return;
       }
       // Delete 或 Backspace 删除选中 clip（T4.6: 多选时批量删）
+      // Shift+Delete: 非 ripple 删除（保留空隙，剪映式）
       if ((event.key === "Delete" || event.key === "Backspace") && s.selectedClipId) {
         event.preventDefault();
+        const ripple = !event.shiftKey;
         if (s.selectedClipIds && s.selectedClipIds.length > 1) {
-          s.deleteSelectedClips();
+          s.deleteSelectedClips(ripple);
         } else {
-          s.deleteSelectedClip();
+          s.deleteSelectedClip(ripple);
         }
       }
       // Ctrl+Z 撤销，Ctrl+Shift+Z 或 Ctrl+Y 重做
@@ -492,12 +859,12 @@ export function App() {
       // 方向键：帧级步进 / 秒级步进
       if (event.key === "ArrowLeft") {
         event.preventDefault();
-        const step = event.shiftKey ? 1 : 1 / 30;
+        const step = event.shiftKey ? 1 : 1 / s.fps;
         s.seek(Math.max(0, usePlaybackStore.getState().currentTime - step));
       }
       if (event.key === "ArrowRight") {
         event.preventDefault();
-        const step = event.shiftKey ? 1 : 1 / 30;
+        const step = event.shiftKey ? 1 : 1 / s.fps;
         s.seek(usePlaybackStore.getState().currentTime + step);
       }
       // Home/End 跳到开头/结尾
@@ -524,6 +891,19 @@ export function App() {
   async function bootstrap() {
     setBusy("init");
     try {
+      // G5: 崩溃恢复检测 -- 读上次退出标记，如果不是 clean 则提示
+      try {
+        const exitedCleanly = localStorage.getItem("appExitedCleanly");
+        if (exitedCleanly === "false") {
+          // 上次未正常退出（崩溃/被杀），但数据已通过定时 flush + SQLite 持久化
+          setTimeout(() => setStatus("上次未正常退出，最近更改已自动保存"), 1500);
+        }
+        // 标记本次运行中（beforeunload 时会改为 true）
+        localStorage.setItem("appExitedCleanly", "false");
+      } catch {
+        // localStorage 不可用时忽略
+      }
+
       const [info, ffmpegStatus, loadedSettings, loadedProjects, voices] = await Promise.all([
         desktopApi.getAppInfo(),
         desktopApi.checkFfmpeg(),
@@ -576,71 +956,6 @@ export function App() {
     }
   }
 
-  /** 把当前 project 推入撤销栈（在修改前调用） */
-  function pushUndo(current: Project | null) {
-    if (!current) return;
-    // T2.3: structuredClone 比 JSON.parse(JSON.stringify()) 快 ~3x
-    undoStack.current.push(structuredClone(current));
-    if (undoStack.current.length > 50) undoStack.current.shift(); // 限制 50 步
-    redoStack.current = []; // 新操作清空重做栈
-    setCanUndo(undoStack.current.length > 0);
-    setCanRedo(false);
-  }
-
-  /** 撤销 */
-  function undo() {
-    const prev = undoStack.current.pop();
-    if (!prev || !project) return;
-    redoStack.current.push(structuredClone(project));
-    setProject(prev);
-    void desktopApi.saveProject(prev);
-    setCanUndo(undoStack.current.length > 0);
-    setCanRedo(true);
-    setStatus("已撤销");
-  }
-
-  /** 重做 */
-  function redo() {
-    const next = redoStack.current.pop();
-    if (!next || !project) return;
-    undoStack.current.push(structuredClone(project));
-    setProject(next);
-    void desktopApi.saveProject(next);
-    setCanUndo(true);
-    setCanRedo(redoStack.current.length > 0);
-    setStatus("已重做");
-  }
-
-  // T2.3: 落盘防抖 ref（500ms trailing edge），高频编辑时不每秒写盘
-  const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pendingSaveRef = useRef<Project | null>(null);
-  function debouncedSaveProject(project: Project) {
-    pendingSaveRef.current = project;
-    if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
-    saveDebounceRef.current = setTimeout(async () => {
-      const toSave = pendingSaveRef.current;
-      saveDebounceRef.current = null;
-      if (toSave) {
-        await desktopApi.saveProject(toSave);
-      }
-    }, 500);
-  }
-
-  async function persist(next: Project, message = "已保存") {
-    pushUndo(projectRef.current); // 修改前保存撤销快照
-    setProject(next);
-    debouncedSaveProject(next); // 防抖落盘（不再每秒写）
-    setStatus(message);
-  }
-
-  /** persist 变体：用外部提供的"操作前快照"压入撤销栈（用于拖拽等交互式编辑） */
-  async function persistWithSnapshot(next: Project, snapshot: Project | null, message = "已保存") {
-    pushUndo(snapshot); // 用拖拽开始时的快照，而非中间态
-    setProject(next);
-    debouncedSaveProject(next); // 防抖落盘
-    setStatus(message);
-  }
-
   async function handleSaveSettings() {
     setBusy("settings");
     try {
@@ -670,27 +985,6 @@ export function App() {
         }
       }
       setStatus("项目已删除");
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function handleRenderFinal(outputPath: string | null) {
-    if (!project) return;
-    setExportState("exporting");
-    setStatus("正在导出视频...");
-    try {
-      await desktopApi.saveProject(project);
-      const result = await desktopApi.renderProject({ projectId: project.id, preview: false, outputPath });
-      await refreshProjects(project.id);
-      setExportPath(result.previewPath);
-      setExportState("done");
-      setStatus(`导出成功：${result.previewPath}`);
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      setExportError(msg);
-      setExportState("error");
-      setStatus(`导出失败：${msg}`);
     } finally {
       setBusy(null);
     }
@@ -782,6 +1076,33 @@ export function App() {
     setSelectedClipId(newClip.id);
   }
 
+  /** 导入 SRT 字幕文件：解析后端 -> 生成字幕 clip 到字幕轨 */
+  async function handleImportSrt() {
+    if (!project) return;
+    try {
+      const srtPath = await desktopApi.pickSrtFile();
+      if (!srtPath) return;
+      setBusy("subtitles");
+      setStatus("正在导入 SRT 字幕...");
+      await desktopApi.saveProject(project);
+      const next = await desktopApi.importSrt({
+        projectId: project.id,
+        srtPath,
+        timeOffset: 0,
+      });
+      setProject(next);
+      await refreshProjects(next.id);
+      const subCount = next.clips.filter((c) =>
+        next.tracks.some((t) => t.kind === "subtitle" && t.id === c.trackId),
+      ).length;
+      setStatus(`SRT 导入完成，共 ${subCount} 条字幕`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   /**
    * 拖动字幕手柄（8 个点）：
    * - 四角 tl/tr/bl/br：等比缩放字号（文字整体变大变小）
@@ -795,24 +1116,19 @@ export function App() {
    * - duration = (sourceOut - sourceIn) / speed
    * - 同轨后续 clip 涟漪推移（补/缩差值）
    */
+  function applyClipOperation(result: OperationResult) {
+    void persist(result.project, result.message);
+    setSelectedClipId(result.selectedClipId);
+  }
+
   function changeClipSpeed(clip: Clip, newSpeed: number) {
     if (!project) return;
-    const sourceDuration = clip.sourceOut - clip.sourceIn;
-    const newDuration = Math.max(0.2, sourceDuration / Math.abs(newSpeed));
-    const durationDelta = newDuration - clip.duration;
-    // 更新该 clip 的 speed + duration
-    let nextClips = project.clips.map((c) =>
-      c.id === clip.id ? { ...c, speed: newSpeed, duration: newDuration } : c,
-    );
-    // 同轨后续 clip 涟漪推移
-    const clipEnd = clip.startOnTrack + clip.duration;
-    nextClips = nextClips.map((c) => {
-      if (c.trackId === clip.trackId && c.id !== clip.id && c.startOnTrack >= clipEnd - 0.05) {
-        return { ...c, startOnTrack: c.startOnTrack + durationDelta };
-      }
-      return c;
-    });
-    void persist({ ...project, clips: nextClips }, `变速 ${newSpeed}x`);
+    applyClipOperation(buildClipSpeedChange(project, clip, newSpeed));
+  }
+
+  function applySpeedCurvePreset(clip: Clip, curve: Parameters<typeof buildSpeedCurvePresetChange>[2], label: string) {
+    if (!project) return;
+    applyClipOperation(buildSpeedCurvePresetChange(project, clip, curve, label));
   }
 
   function handleSubtitleResize(event: React.PointerEvent<HTMLDivElement>, _corner: string) {
@@ -836,11 +1152,12 @@ export function App() {
       const currentStyle = selectedClipRef.current?.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE };
       updateSelectedClip({
         subtitleStyle: { ...currentStyle, fontSize: newSize },
-      });
+      }, false);
     };
     const up = () => {
       document.removeEventListener("pointermove", move);
       document.removeEventListener("pointerup", up);
+      commitInteractiveEdit();
     };
     document.addEventListener("pointermove", move);
     document.addEventListener("pointerup", up);
@@ -894,84 +1211,47 @@ export function App() {
    * 模式 2（文案）：文案 → AI分段+配素材 → TTS配音 → 字幕识别
    * 模式 1（音频）：whisper 句级识别 → AI 配关键词（保留真实时间）→ (已有音频) → 字幕识别
    */
-  async function handleGeneratePipeline(input: {
-    script: string;
-    ratio: string;
-    voiceId: string;
-    translate: boolean;
-    audioPath?: string | null;
-  }) {
+  async function handleGeneratePipeline(input: GeneratePipelineInput) {
     const isAudioMode = !!input.audioPath;
-    const steps = [
-      { label: "创建项目", status: "pending" as const },
-      { label: isAudioMode ? "识别音频 + 匹配素材" : "AI 分段 + 匹配素材", status: "pending" as const },
-      { label: input.voiceId ? "生成配音" : "准备音频", status: "pending" as const },
-      { label: "识别字幕", status: "pending" as const },
-      { label: "完成", status: "pending" as const },
-    ];
-
-    const updateStep = (idx: number, status: "running" | "done" | "error") => {
-      setPipeline((prev) => ({
-        ...prev,
-        steps: prev.steps.map((s, i) => (i === idx ? { ...s, status } : s)),
-        currentStep: idx,
-      }));
-    };
-
-    setPipeline({ active: true, steps, error: null });
-
-    try {
-      // Step 1: 创建项目 + 设置文案
-      updateStep(0, "running");
-      const proj = await desktopApi.createProject({ title: "一键生成", ratio: input.ratio });
-      const withScript = { ...proj, script: input.script };
-      await desktopApi.saveProject(withScript);
-      setProject(withScript);
-      setSelectedClipId(null);
-      setView("editor");
-      updateStep(0, "done");
-
-      // Step 2: 分段 + 绑素材
-      updateStep(1, "running");
-      await new Promise((r) => setTimeout(r, 200));
-      if (isAudioMode && input.audioPath) {
-        // 音频模式：whisper 句级识别（真实时间）→ AI 配关键词 → 编排（保留真实时间）
-        await handleAudioSegmentPipeline(input.audioPath, input.ratio);
-      } else {
-        // 文案模式：AI 分段（估算时长）→ 编排
-        await handleSegmentScript({ skipEdl: true });
-      }
-      updateStep(1, "done");
-
-      // Step 3: 生成配音 或 跳过（音频模式已有原始音频）
-      updateStep(2, "running");
-      if (input.voiceId) {
+    await runGeneratePipeline(input, {
+      startPipeline,
+      updateStep: updatePipelineStep,
+      createProject: async () => {
+        const proj = await desktopApi.createProject({ title: "一键生成", ratio: input.ratio });
+        const withScript = { ...proj, script: input.script };
+        await desktopApi.saveProject(withScript);
+        setProject(withScript);
+        setSelectedClipId(null);
+        setView("editor");
+      },
+      segmentAndBindAssets: async () => {
+        if (isAudioMode && input.audioPath) {
+          await handleAudioSegmentPipeline(input.audioPath, input.ratio);
+        } else {
+          await handleSegmentScript({ skipEdl: true });
+        }
+      },
+      prepareAudio: async () => {
+        if (!input.voiceId) return;
         setSelectedVoiceId(input.voiceId);
-        await new Promise((r) => setTimeout(r, 200));
+        await new Promise((resolve) => setTimeout(resolve, 200));
         await handleGenerateProjectAudio();
-      }
-      updateStep(2, "done");
-
-      // Step 4: 识别字幕
-      updateStep(3, "running");
-      await new Promise((r) => setTimeout(r, 300));
-      await handleRecognizeSubtitles(input.translate);
-      updateStep(3, "done");
-
-      // Step 5: 完成
-      updateStep(4, "done");
-      setStatus("一键生成完成！请在编辑器中检查并导出");
-      setTimeout(() => {
-        setPipeline({ active: false, steps: [], error: null });
-        setShowGenerate(false);
-      }, 1500);
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      const currentIdx = pipeline.steps.findIndex((s) => s.status === "running");
-      if (currentIdx >= 0) updateStep(currentIdx, "error");
-      setPipeline((prev) => ({ ...prev, error: msg }));
-      setStatus(`生成失败：${msg}`);
-    }
+      },
+      recognizeSubtitles: async () => {
+        await handleRecognizeSubtitles(input.translate);
+      },
+      complete: () => {
+        setStatus("一键生成完成！请在编辑器中检查并导出");
+        setTimeout(() => {
+          resetPipeline();
+          setShowGenerate(false);
+        }, 1500);
+      },
+      fail: (message) => {
+        failRunningPipelineStep(message);
+        setStatus(`生成失败：${message}`);
+      },
+    });
   }
 
   async function handleSegmentScript(opts?: { skipEdl?: boolean }) {
@@ -1228,7 +1508,7 @@ export function App() {
     setBusy("asset-search");
     setStatus(`正在搜索素材：${query}`);
     // 把搜索词回写到视频 clip 的 visualQuery（下次选中仍是新词）
-    if (selectedClipTrack?.kind === "video" && selectedClip.visualQuery !== query) {
+    if (selectedClipTrack && isVisualTrackKind(selectedClipTrack.kind) && selectedClip.visualQuery !== query) {
       updateSelectedClip({ visualQuery: query });
     }
     try {
@@ -1444,126 +1724,54 @@ export function App() {
   /** 工具栏分割：在 playhead 处把当前选中的 clip 一分为二。 */
   function splitAtPlayhead() {
     if (!project) return;
-    // 找到播放头位置下最上层的视频/图片 clip（剪映式：基于播放头而非选中）
-    const visualTrackIds = new Set(
-      project.tracks
-        .filter((t) => t.kind === "video" || t.kind === "image")
-        .sort((a, b) => a.order - b.order)
-        .map((t) => t.id),
-    );
-    const targetClip = project.clips.find(
-      (c) =>
-        visualTrackIds.has(c.trackId) &&
-        playhead >= c.startOnTrack - 0.01 &&
-        playhead < c.startOnTrack + c.duration - 0.01,
-    ) || selectedClip; // 回退到选中 clip
-    if (!targetClip) {
+    const currentTime = usePlaybackStore.getState().currentTime;
+    const result = splitVisualClipAtPlayhead(project, currentTime, selectedClip);
+    if (!result) {
       setStatus("播放头位置没有可分割的片段");
       return;
     }
-    const result = splitClipAt(targetClip, playhead);
-    if (!result) {
-      setStatus("播放头不在片段范围内，无法分割");
-      return;
-    }
-    const [first, second] = result;
-    const next: Project = {
-      ...project,
-      clips: project.clips.flatMap((c) => (c.id === targetClip.id ? [first, second] : [c])),
-    };
-    void persist(next, `已分割（${first.duration.toFixed(1)}s + ${second.duration.toFixed(1)}s）`);
-    setSelectedClipId(first.id);
+    applyClipOperation(result);
   }
 
   /** 涟漪删除：删除 clip 后同轨道后续 clip 前移闭合间隙 */
-  function deleteSelectedClip() {
+  function deleteSelectedClip(ripple = true) {
     if (!project || !selectedClip) return;
-    const deleted = selectedClip;
-    const gap = deleted.duration;
-    const gapEnd = deleted.startOnTrack + deleted.duration;
-    // 同轨道、在删除 clip 之后的 clip 前移
-    const newClips = project.clips
-      .filter((c) => c.id !== deleted.id)
-      .map((c) => {
-        if (c.trackId === deleted.trackId && c.startOnTrack >= gapEnd - 0.01) {
-          return { ...c, startOnTrack: c.startOnTrack - gap };
-        }
-        return c;
-      });
-    const next = { ...project, clips: newClips };
-    void persist(next, "已删除片段");
-    setSelectedClipId(next.clips.find((c) => c.trackId === deleted.trackId)?.id || null);
-    setSelectedClipIds([]);
+    applyClipOperation(buildDeleteClipChange(project, selectedClip, ripple));
   }
 
   /** T4.6: 批量删除多个选中 clip */
-  function deleteSelectedClips() {
-    if (!project || selectedClipIds.length === 0) return;
-    const idsToDelete = new Set(selectedClipIds);
-    // 按 track 分组，每轨各自做涟漪前移
-    const newClips: Clip[] = [];
-    const trackDeleted: Record<string, { start: number; gap: number }[]> = {};
-    for (const c of project.clips) {
-      if (idsToDelete.has(c.id)) {
-        trackDeleted[c.trackId] = trackDeleted[c.trackId] || [];
-        trackDeleted[c.trackId].push({ start: c.startOnTrack, gap: c.duration });
-      }
+  function deleteSelectedClips(ripple = true) {
+    if (project && selectedClipIds.length > 0) {
+      applyClipOperation(buildDeleteClipsChange(project, selectedClipIds, ripple));
     }
-    for (const c of project.clips) {
-      if (idsToDelete.has(c.id)) continue;
-      let offset = 0;
-      const dels = trackDeleted[c.trackId] || [];
-      for (const d of dels) {
-        if (c.startOnTrack >= d.start - 0.01) offset += d.gap;
-      }
-      newClips.push(offset > 0 ? { ...c, startOnTrack: c.startOnTrack - offset } : c);
-    }
-    const next = { ...project, clips: newClips };
-    void persist(next, `已删除 ${idsToDelete.size} 个片段`);
-    setSelectedClipId(null);
-    setSelectedClipIds([]);
   }
 
   /** T4.6: 选中 clip（additive=true 时 Ctrl/Cmd+点击多选） */
-  function selectClip(id: string, additive: boolean) {
-    if (additive) {
-      setSelectedClipIds((prev) =>
-        prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
-      );
-      // 多选时 selectedClipId 取第一个或保持
-      setSelectedClipId((prev) => prev ?? id);
-    } else {
-      setSelectedClipIds([id]);
-      setSelectedClipId(id);
-    }
+  function selectClip(id: string, additive: boolean, range: boolean = false) {
+    setSelectedClipIds((prev) => selectClipIds(project, prev, id, additive, range));
+  }
+
+  function selectClipsByBox(ids: string[], additive: boolean) {
+    setSelectedClipIds((prev) => selectClipIdsByBox(prev, ids, additive));
+  }
+
+  /** 复制选中 clip 到剪贴板（Ctrl+C 的工具栏入口） */
+  function copySelectedClip() {
+    if (!selectedClip) return;
+    clipboardRef.current = structuredClone(selectedClip);
+    setStatus("已复制片段");
   }
 
   /** 复制选中 clip（原地复制，偏移 0.5s 避免重叠） */
   function duplicateSelectedClip() {
     if (!project || !selectedClip) return;
-    const dup: Clip = {
-      ...JSON.parse(JSON.stringify(selectedClip)),
-      id: newClipId(),
-      startOnTrack: selectedClip.startOnTrack + selectedClip.duration,
-    };
-    void persist({ ...project, clips: [...project.clips, dup] }, "已复制片段");
-    setSelectedClipId(dup.id);
+    applyClipOperation(buildDuplicateClipChange(project, selectedClip, newClipId));
   }
 
   /** 粘贴剪贴板里的 clip 到选中轨道末尾 */
   function pasteClip() {
     if (!project || !clipboardRef.current) return;
-    const src = clipboardRef.current;
-    // 粘贴到同轨道末尾
-    const trackClips = project.clips.filter((c) => c.trackId === src.trackId);
-    const endTime = trackClips.reduce((max, c) => Math.max(max, c.startOnTrack + c.duration), 0);
-    const pasted: Clip = {
-      ...JSON.parse(JSON.stringify(src)),
-      id: newClipId(),
-      startOnTrack: endTime,
-    };
-    void persist({ ...project, clips: [...project.clips, pasted] }, "已粘贴片段");
-    setSelectedClipId(pasted.id);
+    applyClipOperation(pasteClipAtTrackEnd(project, clipboardRef.current, newClipId));
   }
 
   /** 项目下拉菜单切换项目 */
@@ -1574,39 +1782,29 @@ export function App() {
     setStatus(`已切换到项目：${next.title}`);
   }
 
-  /** 转场 Tab：把转场效果应用到当前选中 clip 的入场转场 */
-  function handleApplyTransition(transitionId: string) {
+  /** 转场 Tab：把转场效果应用到当前选中 clip 的入场/出场转场 */
+ function handleApplyTransition(transitionId: string) {
     if (!project || !selectedClip) return;
-    const patch =
-      transitionId === "none"
-        ? { transitionIn: null }
-        : { transitionIn: transitionId };
+    const duration = transitionDuration(selectedClip.transitionIn, project.renderConfig.transitionDuration ?? 0.5);
+    const patch = { transitionIn: makeTransition(transitionId, duration) };
     updateSelectedClip(patch);
-    void persist(
-      { ...project, clips: project.clips.map((c) => (c.id === selectedClip.id ? { ...c, ...patch } : c)) },
-      transitionId === "none" ? "已移除转场" : `已应用转场：${transitionId}`,
-    );
+  }
+  function handleApplyTransitionOut(transitionId: string) {
+    if (!project || !selectedClip) return;
+    const duration = transitionDuration(selectedClip.transitionOut, project.renderConfig.transitionDuration ?? 0.5);
+    updateSelectedClip({ transitionOut: makeTransition(transitionId, duration) });
   }
 
   /** 添加新轨道（视频/配音/音频/字幕） */
   async function handleAddTrack(kind: TrackKind) {
     setShowAddTrackMenu(false);
     if (!project) return;
-    const nameMap: Record<TrackKind, string> = {
-      video: "视频",
-      image: "图片",
-      voiceover: "配音",
-      audio: "音频",
-      subtitle: "字幕",
-    };
-    // 统计同 kind 已有轨道数，命名加序号
-    const sameKindCount = project.tracks.filter((t) => t.kind === kind).length;
-    const name = sameKindCount > 0 ? `${nameMap[kind]} ${sameKindCount + 1}` : nameMap[kind];
+    const name = nextTrackName(project, kind);
     try {
       const next = await desktopApi.addTrack(project.id, kind, name);
       setProject(next);
       await refreshProjects(next.id);
-      setStatus(`已添加${nameMap[kind]}轨`);
+      setStatus(`已添加${TRACK_KIND_LABELS[kind]}轨`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     }
@@ -1621,9 +1819,27 @@ export function App() {
     if (!commit && !interactiveEditSnapshotRef.current) {
       interactiveEditSnapshotRef.current = structuredClone(project);
     }
+    const snapshot = interactiveEditSnapshotRef.current;
+    const draggedOriginal = snapshot?.clips.find((c) => c.id === clipId);
+    const isGroupMove =
+      selectedClipIds.length > 1 &&
+      selectedClipIds.includes(clipId) &&
+      draggedOriginal &&
+      typeof patch.startOnTrack === "number" &&
+      (patch.duration === undefined || Math.abs(patch.duration - draggedOriginal.duration) < 0.001) &&
+      (patch.sourceIn === undefined || Math.abs(patch.sourceIn - draggedOriginal.sourceIn) < 0.001) &&
+      (patch.sourceOut === undefined || Math.abs(patch.sourceOut - draggedOriginal.sourceOut) < 0.001);
+    const selectedSet = new Set(selectedClipIds);
+    const delta = isGroupMove ? (patch.startOnTrack! - draggedOriginal!.startOnTrack) : 0;
+    const baseProject = isGroupMove && snapshot ? snapshot : project;
     const next: Project = {
-      ...project,
-      clips: project.clips.map((c) => (c.id === clipId ? { ...c, ...patch } : c)),
+      ...baseProject,
+      clips: baseProject.clips.map((c) => {
+        if (isGroupMove && selectedSet.has(c.id)) {
+          return { ...c, startOnTrack: Math.max(0, c.startOnTrack + delta) };
+        }
+        return c.id === clipId ? { ...c, ...patch } : c;
+      }),
     };
     setProject(next);
     if (commit) {
@@ -1732,31 +1948,27 @@ export function App() {
   async function handleAddToTimeline(asset: MediaSource) {
     const current = projectRef.current;
     if (!current) return;
-    const videoTrackIds = current.tracks.filter((t) => t.kind === "video").map((t) => t.id);
-    const firstVideoTrack = current.tracks.find((t) => t.kind === "video");
-    if (!firstVideoTrack) {
-      setStatus("没有视频轨，无法添加");
-      return;
-    }
     // 把素材加入素材库（去重）
     const media = current.media.some((m) => m.id === asset.id)
       ? current.media
       : [...current.media, asset];
+    const currentWithMedia = { ...current, media };
 
-    // 判断当前选中的是否在任意视频轨上
-    const selectedIsVideoClip =
-      !!selectedClip && videoTrackIds.includes(selectedClip.trackId);
+    const selectedTrack = selectedClip
+      ? current.tracks.find((track) => track.id === selectedClip.trackId)
+      : null;
+    const selectedIsCompatible = !!selectedClip && !!selectedTrack && assetFitsTrack(asset, selectedTrack);
 
-    if (selectedIsVideoClip && selectedClip) {
+    if (selectedIsCompatible && selectedClip) {
       // 替换：把选中 clip 的 sourceId 换成该素材，重置裁剪范围
       // 图片无时长（duration=0），替换时保持原 clip duration；视频取 min(素材时长, clip时长)
       const end = asset.kind === "image"
         ? selectedClip.duration
         : Math.min(asset.duration, selectedClip.duration);
       const next: Project = {
-        ...current,
+        ...currentWithMedia,
         media,
-        clips: current.clips.map((clip) =>
+        clips: currentWithMedia.clips.map((clip) =>
           clip.id === selectedClip.id
             ? { ...clip, sourceId: asset.id, sourceIn: 0, sourceOut: end }
             : clip,
@@ -1770,14 +1982,15 @@ export function App() {
       return;
     }
 
-    // 追加：第一个视频轨末尾生成新 clip
-    const videoClips = current.clips.filter((c) => c.trackId === firstVideoTrack.id);
-    const endTime = videoClips.reduce((max, c) => Math.max(max, c.startOnTrack + c.duration), 0);
+    // 追加：按素材类型选择/创建匹配轨道
+    const { project: projectWithTrack, track: targetTrack } = ensureTrackForAsset(currentWithMedia, asset);
+    const trackClips = projectWithTrack.clips.filter((c) => c.trackId === targetTrack.id);
+    const endTime = trackClips.reduce((max, c) => Math.max(max, c.startOnTrack + c.duration), 0);
     // 视频/音频用真实时长，图片无时长默认 5 秒
     const clipDuration = asset.kind === "image" ? 5 : (asset.duration || 5);
     const newClip: Clip = {
       id: newClipId(),
-      trackId: firstVideoTrack.id,
+      trackId: targetTrack.id,
       sourceId: asset.id,
       startOnTrack: endTime,
       duration: clipDuration,
@@ -1790,11 +2003,11 @@ export function App() {
       brightness: 0,
       contrast: 0,
       saturation: 0,
+      transform: { ...DEFAULT_TRANSFORM },
       transitionIn: null,
       transitionOut: null,
     };
-    const projectWithMedia = { ...current, media };
-    const next: Project = insertClipToTrack(projectWithMedia, firstVideoTrack.id, newClip, endTime);
+    const next: Project = insertClipToTrack(projectWithTrack, targetTrack.id, newClip, endTime);
     void persist(next, `已添加到时间线：${asset.title}`);
     setSelectedClipId(newClip.id);
     if (asset.source === "pexels" && !asset.localPath) {
@@ -1813,6 +2026,10 @@ export function App() {
     if (!asset) return;
     const track = current.tracks.find((t) => t.id === trackId);
     if (!track) return;
+    if (!assetFitsTrack(asset, track)) {
+      setStatus(`${asset.kind === "audio" ? "音频" : asset.kind === "image" ? "图片" : "视频"}素材不能添加到${TRACK_KIND_LABELS[track.kind]}轨`);
+      return;
+    }
 
     // 磁吸对齐：收集所有轨道所有 clip 的起止边界，光标接近就吸附
     const SNAP_THRESHOLD = 0.4; // 0.4 秒内吸附
@@ -1850,7 +2067,7 @@ export function App() {
       brightness: 0,
       contrast: 0,
       saturation: 0,
-      transform: track.kind === "video" ? { ...DEFAULT_TRANSFORM } : null,
+      transform: track.kind === "video" || track.kind === "image" ? { ...DEFAULT_TRANSFORM } : null,
       transitionIn: null,
       transitionOut: null,
     };
@@ -1868,12 +2085,127 @@ export function App() {
   }
 
   const timelineWidth = Math.max(840, totalDuration * pxPerSecond);
-  const fullPreviewSrc = desktopApi.fileSrc(project?.previewPath || project?.finalPath || null);
+  const clipsByTrackId = useMemo(() => {
+    const map = new Map<string, Clip[]>();
+    if (!project) return map;
+    for (const track of project.tracks) {
+      map.set(track.id, []);
+    }
+    for (const clip of project.clips) {
+      const clips = map.get(clip.trackId);
+      if (clips) clips.push(clip);
+    }
+    return map;
+  }, [project?.clips, project?.tracks]);
+  const handleTimelineSelectClip = useCallback((id: string, additive: boolean, range?: boolean) => {
+    selectClip(id, additive, range);
+    const c = project?.clips.find((clip) => clip.id === id);
+    if (c && !additive && !range) seek(c.startOnTrack);
+  }, [project, selectedClipId, seek]);
+  const handleTimelineContextMenu = useCallback((clip: Clip, trackKind: string, x: number, y: number) => {
+    setSelectedClipId(clip.id);
+    setContextMenu({ x, y, clip, trackKind: trackKind as TrackKind });
+  }, []);
+  const handleTimelineToggleMute = useCallback((trackId: string) => {
+    if (!project) return;
+    void persist(toggleTrackMuted(project, trackId), "已切换静音");
+  }, [project]);
+  const handleTimelineToggleLock = useCallback((trackId: string) => {
+    if (!project) return;
+    void persist(toggleTrackLocked(project, trackId), "已切换锁定");
+  }, [project]);
+  const handleTimelineToggleHidden = useCallback((trackId: string) => {
+    if (!project) return;
+    void persist(toggleTrackHidden(project, trackId), "已切换显示");
+  }, [project]);
+
+  // 章节标记：在播放头处添加/删除
+  const handleAddChapter = useCallback(() => {
+    if (!project) return;
+    const t = usePlaybackStore.getState().currentTime;
+    const chapters = project.chapters ?? [];
+    // 已存在则不重复添加
+    if (chapters.some((c) => Math.abs(c.time - t) < 0.5)) {
+      setStatus("该位置已有章节标记");
+      return;
+    }
+    const newChapter: Chapter = {
+      id: `chap_${Date.now().toString(36)}`,
+      time: t,
+      title: `章节 ${chapters.length + 1}`,
+    };
+    const next = [...chapters, newChapter].sort((a, b) => a.time - b.time);
+    void persist({ ...project, chapters: next }, "已添加章节");
+  }, [project]);
+
+  const handleDeleteChapter = useCallback((chapterId: string) => {
+    if (!project) return;
+    const next = (project.chapters ?? []).filter((c) => c.id !== chapterId);
+    void persist({ ...project, chapters: next }, "已删除章节");
+  }, [project]);
+  const handleTimelineMoveUp = useCallback((trackId: string) => {
+    if (!project) return;
+    const next = moveTrack(project, trackId, "up");
+    if (next) void persist(next, "已上移图层");
+  }, [project]);
+  const handleTimelineMoveDown = useCallback((trackId: string) => {
+    if (!project) return;
+    const next = moveTrack(project, trackId, "down");
+    if (next) void persist(next, "已下移图层");
+  }, [project]);
+  const handleTimelineDeleteTrack = useCallback((trackId: string) => {
+    if (!project) return;
+    const next = deleteTrack(project, trackId);
+    if (next) void persist(next, "已删除轨道");
+  }, [project]);
+
+  // 字幕轨头部"统一调整样式"：取该轨第一条字幕样式作为草稿初始值
+  const handleEditSubtitleStyle = useCallback((trackId: string) => {
+    if (!project) return;
+    const track = project.tracks.find((t) => t.id === trackId);
+    if (!track || track.kind !== "subtitle") return;
+    const firstSub = project.clips.find((c) => c.trackId === trackId);
+    const initial: SubtitleStyle = firstSub?.subtitleStyle
+      ? { ...DEFAULT_SUBTITLE_STYLE, ...firstSub.subtitleStyle }
+      : { ...DEFAULT_SUBTITLE_STYLE };
+    setSubtitleTrackStyleEditing({ trackId, draft: initial });
+  }, [project]);
+
+  // 提交：把 draft 一次性应用到该轨所有字幕（draft 覆盖原有字段，实现"统一"语义）
+  const applySubtitleTrackStyle = useCallback(() => {
+    if (!project || !subtitleTrackStyleEditing) return;
+    const { trackId, draft } = subtitleTrackStyleEditing;
+    const targetIds = new Set(
+      project.clips.filter((c) => c.trackId === trackId).map((c) => c.id),
+    );
+    if (targetIds.size === 0) {
+      setSubtitleTrackStyleEditing(null);
+      return;
+    }
+    const next = project.clips.map((c) =>
+      targetIds.has(c.id)
+        ? { ...c, subtitleStyle: { ...(c.subtitleStyle ?? {}), ...draft } }
+        : c,
+    );
+    void persist({ ...project, clips: next }, `已统一应用字幕样式到本轨 ${targetIds.size} 条`);
+    setSubtitleTrackStyleEditing(null);
+  }, [project, subtitleTrackStyleEditing]);
+
+  // 调整 draft 字段（不实时应用到字幕，提交时才生效）
+  const updateSubtitleTrackDraft = useCallback((patch: Partial<SubtitleStyle>) => {
+    setSubtitleTrackStyleEditing((cur) => cur ? { ...cur, draft: { ...cur.draft, ...patch } } : cur);
+  }, []);
+
+  const handleKeyframeClick = useCallback((clipId: string, _prop: keyof ClipKeyframes, time: number) => {
+    const clip = project?.clips.find((c) => c.id === clipId);
+    if (!clip) return;
+    selectClip(clipId, false, false);
+    seek(Math.max(0, clip.startOnTrack + time));
+  }, [project, seek]);
   const selectedSource = selectedClip?.sourceId
     ? project?.media.find((m) => m.id === selectedClip.sourceId)
     : null;
   const selectedMediaSrc = desktopApi.mediaSrc(selectedSource?.localPath || null);
-  const playheadPercent = totalDuration > 0 ? Math.min(100, (playhead / totalDuration) * 100) : 0;
   // 素材库悬停预览的 src（图片直接显示，视频显示缩略/首帧）
   const previewingSrc = previewingAsset
     ? desktopApi.mediaSrc(previewingAsset.thumbnailUrl || previewingAsset.localPath || null)
@@ -2057,6 +2389,7 @@ export function App() {
                 onAiSegment={handleSegmentScript}
                 onRecognizeSubtitles={handleRecognizeSubtitles}
                 onAddManualSubtitle={handleAddManualSubtitle}
+                onImportSrt={handleImportSrt}
                 subtitleStyle={subtitleStyleDraft}
                 onSubtitleStyleChange={setSubtitleStyleDraft}
               />
@@ -2097,16 +2430,26 @@ export function App() {
             {activeTab === "transition" && (
               <TransitionPanel
                 selectedClipId={selectedClipId}
-                currentTransition={selectedClip?.transitionIn ?? null}
-                currentDuration={project?.renderConfig?.transitionDuration ?? 0.5}
-                onApply={handleApplyTransition}
-                onDurationChange={(d) => {
-                  if (project) {
-                    const next = { ...project, renderConfig: { ...project.renderConfig, transitionDuration: d } };
-                    setProject(next);
-                    void desktopApi.saveProject(next);
-                  }
+                currentTransitionIn={transitionName(selectedClip?.transitionIn)}
+                currentTransitionOut={transitionName(selectedClip?.transitionOut)}
+                currentDurationIn={transitionDuration(selectedClip?.transitionIn, project?.renderConfig?.transitionDuration ?? 0.5)}
+                currentDurationOut={transitionDuration(selectedClip?.transitionOut, project?.renderConfig?.transitionDuration ?? 0.5)}
+                onApplyIn={handleApplyTransition}
+                onApplyOut={handleApplyTransitionOut}
+                onDurationChangeIn={(d) => {
+                  if (!selectedClip) return;
+                  const name = transitionName(selectedClip.transitionIn);
+                  if (!name || name === "none") return;
+                  updateSelectedClip({ transitionIn: makeTransition(name, d) }, false);
                 }}
+                onDurationCommitIn={() => commitInteractiveEdit("已更新转场时长")}
+                onDurationChangeOut={(d) => {
+                  if (!selectedClip) return;
+                  const name = transitionName(selectedClip.transitionOut);
+                  if (!name || name === "none") return;
+                  updateSelectedClip({ transitionOut: makeTransition(name, d) }, false);
+                }}
+                onDurationCommitOut={() => commitInteractiveEdit("已更新转场时长")}
               />
             )}
           </div>
@@ -2139,6 +2482,13 @@ export function App() {
               <button className="zoom-btn" title="放大" onClick={() => setPreviewZoom((z) => Math.min(200, z + 25))}>
                 <ZoomIn size={14} />
               </button>
+              <button
+                className={`zoom-btn ${showPreviewDebug ? "active" : ""}`}
+                title="预览诊断"
+                onClick={() => setShowPreviewDebug((current) => !current)}
+              >
+                <SlidersHorizontal size={14} />
+              </button>
             </div>
           </div>
 
@@ -2166,24 +2516,22 @@ export function App() {
                 )}
               </div>
             )}
-            {/* 双缓冲 video：A 显示时 B 预加载下一个 clip，切换时交换无黑屏 */}
-            <video
-              ref={stageVideoRef}
-              className="stage-video stage-video-a"
-              playsInline
-              preload="auto"
-            />
-            <video
-              ref={stageVideoBRef}
-              className="stage-video stage-video-b"
-              playsInline
-              preload="auto"
-            />
+            {/* 主轨媒体元素由 PreviewEngine 的 MediaElementPool 动态管理 */}
             {/* WebGL 滤镜 canvas：覆盖在 video 上，GPU shader 实时处理滤镜 */}
             <canvas ref={filterCanvasRef} className="stage-filter-canvas" />
             {/* 画中画叠加层：上层视频轨 clip 按 transform 叠加显示 */}
             {/* T4.1: 画中画叠加层容器 —— PreviewEngine 在里面动态管理 overlay <video> */}
             <div ref={overlayContainerRef} className="stage-overlay-container" />
+            {showPreviewDebug && (
+              <div className="preview-debug-panel">
+                {Object.entries(previewDebugInfo).map(([key, value]) => (
+                  <div key={key}>
+                    <span>{key}</span>
+                    <code>{value}</code>
+                  </div>
+                ))}
+              </div>
+            )}
             {!activeVideoClip && !selectedMediaSrc && (
               <div className="stage-content">
                 <ImagePlay size={46} />
@@ -2226,96 +2574,52 @@ export function App() {
                       resize: "none",
                       outline: "none",
                     }}
-                    onChange={(e) => updateSelectedClip({ text: e.target.value })}
-                    onBlur={() => setSubtitleEditing(false)}
+                    onChange={(e) => updateSelectedClip({ text: e.target.value }, false)}
+                    onBlur={() => {
+                      commitInteractiveEdit();
+                      setSubtitleEditing(false);
+                    }}
                     onKeyDown={(e) => {
                       if (e.key === "Escape" || (e.key === "Enter" && e.metaKey)) {
                         e.preventDefault();
+                        commitInteractiveEdit();
                         setSubtitleEditing(false);
                       }
                     }}
                   />
                 );
               }
-              // 选中字幕：用 SubtitleOverlay（可拖动/缩放/旋转/双击编辑）
+              // 选中字幕：StageSubtitleLayer（按时间轴显示）+ SubtitleOverlay（编辑手柄）
+              // 选中字幕若与当前播放字幕相同，StageSubtitleLayer 跳过避免重复
               if (isSelectedSubtitle && selectedClip) {
                 return (
-                  <SubtitleOverlay
-                    clip={selectedClip}
-                    targetRef={stageRef}
-                    isSelected
-                    currentTime={playhead}
-                    onMove={(x, y) => {
-                      const cur = selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE };
-                      updateSelectedClip({ subtitleStyle: { ...cur, position: "custom", x, y } });
-                    }}
-                    onScale={(sx, sy) => {
-                      const cur = selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE };
-                      updateSelectedClip({ subtitleStyle: { ...cur, scaleX: sx, scaleY: sy } });
-                    }}
-                    onRotate={(rotation) => {
-                      const cur = selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE };
-                      updateSelectedClip({ subtitleStyle: { ...cur, rotation } });
-                    }}
-                    onEditStart={() => setSubtitleEditing(true)}
-                  />
+                  <>
+                    <StageSubtitleLayer excludeClipId={selectedClip.id} />
+                    <SubtitleOverlay
+                      clip={selectedClip}
+                      targetRef={stageRef}
+                      isSelected
+                      onMove={(x, y) => {
+                        const cur = selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE };
+                        updateSelectedClip({ subtitleStyle: { ...cur, position: "custom", x, y } }, false);
+                      }}
+                      onMoveEnd={() => commitInteractiveEdit()}
+                      onScale={(sx, sy) => {
+                        const cur = selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE };
+                        updateSelectedClip({ subtitleStyle: { ...cur, scaleX: sx, scaleY: sy } }, false);
+                      }}
+                      onScaleEnd={() => commitInteractiveEdit()}
+                      onRotate={(rotation) => {
+                        const cur = selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE };
+                        updateSelectedClip({ subtitleStyle: { ...cur, rotation } }, false);
+                      }}
+                      onRotateEnd={() => commitInteractiveEdit()}
+                      onEditStart={() => setSubtitleEditing(true)}
+                    />
+                  </>
                 );
               }
-              // 编辑态
-              // 未选中：引擎实时字幕（纯渲染，无控制点）
-              const subText = activeSubtitle;
-              const subStyle = activeSubtitleStyle;
-              const subClip = activeSubtitleClip;
-              if (!subText || !subText.trim()) return null;
-              const s = subStyle;
-              const isCustom = s?.position === "custom";
-              const posX = isCustom ? (s?.x ?? 50) : 50;
-              const posY = isCustom ? (s?.y ?? 80) : (s?.position === "top" ? 12 : s?.position === "center" ? 50 : 88);
-              // 逐字高亮：subClip 有 words 且 style.karaoke
-              const baseColor = s?.color ?? "#FFFFFF";
-              const highlightColor = s?.highlightColor ?? "#FFD700";
-              const karaokeOn = (s?.karaoke ?? true) && (subClip?.words?.length ?? 0) > 0;
-              return (
-                <div
-                  className={`subtitle-overlay-text ${s?.animationIn && s.animationIn !== "none" ? `anim-${s.animationIn}` : ""}`}
-                  style={{
-                    position: "absolute",
-                    left: `${posX}%`,
-                    top: `${posY}%`,
-                    transform: `translate(-50%, -50%) rotate(${s?.rotation ?? 0}deg) scale(${(s?.scaleX ?? 100) / 100})`,
-                    transformOrigin: "center",
-                    fontFamily: s?.fontFamily,
-                    fontSize: `${Math.max(12, (s?.fontSize ?? 48) * 0.35)}px`,
-                    fontWeight: 700,
-                    lineHeight: 1.4,
-                    color: baseColor,
-                    textShadow: `1px 1px 0 ${s?.strokeColor ?? "#000"}, -1px -1px 0 ${s?.strokeColor ?? "#000"}, 1px -1px 0 ${s?.strokeColor ?? "#000"}, -1px 1px 0 ${s?.strokeColor ?? "#000"}`,
-                    padding: "4px 10px",
-                    textAlign: "center",
-                    whiteSpace: "pre-wrap",
-                    maxWidth: "calc(100% - 24px)",
-                    zIndex: 7,
-                    pointerEvents: "none",
-                  }}
-                >
-                  {karaokeOn && subClip?.words
-                    ? subClip.words.map((w, i, arr) => {
-                        const prev = arr[i - 1];
-                        const needSpace =
-                          i > 0 &&
-                          prev &&
-                          /[A-Za-z0-9]$/.test(prev.text) &&
-                          /^[A-Za-z0-9]/.test(w.text);
-                        return (
-                          <span key={i} style={{ color: playhead >= w.start ? highlightColor : baseColor }}>
-                            {needSpace ? " " : ""}
-                            {w.text}
-                          </span>
-                        );
-                      })
-                    : subText}
-                </div>
-              );
+              return <StageSubtitleLayer />;
             })()}
           </div>
           </div>
@@ -2329,28 +2633,50 @@ export function App() {
               title="上一个片段"
               onClick={() => {
                 if (!project) return;
+                const currentTime = usePlaybackStore.getState().currentTime;
                 const videoClips = project.clips
-                  .filter((c) => project.tracks.some((t) => t.id === c.trackId && t.kind === "video"))
+                  .filter((c) => project.tracks.some((t) => t.id === c.trackId && isVisualTrackKind(t.kind)))
                   .sort((a, b) => a.startOnTrack - b.startOnTrack);
-                const prev = videoClips.filter((c) => c.startOnTrack + c.duration <= playhead - 0.05)
+                const prev = videoClips.filter((c) => c.startOnTrack + c.duration <= currentTime - 0.05)
                   .pop();
                 seek(prev ? prev.startOnTrack : 0);
               }}
             >
               <ChevronLeft size={16} />
             </button>
-            <button className="round-button" title={isPlaying ? "暂停" : "播放"} onClick={togglePlay}>
-              {isPlaying ? <Pause size={18} /> : <Play size={18} />}
+            <button
+              className="round-button xs"
+              title="上一帧 (←)"
+              onClick={() => {
+                const fps = project?.renderConfig?.fps ?? 30;
+                const t = usePlaybackStore.getState().currentTime;
+                seek(Math.max(0, t - 1 / fps));
+              }}
+            >
+              <ChevronLeft size={12} />
+            </button>
+            <PlayPauseButton onToggle={togglePlay} />
+            <button
+              className="round-button xs"
+              title="下一帧 (→)"
+              onClick={() => {
+                const fps = project?.renderConfig?.fps ?? 30;
+                const t = usePlaybackStore.getState().currentTime;
+                seek(t + 1 / fps);
+              }}
+            >
+              <ChevronRight size={12} />
             </button>
             <button
               className="round-button sm"
               title="下一个片段"
               onClick={() => {
                 if (!project) return;
+                const currentTime = usePlaybackStore.getState().currentTime;
                 const videoClips = project.clips
-                  .filter((c) => project.tracks.some((t) => t.id === c.trackId && t.kind === "video"))
+                  .filter((c) => project.tracks.some((t) => t.id === c.trackId && isVisualTrackKind(t.kind)))
                   .sort((a, b) => a.startOnTrack - b.startOnTrack);
-                const next = videoClips.find((c) => c.startOnTrack > playhead + 0.05);
+                const next = videoClips.find((c) => c.startOnTrack > currentTime + 0.05);
                 seek(next ? next.startOnTrack : totalDuration);
               }}
             >
@@ -2359,16 +2685,8 @@ export function App() {
             <button className="round-button sm" title="跳到结尾 (End)" onClick={() => seek(totalDuration)}>
               <SkipForward size={14} />
             </button>
-            <input
-              type="range"
-              min={0}
-              max={100}
-              value={playheadPercent}
-              onChange={(event) => seek((Number(event.target.value) / 100) * totalDuration)}
-            />
-            <span className="timecode">
-              {formatTC(playhead, project?.renderConfig?.fps ?? 30)} / {formatTC(totalDuration, project?.renderConfig?.fps ?? 30)}
-            </span>
+            <PreviewProgress totalDuration={totalDuration} onSeek={seek} />
+            <TimecodeDisplay totalDuration={totalDuration} fps={project?.renderConfig?.fps ?? 30} />
           </div>
         </section>
         </Panel>
@@ -2383,6 +2701,82 @@ export function App() {
           </div>
           {selectedClip && selectedClipTrack ? (
             <div className="inspector">
+              {/* 批量字幕编辑：选中多个字幕 clip 时显示 */}
+              {selectedClipIds.length > 1 &&
+                selectedClipTrack.kind === "subtitle" && (
+                  <div className="batch-edit-section">
+                    <div className="batch-edit-title">
+                      批量编辑（{selectedClipIds.length} 条字幕）
+                    </div>
+                    <button
+                      className="panel-secondary-action"
+                      onClick={() => {
+                        if (!project) return;
+                        const targetIds = new Set(selectedClipIds);
+                        const next = project.clips.map((c) =>
+                          targetIds.has(c.id)
+                            ? { ...c, subtitleStyle: { ...subtitleStyleDraft, ...(c.subtitleStyle ?? {}) } }
+                            : c,
+                        );
+                        void persist({ ...project, clips: next }, `已批量应用字幕样式到 ${selectedClipIds.length} 条`);
+                      }}
+                    >
+                      应用字幕样式到选中
+                    </button>
+                    <button
+                      className="panel-secondary-action"
+                      onClick={() => {
+                        if (!project) return;
+                        const targetIds = new Set(selectedClipIds);
+                        const delta = 0.5;
+                        const next = project.clips.map((c) =>
+                          targetIds.has(c.id)
+                            ? { ...c, startOnTrack: Math.max(0, c.startOnTrack + delta) }
+                            : c,
+                        );
+                        void persist({ ...project, clips: next }, `已批量后移 ${delta}s`);
+                      }}
+                    >
+                      整体后移 0.5s
+                    </button>
+                    <button
+                      className="panel-secondary-action"
+                      onClick={() => {
+                        if (!project) return;
+                        const targetIds = new Set(selectedClipIds);
+                        const delta = 0.5;
+                        const next = project.clips.map((c) =>
+                          targetIds.has(c.id)
+                            ? { ...c, startOnTrack: Math.max(0, c.startOnTrack - delta) }
+                            : c,
+                        );
+                        void persist({ ...project, clips: next }, `已批量前移 ${delta}s`);
+                      }}
+                    >
+                      整体前移 0.5s
+                    </button>
+                    <button
+                      className="panel-secondary-action"
+                      onClick={() => {
+                        if (!project) return;
+                        const targetIds = new Set(selectedClipIds);
+                        const delta = 0.2;
+                        const next = project.clips.map((c) =>
+                          targetIds.has(c.id) && c.duration > 0.5
+                            ? {
+                                ...c,
+                                duration: c.duration + delta,
+                                sourceOut: c.sourceOut + delta,
+                              }
+                            : c,
+                        );
+                        void persist({ ...project, clips: next }, `已批量延长 ${delta}s`);
+                      }}
+                    >
+                      整体延长 0.2s
+                    </button>
+                  </div>
+                )}
               <div className="track-badge" data-kind={selectedClipTrack.kind}>
                 {selectedClipTrack.name}轨
               </div>
@@ -2392,7 +2786,8 @@ export function App() {
                   {selectedClipTrack.kind === "voiceover" ? "配音文案" : "字幕文案"}
                   <textarea
                     value={selectedClip.text || ""}
-                    onChange={(event) => updateSelectedClip({ text: event.target.value })}
+                    onChange={(event) => updateSelectedClip({ text: event.target.value }, false)}
+                    onBlur={() => commitInteractiveEdit()}
                   />
                 </label>
               )}
@@ -2452,9 +2847,9 @@ export function App() {
                     位置
                     <select
                       value={selectedClip.subtitleStyle?.position || "bottom"}
-                      onChange={(event) => updateSelectedClip({
-                        subtitleStyle: { ...selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE }, position: event.target.value },
-                      })}
+                     onChange={(event) => updateSelectedClip({
+                        subtitleStyle: { ...selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE }, position: event.target.value as "bottom" | "center" | "top" | "custom" },
+                     })}
                     >
                       <option value="bottom">底部</option>
                       <option value="center">居中</option>
@@ -2515,6 +2910,20 @@ export function App() {
                       <option value="scaleOut">缩放</option>
                     </select>
                   </label>
+                  <label className="style-field">
+                    动画时长（{(selectedClip.subtitleStyle?.animationDuration ?? 0.3).toFixed(1)}s）
+                    <input
+                      type="range"
+                      min={0.1}
+                      max={2.0}
+                      step={0.1}
+                      value={selectedClip.subtitleStyle?.animationDuration ?? 0.3}
+                      onChange={(event) => updateSelectedClip({
+                        subtitleStyle: { ...selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE }, animationDuration: Number(event.target.value) },
+                      }, false)}
+                      onPointerUp={() => commitInteractiveEdit()}
+                    />
+                  </label>
                 </div>
               )}
 
@@ -2547,7 +2956,11 @@ export function App() {
                   max={200}
                   step={1}
                   value={Math.round((selectedClip.volume ?? 1) * 100)}
-                  onChange={(e) => updateSelectedClip({ volume: Number(e.target.value) / 100 }, false)}
+                  onChange={(e) => {
+                    const volume = Number(e.target.value) / 100;
+                    updateSelectedClip({ volume }, false);
+                    setClipVolume(selectedClip.id, volume);
+                  }}
                   onPointerUp={() => commitInteractiveEdit()}
                   style={{ flex: 1 }}
                 />
@@ -2587,7 +3000,30 @@ export function App() {
                 </div>
               )}
 
-              {selectedClipTrack.kind === "video" && (
+              {/* 音频降噪（剪映式"降噪"开关升级为强度滑块）。视频/配音/音频轨都支持 */}
+              {(selectedClipTrack.kind === "voiceover" ||
+                selectedClipTrack.kind === "audio" ||
+                selectedClipTrack.kind === "video") && (
+                <div className="style-field-column">
+                  <label className="style-field">
+                    降噪（{(selectedClip.noiseReduction ?? 0).toFixed(0)}）
+                    <input
+                      type="range"
+                      min={0}
+                      max={100}
+                      step={5}
+                      value={selectedClip.noiseReduction ?? 0}
+                      onChange={(event) =>
+                        updateSelectedClip({ noiseReduction: Number(event.target.value) }, false)
+                      }
+                      onPointerUp={() => commitInteractiveEdit()}
+                    />
+                  </label>
+                  <small className="style-hint">降低背景噪声（导出时生效）</small>
+                </div>
+              )}
+
+              {isVisualTrackKind(selectedClipTrack.kind) && (
                 <>
                   <div className="bound-asset-info">
                     <strong>当前素材</strong>
@@ -2600,9 +3036,51 @@ export function App() {
                           : selectedSource.localPath
                             ? " · 已缓存"
                             : ""}
+                        {selectedSource.proxyStatus === "ready" ? " · 预览代理" : ""}
+                        {selectedSource.proxyStatus === "failed" ? " · 代理失败" : ""}
                       </small>
                     )}
                   </div>
+                  {/* 画面关键词（可编辑，用于 AI 搜索替换素材） */}
+                  <label className="style-field">
+                    画面关键词
+                    <div style={{ display: "flex", gap: 4 }}>
+                      <input
+                        type="text"
+                        value={selectedClip.visualQuery ?? ""}
+                        placeholder="描述想要的画面"
+                        onChange={(e) => updateSelectedClip({ visualQuery: e.target.value || null }, false)}
+                        onBlur={() => commitInteractiveEdit("已更新画面关键词")}
+                      />
+                      <button
+                        className="search-asset-btn"
+                        disabled={busy === "asset-search"}
+                        onClick={() => searchAssetsForSelected()}
+                        title="按关键词搜索 Pexels 素材并替换当前片段"
+                      >
+                        <Search size={14} />
+                      </button>
+                    </div>
+                  </label>
+                  {/* 搜索结果候选区 */}
+                  {assetCandidates[selectedClip.id]?.length ? (
+                    <div className="asset-candidates">
+                      {assetCandidates[selectedClip.id].slice(0, 8).map((asset, idx) => (
+                        <button
+                          key={asset.id}
+                          className="asset-candidate"
+                          onClick={() => project && bindAssetToClip(project.id, selectedClip.id, asset)}
+                          title={asset.title || asset.id}
+                        >
+                          {asset.thumbnailUrl ? (
+                            <img src={desktopApi.mediaSrc(asset.thumbnailUrl) ?? undefined} alt="" />
+                          ) : (
+                            <span>{asset.title || `素材 ${idx + 1}`}</span>
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
                   {/* 分离音频 / 分离人声 */}
                   {selectedSource && selectedSource.kind === "video" && (
                     <div className="audio-actions">
@@ -2684,10 +3162,12 @@ export function App() {
                                 const targetRatio = rw / rh;
                                 let w, h;
                                 if (srcRatio > targetRatio) {
-                                  h = 100; w = Math.min(100, (targetRatio / srcRatio) * 100 * (selectedSource?.height ?? 1920) / (selectedSource?.width ?? 1080) * 100);
+                                  h = 100;
+                                  w = Math.round(Math.min(100, (targetRatio / srcRatio) * 100));
                                   w = Math.round(w);
                                 } else {
-                                  w = 100; h = Math.min(100, (srcRatio / targetRatio) * 100);
+                                  w = 100;
+                                  h = Math.round(Math.min(100, (srcRatio / targetRatio) * 100));
                                   h = Math.round(h);
                                 }
                                 const x = Math.round((100 - w) / 2);
@@ -2748,37 +3228,49 @@ export function App() {
                       </button>
                     </div>
 
-                    {/* 素材裁剪 */}
+                    {/* 素材裁剪（仅视频/音频有时长素材；图片无时长跳过） */}
                     <div className="trim-box">
+                    {selectedSource && selectedSource.kind !== "image" && (
+                      <>
                       <div className="trim-title">
                         <Scissors size={15} />
                         素材裁剪
                       </div>
                       <label>
-                        入点
+                        入点（{selectedClip.sourceIn.toFixed(1)}s）
                         <input
                           type="range"
                           min={0}
-                          max={selectedSource.duration || 20}
+                          max={Math.max(0.1, selectedClip.sourceOut - 0.1)}
                           step={0.1}
                           value={selectedClip.sourceIn}
-                          onChange={(event) => updateSelectedClip({ sourceIn: Number(event.target.value) }, false)}
+                          onChange={(event) => {
+                            const newIn = Number(event.target.value);
+                            const newDuration = Math.max(0.1, (selectedClip.sourceOut - newIn) / selectedClip.speed);
+                            updateSelectedClip({ sourceIn: newIn, duration: newDuration }, false);
+                          }}
                           onPointerUp={() => commitInteractiveEdit()}
                         />
                       </label>
                       <label>
-                        出点
+                        出点（{selectedClip.sourceOut.toFixed(1)}s）
                         <input
                           type="range"
-                          min={0}
-                          max={selectedSource.duration || 20}
+                          min={selectedClip.sourceIn + 0.1}
+                          max={selectedSource.duration || selectedClip.sourceOut}
                           step={0.1}
                           value={selectedClip.sourceOut}
-                          onChange={(event) => updateSelectedClip({ sourceOut: Number(event.target.value) }, false)}
+                          onChange={(event) => {
+                            const newOut = Number(event.target.value);
+                            const newDuration = Math.max(0.1, (newOut - selectedClip.sourceIn) / selectedClip.speed);
+                            updateSelectedClip({ sourceOut: newOut, duration: newDuration }, false);
+                          }}
                           onPointerUp={() => commitInteractiveEdit()}
                         />
                       </label>
-                      {/* 变速：预设按钮 + 自定义输入 */}
+                      </>
+                    )}
+                      {/* 变速：预设按钮 + 自定义输入 + 倒放 */}
                       <div className="speed-control">
                         <div className="speed-label">变速</div>
                         <div className="speed-presets">
@@ -2791,17 +3283,27 @@ export function App() {
                           ].map((preset) => (
                             <button
                               key={preset.v}
-                              className={`speed-preset ${Math.abs(selectedClip.speed - preset.v) < 0.01 ? "active" : ""}`}
-                              onClick={() => selectedClip && changeClipSpeed(selectedClip, preset.v)}
+                              className={`speed-preset ${Math.abs(Math.abs(selectedClip.speed) - preset.v) < 0.01 ? "active" : ""}`}
+                              onClick={() => selectedClip && changeClipSpeed(selectedClip, (selectedClip.speed < 0 ? -1 : 1) * preset.v)}
                             >
                               {preset.label}
                             </button>
                           ))}
+                          <button
+                            className={`speed-preset ${selectedClip.speed < 0 ? "active" : ""}`}
+                            title="倒放（渲染时生效）"
+                            onClick={() => {
+                              if (!selectedClip) return;
+                              updateSelectedClip({ speed: selectedClip.speed < 0 ? Math.abs(selectedClip.speed) : -Math.abs(selectedClip.speed) });
+                            }}
+                          >
+                            倒放
+                          </button>
                         </div>
                         <input
                           className="speed-custom"
                           type="number"
-                          min={0.25}
+                          min={-4}
                           max={4}
                           step={0.05}
                           value={selectedClip.speed}
@@ -2813,14 +3315,29 @@ export function App() {
                           {Object.entries(SPEED_PRESETS).map(([key, preset]) => (
                             <button
                               key={key}
-                              className="speed-preset"
+                              className={`speed-preset ${
+                                (preset.points.length === 0 && !selectedClip.speedCurve?.length) ||
+                                (preset.points.length > 0 && JSON.stringify(selectedClip.speedCurve ?? []) === JSON.stringify(preset.points))
+                                  ? "active"
+                                  : ""
+                              }`}
                               title={preset.label}
-                              onClick={() => updateSelectedClip({ speedCurve: preset.points.length > 0 ? preset.points : null })}
+                              onClick={() => selectedClip && applySpeedCurvePreset(
+                                selectedClip,
+                                preset.points.length > 0 ? preset.points : null,
+                                preset.label,
+                              )}
                             >
                               {preset.label}
                             </button>
                           ))}
                         </div>
+                        {(selectedClip.speedCurve?.length ?? 0) > 0 && (
+                          <SpeedCurveEditor
+                            curve={selectedClip.speedCurve ?? []}
+                            onChange={(next) => applySpeedCurvePreset(selectedClip, next, "自定义")}
+                          />
+                        )}
                       </div>
                     </div>
                     </>
@@ -2874,26 +3391,57 @@ export function App() {
                           onChange={(e) => updateSelectedClip({ saturation: Number(e.target.value) }, false)}
                           onPointerUp={() => commitInteractiveEdit()} />
                       </label>
+                      <label className="style-field">
+                        色温
+                        <input type="range" min={-100} max={100} step={1} value={selectedClip.temperature ?? 0}
+                          onChange={(e) => updateSelectedClip({ temperature: Number(e.target.value) }, false)}
+                          onPointerUp={() => commitInteractiveEdit()} />
+                      </label>
+                      <label className="style-field">
+                        色调
+                        <input type="range" min={-100} max={100} step={1} value={selectedClip.tint ?? 0}
+                          onChange={(e) => updateSelectedClip({ tint: Number(e.target.value) }, false)}
+                          onPointerUp={() => commitInteractiveEdit()} />
+                      </label>
                     </div>
 
-                  {isOverlayClip && (
+                  {isVisualTrackKind(selectedClipTrack.kind) && (
                     <div className="transform-box">
                       <div className="trim-title">
                         <Layers size={15} />
-                        画中画变换
+                        画面变换
                       </div>
                       {/* T4.2: 关键帧 —— 在播放头处为属性打关键帧 */}
                       <div className="keyframe-row">
-                        <span className="kf-label">关键帧（@ {playhead.toFixed(1)}s）</span>
+                        <KeyframeLabel />
                         <div className="kf-buttons">
                           <button title="在播放头处为水平位置打关键帧" onClick={() => addKeyframeAtPlayhead("x", overlayTransform.x)}>◆ X</button>
                           <button title="在播放头处为垂直位置打关键帧" onClick={() => addKeyframeAtPlayhead("y", overlayTransform.y)}>◆ Y</button>
                           <button title="在播放头处为缩放打关键帧" onClick={() => addKeyframeAtPlayhead("scale", overlayTransform.scale)}>◆ 缩放</button>
+                          <button title="在播放头处为旋转打关键帧" onClick={() => addKeyframeAtPlayhead("rotation", overlayTransform.rotation ?? 0)}>◆ 旋转</button>
                           <button title="在播放头处为不透明度打关键帧" onClick={() => addKeyframeAtPlayhead("opacity", overlayTransform.opacity ?? 100)}>◆ 透明</button>
+                          <button title="在播放头处为音量打关键帧" onClick={() => addKeyframeAtPlayhead("volume", selectedClip?.volume ?? 1)}>◆ 音量</button>
+                          {hasKeyframeAtPlayhead() && (
+                            <button title="删除播放头处的关键帧" onClick={removeKeyframeAtPlayhead}>✕ 删帧</button>
+                          )}
                           {selectedClip?.keyframes && (
                             <button title="清除所有关键帧" onClick={() => updateSelectedClip({ keyframes: null })}>✕ 清除</button>
                           )}
                         </div>
+                        {hasKeyframeAtPlayhead() && (
+                          <label className="style-field" style={{ marginTop: 6 }}>
+                            <span className="kf-label">缓动</span>
+                            <select
+                              value={getKeyframeEasingAtPlayhead() ?? "linear"}
+                              onChange={(event) => setKeyframeEasingAtPlayhead(event.target.value as "linear" | "easeIn" | "easeOut" | "easeInOut")}
+                            >
+                              <option value="linear">线性</option>
+                              <option value="easeIn">缓入</option>
+                              <option value="easeOut">缓出</option>
+                              <option value="easeInOut">缓入缓出</option>
+                            </select>
+                          </label>
+                        )}
                       </div>
                       <label>
                         水平位置（{overlayTransform.x.toFixed(0)}%）
@@ -2932,6 +3480,18 @@ export function App() {
                         />
                       </label>
                       <label>
+                        旋转（{(overlayTransform.rotation ?? 0).toFixed(0)}°）
+                        <input
+                          type="range"
+                          min={-180}
+                          max={180}
+                          step={1}
+                          value={overlayTransform.rotation ?? 0}
+                          onChange={(event) => updateOverlayTransform({ rotation: Number(event.target.value) }, false)}
+                          onPointerUp={() => commitInteractiveEdit()}
+                        />
+                      </label>
+                      <label>
                         不透明度（{overlayTransform.opacity.toFixed(0)}%）
                         <input
                           type="range"
@@ -2953,7 +3513,15 @@ export function App() {
                           <option value="overlay">叠加</option>
                           <option value="screen">滤色</option>
                           <option value="multiply">正片叠底</option>
-                          <option value="addition">线性加深</option>
+                          <option value="addition">线性减淡(添加)</option>
+                          <option value="softlight">柔光</option>
+                          <option value="hardlight">强光</option>
+                          <option value="lighten">变亮</option>
+                          <option value="darken">变暗</option>
+                          <option value="difference">差值</option>
+                          <option value="exclusion">排除</option>
+                          <option value="colorburn">颜色加深</option>
+                          <option value="colordodge">颜色减淡</option>
                         </select>
                       </label>
                       <label>
@@ -2988,8 +3556,54 @@ export function App() {
                             </button>
                           ))}
                         </div>
+                        <MaskPreview mask={selectedClip.mask} />
                         {selectedClip.mask && (
                           <>
+                            <label className="style-field">
+                              中心 X（{Math.round((selectedClip.mask.cx ?? 0.5) * 100)}%）
+                              <input
+                                type="range" min={0} max={1} step={0.01}
+                                value={selectedClip.mask.cx ?? 0.5}
+                                onChange={(e) => updateSelectedClip({ mask: { ...selectedClip.mask!, cx: Number(e.target.value) } }, false)}
+                                onPointerUp={() => commitInteractiveEdit()}
+                              />
+                            </label>
+                            <label className="style-field">
+                              中心 Y（{Math.round((selectedClip.mask.cy ?? 0.5) * 100)}%）
+                              <input
+                                type="range" min={0} max={1} step={0.01}
+                                value={selectedClip.mask.cy ?? 0.5}
+                                onChange={(e) => updateSelectedClip({ mask: { ...selectedClip.mask!, cy: Number(e.target.value) } }, false)}
+                                onPointerUp={() => commitInteractiveEdit()}
+                              />
+                            </label>
+                            <label className="style-field">
+                              宽度（{Math.round((selectedClip.mask.width ?? 0.8) * 100)}%）
+                              <input
+                                type="range" min={0.05} max={1} step={0.01}
+                                value={selectedClip.mask.width ?? 0.8}
+                                onChange={(e) => updateSelectedClip({ mask: { ...selectedClip.mask!, width: Number(e.target.value) } }, false)}
+                                onPointerUp={() => commitInteractiveEdit()}
+                              />
+                            </label>
+                            <label className="style-field">
+                              高度（{Math.round((selectedClip.mask.height ?? 0.8) * 100)}%）
+                              <input
+                                type="range" min={0.05} max={1} step={0.01}
+                                value={selectedClip.mask.height ?? 0.8}
+                                onChange={(e) => updateSelectedClip({ mask: { ...selectedClip.mask!, height: Number(e.target.value) } }, false)}
+                                onPointerUp={() => commitInteractiveEdit()}
+                              />
+                            </label>
+                            <label className="style-field">
+                              旋转（{Math.round(selectedClip.mask.rotation ?? 0)}°）
+                              <input
+                                type="range" min={-180} max={180} step={1}
+                                value={selectedClip.mask.rotation ?? 0}
+                                onChange={(e) => updateSelectedClip({ mask: { ...selectedClip.mask!, rotation: Number(e.target.value) } }, false)}
+                                onPointerUp={() => commitInteractiveEdit()}
+                              />
+                            </label>
                             <label className="style-field">
                               羽化（{Math.round((selectedClip.mask.feather ?? 0.2) * 100)}%）
                               <input
@@ -3012,13 +3626,77 @@ export function App() {
                       </div>
                     </div>
                   )}
+
+                  {/* 视觉特效（剪映式"特效"面板） */}
+                  {isVisualTrackKind(selectedClipTrack.kind) && (
+                    <div className="mask-section">
+                      <span className="kf-label">视觉特效</span>
+                      <div className="kf-buttons">
+                        {([
+                          { id: "vignette", label: "暗角" },
+                          { id: "glow", label: "发光" },
+                          { id: "mirror", label: "镜像" },
+                          { id: "invert", label: "反色" },
+                          { id: "grayscale", label: "灰度" },
+                          { id: "flicker", label: "闪烁" },
+                          { id: "shake", label: "抖动" },
+                        ] as const).map((eff) => {
+                          const active = (selectedClip.visualEffects ?? []).some((e) => e.kind === eff.id);
+                          return (
+                            <button
+                              key={eff.id}
+                              className={`speed-preset ${active ? "active" : ""}`}
+                              onClick={() => {
+                                const cur = selectedClip.visualEffects ?? [];
+                                const next = active
+                                  ? cur.filter((e) => e.kind !== eff.id)
+                                  : [...cur, { kind: eff.id, intensity: 50 }];
+                                updateSelectedClip({ visualEffects: next.length > 0 ? next : null });
+                              }}
+                            >
+                              {eff.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      {(selectedClip.visualEffects ?? []).map((eff, idx) => (
+                        <label key={eff.kind} className="style-field">
+                          {eff.kind === "vignette" ? "暗角" :
+                           eff.kind === "glow" ? "发光" :
+                           eff.kind === "mirror" ? "镜像" :
+                           eff.kind === "invert" ? "反色" :
+                           eff.kind === "grayscale" ? "灰度" :
+                           eff.kind === "flicker" ? "闪烁" :
+                           eff.kind === "shake" ? "抖动" : eff.kind}
+                          （{eff.intensity.toFixed(0)}）
+                          <input
+                            type="range" min={0} max={100} step={5}
+                            value={eff.intensity}
+                            onChange={(e) => {
+                              const next = [...(selectedClip.visualEffects ?? [])];
+                              next[idx] = { ...next[idx], intensity: Number(e.target.value) };
+                              updateSelectedClip({ visualEffects: next }, false);
+                            }}
+                            onPointerUp={() => commitInteractiveEdit()}
+                          />
+                        </label>
+                      ))}
+                      <small className="style-hint">视觉特效在导出时生效</small>
+                    </div>
+                  )}
                 </>
               )}
 
               {selectedClip.transitionIn && (
                 <div className="transition-info">
                   <SlidersHorizontal size={14} />
-                  入场转场：{selectedClip.transitionIn}
+                  入场转场：{transitionName(selectedClip.transitionIn)}
+                </div>
+              )}
+              {selectedClip.transitionOut && (
+                <div className="transition-info">
+                  <SlidersHorizontal size={14} />
+                  出场转场：{transitionName(selectedClip.transitionOut)}
                 </div>
               )}
             </div>
@@ -3035,13 +3713,25 @@ export function App() {
       <section className="timeline-panel">
         <div className="timeline-head">
           <div className="timeline-tools">
-            <button onClick={splitAtPlayhead} disabled={!project}>
+            <button onClick={splitAtPlayhead} disabled={!project} title="分割 (Ctrl+B)">
               <Scissors size={15} />
               分割
             </button>
-            <button onClick={deleteSelectedClip} disabled={!selectedClip}>
+            <button onClick={() => deleteSelectedClip()} disabled={!selectedClip} title="删除片段 (Del)">
               <Trash2 size={15} />
               删除片段
+            </button>
+            <button onClick={copySelectedClip} disabled={!selectedClip} title="复制 (Ctrl+C)">
+              <Copy size={15} />
+              复制
+            </button>
+            <button onClick={pasteClip} disabled={!clipboardRef.current} title="粘贴 (Ctrl+V)">
+              <ClipboardPaste size={15} />
+              粘贴
+            </button>
+            <button onClick={duplicateSelectedClip} disabled={!selectedClip} title="复制片段 (Ctrl+D)">
+              <CopyPlus size={15} />
+              复制片段
             </button>
             <div className="add-track-menu">
               <button onClick={() => setShowAddTrackMenu((v) => !v)} disabled={!project} title="添加轨道">
@@ -3058,6 +3748,22 @@ export function App() {
                 </div>
               )}
             </div>
+            <button onClick={handleAddChapter} disabled={!project} title="在播放头处添加章节标记">
+              <Bookmark size={15} />
+              章节
+            </button>
+            <button
+              onClick={() => {
+                if (!project) return;
+                const t = usePlaybackStore.getState().currentTime;
+                void persist({ ...project, coverTime: t }, `已设置封面（${t.toFixed(1)}s）`);
+              }}
+              disabled={!project}
+              title="将播放头位置设为封面"
+            >
+              <ImagePlay size={15} />
+              设为封面
+            </button>
             <button onClick={() => { setShowExport(true); setExportState("idle"); }} disabled={!project}>
               <Download size={15} />
               导出
@@ -3096,6 +3802,35 @@ export function App() {
         >
           <div className="timeline-canvas" style={{ width: timelineWidth }}>
             <Ruler totalDuration={totalDuration} pxPerSecond={pxPerSecond} onSeek={seek} fps={project?.renderConfig?.fps ?? 30} />
+            {/* 章节标记：在 ruler 下方按时间位置渲染，点击 seek 到该时间 */}
+            {(project?.chapters ?? []).length > 0 && (
+              <div className="chapter-bar">
+                {(project?.chapters ?? []).map((ch) => {
+                  const leftPct = totalDuration > 0 ? (ch.time / totalDuration) * 100 : 0;
+                  return (
+                    <div
+                      key={ch.id}
+                      className="chapter-marker"
+                      style={{ left: `${leftPct}%` }}
+                      title={`${ch.title} · ${ch.time.toFixed(1)}s`}
+                      onClick={() => seek(ch.time)}
+                    >
+                      <Bookmark size={11} />
+                      <span className="chapter-marker-label">{ch.title}</span>
+                      <button
+                        className="chapter-marker-close"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleDeleteChapter(ch.id);
+                        }}
+                      >
+                        <XCircle size={9} />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
             {/*
               playhead 坐标系对齐 ruler/clip：
               canvas 有 padding-left:44px(标签栏) + padding-right:14px，
@@ -3103,10 +3838,7 @@ export function App() {
               所以 playhead 必须用 calc 把百分比应用到"扣除 58px 后的内容区"，
               否则它会基于 canvas 全宽计算，和 clip/ruler 错位。
             */}
-            <div
-              className="playhead"
-              style={{ left: `calc(44px + (100% - 58px) * ${playheadPercent / 100})` }}
-            />
+            <PlayheadLine totalDuration={totalDuration} />
             {project?.tracks
               .slice()
               .sort((a, b) => a.order - b.order)
@@ -3114,7 +3846,7 @@ export function App() {
                 <TimelineTrack
                   key={track.id}
                   track={track}
-                  clips={project.clips.filter((clip) => clip.trackId === track.id)}
+                  clips={clipsByTrackId.get(track.id) ?? []}
                   media={project.media}
                   totalDuration={totalDuration}
                   timelineWidth={timelineWidth}
@@ -3122,57 +3854,20 @@ export function App() {
                   selectedClipId={selectedClipId}
                   selectedClipIds={selectedClipIds}
                   locked={track.locked}
-                  onSelectClip={(id, additive) => {
-                    selectClip(id, additive);
-                    const c = project.clips.find((cl) => cl.id === id);
-                    if (c && !additive) seek(c.startOnTrack);
-                  }}
+                  onSelectClip={handleTimelineSelectClip}
                   onClipDrag={handleClipDrag}
                   onClipCommit={handleClipCommit}
+                  onBoxSelect={selectClipsByBox}
                   onDropAsset={handleDropAssetToTrack}
-                  onContextMenu={(clip, trackKind, x, y) => {
-                    setSelectedClipId(clip.id);
-                    setContextMenu({ x, y, clip, trackKind: trackKind as TrackKind });
-                  }}
-                  onToggleMute={(trackId) => {
-                    if (!project) return;
-                    const tracks = project.tracks.map((t) =>
-                      t.id === trackId ? { ...t, muted: !t.muted } : t
-                    );
-                    void persist({ ...project, tracks }, "已切换静音");
-                  }}
-                  onToggleLock={(trackId) => {
-                    if (!project) return;
-                    const tracks = project.tracks.map((t) =>
-                      t.id === trackId ? { ...t, locked: !t.locked } : t
-                    );
-                    void persist({ ...project, tracks }, "已切换锁定");
-                  }}
-                  onMoveUp={(trackId) => {
-                    if (!project) return;
-                    const sorted = [...project.tracks].sort((a, b) => a.order - b.order);
-                    const idx = sorted.findIndex((t) => t.id === trackId);
-                    if (idx <= 0) return;
-                    // 交换 order（order 小=上层，大=底层；上移=减小 order）
-                    const tracks = project.tracks.map((t) => {
-                      if (t.id === trackId) return { ...t, order: sorted[idx - 1].order };
-                      if (t.id === sorted[idx - 1].id) return { ...t, order: sorted[idx].order };
-                      return t;
-                    });
-                    void persist({ ...project, tracks }, "已上移图层");
-                  }}
-                  onMoveDown={(trackId) => {
-                    if (!project) return;
-                    const sorted = [...project.tracks].sort((a, b) => a.order - b.order);
-                    const idx = sorted.findIndex((t) => t.id === trackId);
-                    if (idx < 0 || idx >= sorted.length - 1) return;
-                    const tracks = project.tracks.map((t) => {
-                      if (t.id === trackId) return { ...t, order: sorted[idx + 1].order };
-                      if (t.id === sorted[idx + 1].id) return { ...t, order: sorted[idx].order };
-                      return t;
-                    });
-                    void persist({ ...project, tracks }, "已下移图层");
-                  }}
+                  onContextMenu={handleTimelineContextMenu}
+                  onToggleMute={handleTimelineToggleMute}
+                  onToggleLock={handleTimelineToggleLock}
+                  onToggleHidden={handleTimelineToggleHidden}
+                  onMoveUp={handleTimelineMoveUp}
+                  onMoveDown={handleTimelineMoveDown}
+                  onDeleteTrack={handleTimelineDeleteTrack}
+                  onKeyframeClick={handleKeyframeClick}
+                  onEditSubtitleStyle={handleEditSubtitleStyle}
                 />
               ))}
           </div>
@@ -3237,10 +3932,6 @@ export function App() {
               updateSelectedClip({ speed: -Math.abs(selectedClip.speed) });
               setStatus("倒放（渲染时生效）");
             },
-            onEnableToggle: () => {
-              if (!selectedClip) return;
-              updateSelectedClip({ volume: selectedClip.volume > 0 ? 0 : 1 });
-            },
             onAddSubtitle: () => handleRecognizeSubtitles(false),
             onEditText: () => {
               // 字幕"编辑文字"：进入字幕编辑模式（textarea 直接改 text）
@@ -3255,7 +3946,7 @@ export function App() {
       {/* 一键生成向导 */}
       <GenerateWizard
         open={showGenerate}
-        onClose={() => { setShowGenerate(false); setPipeline({ active: false, steps: [], error: null }); }}
+        onClose={() => { setShowGenerate(false); resetPipeline(); }}
         voiceProfiles={voiceProfiles}
         hasDeepSeekKey={!!settings.deepseekApiKey}
         hasPexelsKey={!!settings.pexelsApiKey}
@@ -3286,7 +3977,7 @@ export function App() {
             void desktopApi.saveProject(next);
           }
         }}
-        onExport={(outputPath) => { setExportProgress(0); setExportMessage(""); handleRenderFinal(outputPath); }}
+        onExport={handleRenderFinal}
         onCancel={() => { void desktopApi.cancelRender(); }}
         exportState={exportState}
         exportProgress={exportProgress}
@@ -3295,6 +3986,263 @@ export function App() {
         outputPath={exportPath}
         errorMessage={exportError}
       />
+
+      {subtitleTrackStyleEditing && project && (() => {
+        const track = project.tracks.find((t) => t.id === subtitleTrackStyleEditing.trackId);
+        const trackClipCount = project.clips.filter((c) => c.trackId === subtitleTrackStyleEditing.trackId).length;
+        const draft = subtitleTrackStyleEditing.draft;
+        return (
+          <div className="modal-backdrop" onClick={() => setSubtitleTrackStyleEditing(null)}>
+            <div className="subtitle-track-style-modal" onClick={(e) => e.stopPropagation()}>
+              <div className="modal-title">
+                <div>
+                  <SlidersHorizontal size={18} />
+                  <strong>统一调整字幕样式</strong>
+                  <span className="modal-subtitle">{track?.name ?? "字幕轨"} · {trackClipCount} 条</span>
+                </div>
+                <button className="icon-button" onClick={() => setSubtitleTrackStyleEditing(null)}>
+                  <XCircle size={18} />
+                </button>
+              </div>
+              <div className="subtitle-track-style-body">
+                <label className="style-field">
+                  字体
+                  <select
+                    value={draft.fontFamily}
+                    style={{ fontFamily: draft.fontFamily }}
+                    onChange={(e) => updateSubtitleTrackDraft({ fontFamily: e.target.value })}
+                  >
+                    {FONT_OPTIONS.map((font) => (
+                      <option key={font.family} value={font.family} style={{ fontFamily: font.family }}>
+                        {font.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="style-field">
+                  字号
+                  <input
+                    type="number"
+                    min={16}
+                    max={120}
+                    value={draft.fontSize}
+                    onChange={(e) => updateSubtitleTrackDraft({ fontSize: Number(e.target.value) })}
+                  />
+                </label>
+                <label className="style-field">
+                  颜色
+                  <input
+                    type="color"
+                    value={draft.color}
+                    onChange={(e) => updateSubtitleTrackDraft({ color: e.target.value })}
+                  />
+                </label>
+                <label className="style-field">
+                  描边色
+                  <input
+                    type="color"
+                    value={draft.strokeColor}
+                    onChange={(e) => updateSubtitleTrackDraft({ strokeColor: e.target.value })}
+                  />
+                </label>
+                <label className="style-field">
+                  描边粗细（{draft.strokeWidth ?? 0}px）
+                  <input
+                    type="range"
+                    min={0}
+                    max={10}
+                    step={0.5}
+                    value={draft.strokeWidth ?? 0}
+                    onChange={(e) => updateSubtitleTrackDraft({ strokeWidth: Number(e.target.value) })}
+                  />
+                </label>
+                <label className="style-field">
+                  背景色
+                  <input
+                    type="color"
+                    value={draft.backgroundColor === "none" ? "#000000" : draft.backgroundColor ?? "#000000"}
+                    onChange={(e) => updateSubtitleTrackDraft({ backgroundColor: e.target.value })}
+                  />
+                </label>
+                <label className="style-field" style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                  <input
+                    type="checkbox"
+                    checked={draft.backgroundColor !== "none"}
+                    onChange={(e) => updateSubtitleTrackDraft({ backgroundColor: e.target.checked ? "#000000" : "none" })}
+                  />
+                  <span>启用背景</span>
+                </label>
+                <label className="style-field">
+                  背景内边距（{draft.backgroundPadding ?? 4}px）
+                  <input
+                    type="range"
+                    min={0}
+                    max={20}
+                    step={1}
+                    value={draft.backgroundPadding ?? 4}
+                    onChange={(e) => updateSubtitleTrackDraft({ backgroundPadding: Number(e.target.value) })}
+                  />
+                </label>
+                <label className="style-field">
+                  阴影色
+                  <input
+                    type="color"
+                    value={draft.shadowColor ?? "#000000"}
+                    onChange={(e) => updateSubtitleTrackDraft({ shadowColor: e.target.value })}
+                  />
+                </label>
+                <label className="style-field">
+                  阴影模糊（{draft.shadowBlur ?? 0}px）
+                  <input
+                    type="range"
+                    min={0}
+                    max={20}
+                    step={0.5}
+                    value={draft.shadowBlur ?? 0}
+                    onChange={(e) => updateSubtitleTrackDraft({ shadowBlur: Number(e.target.value) })}
+                  />
+                </label>
+                <label className="style-field">
+                  字间距（{draft.letterSpacing ?? 0}px）
+                  <input
+                    type="range"
+                    min={-5}
+                    max={20}
+                    step={0.5}
+                    value={draft.letterSpacing ?? 0}
+                    onChange={(e) => updateSubtitleTrackDraft({ letterSpacing: Number(e.target.value) })}
+                  />
+                </label>
+                <label className="style-field">
+                  行高（{(draft.lineHeight ?? 1.2).toFixed(2)}x）
+                  <input
+                    type="range"
+                    min={0.8}
+                    max={2.5}
+                    step={0.05}
+                    value={draft.lineHeight ?? 1.2}
+                    onChange={(e) => updateSubtitleTrackDraft({ lineHeight: Number(e.target.value) })}
+                  />
+                </label>
+                <label className="style-field">
+                  位置
+                  <select
+                    value={draft.position}
+                    onChange={(e) => updateSubtitleTrackDraft({ position: e.target.value as "bottom" | "center" | "top" | "custom" })}
+                  >
+                    <option value="bottom">底部</option>
+                    <option value="center">居中</option>
+                    <option value="top">顶部</option>
+                    <option value="custom">自定义</option>
+                  </select>
+                </label>
+                {draft.position === "custom" && (
+                  <>
+                    <label className="style-field">
+                      X 位置（{draft.x.toFixed(0)}%）
+                      <input
+                        type="range"
+                        min={0}
+                        max={100}
+                        step={1}
+                        value={draft.x}
+                        onChange={(e) => updateSubtitleTrackDraft({ x: Number(e.target.value) })}
+                      />
+                    </label>
+                    <label className="style-field">
+                      Y 位置（{draft.y.toFixed(0)}%）
+                      <input
+                        type="range"
+                        min={0}
+                        max={100}
+                        step={1}
+                        value={draft.y}
+                        onChange={(e) => updateSubtitleTrackDraft({ y: Number(e.target.value) })}
+                      />
+                    </label>
+                  </>
+                )}
+                <label className="style-field">
+                  水平缩放（{draft.scaleX.toFixed(0)}%）
+                  <input
+                    type="range"
+                    min={50}
+                    max={200}
+                    step={1}
+                    value={draft.scaleX}
+                    onChange={(e) => updateSubtitleTrackDraft({ scaleX: Number(e.target.value) })}
+                  />
+                </label>
+                <label className="style-field">
+                  垂直缩放（{draft.scaleY.toFixed(0)}%）
+                  <input
+                    type="range"
+                    min={50}
+                    max={200}
+                    step={1}
+                    value={draft.scaleY}
+                    onChange={(e) => updateSubtitleTrackDraft({ scaleY: Number(e.target.value) })}
+                  />
+                </label>
+                <label className="style-field">
+                  旋转（{draft.rotation.toFixed(0)}°）
+                  <input
+                    type="range"
+                    min={-180}
+                    max={180}
+                    step={1}
+                    value={draft.rotation}
+                    onChange={(e) => updateSubtitleTrackDraft({ rotation: Number(e.target.value) })}
+                  />
+                </label>
+                <label className="style-field">
+                  入场动画
+                  <select
+                    value={draft.animationIn ?? "none"}
+                    onChange={(e) => updateSubtitleTrackDraft({ animationIn: e.target.value })}
+                  >
+                    <option value="none">无</option>
+                    <option value="fadeIn">淡入</option>
+                    <option value="slideUp">上滑</option>
+                    <option value="scaleIn">缩放</option>
+                  </select>
+                </label>
+                <label className="style-field">
+                  出场动画
+                  <select
+                    value={draft.animationOut ?? "none"}
+                    onChange={(e) => updateSubtitleTrackDraft({ animationOut: e.target.value })}
+                  >
+                    <option value="none">无</option>
+                    <option value="fadeOut">淡出</option>
+                    <option value="slideDown">下滑</option>
+                    <option value="scaleOut">缩放</option>
+                  </select>
+                </label>
+                <label className="style-field">
+                  动画时长（{(draft.animationDuration ?? 0.3).toFixed(1)}s）
+                  <input
+                    type="range"
+                    min={0.1}
+                    max={2.0}
+                    step={0.1}
+                    value={draft.animationDuration ?? 0.3}
+                    onChange={(e) => updateSubtitleTrackDraft({ animationDuration: Number(e.target.value) })}
+                  />
+                </label>
+              </div>
+              <div className="modal-actions">
+                <button className="panel-secondary-action" onClick={() => setSubtitleTrackStyleEditing(null)}>
+                  取消
+                </button>
+                <button className="panel-primary-action" onClick={applySubtitleTrackStyle}>
+                  应用到本轨（{trackClipCount} 条）
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {showSettings && (
         <div className="modal-backdrop">

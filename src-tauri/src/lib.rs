@@ -12,7 +12,17 @@ mod tts;
 use storage::AppState;
 
 pub fn run() {
-    let state = AppState::initialize().expect("failed to initialize local app storage");
+    // M18: 初始化失败时用原生消息框提示，而不是直接 panic
+    let state = match AppState::initialize() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("初始化失败: {e}");
+            show_fatal_dialog(&format!(
+                "应用存储初始化失败：\n{e}\n\n请检查磁盘空间和权限后重试。"
+            ));
+            std::process::exit(1);
+        }
+    };
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -47,6 +57,7 @@ pub fn run() {
             commands::detach_audio,
             commands::separate_vocals,
             commands::generate_subtitles,
+            commands::import_srt,
             commands::transcribe_to_text,
             commands::transcribe_to_sentences,
             commands::enrich_segments,
@@ -58,4 +69,17 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running SceneScript Desktop");
+}
+
+/// 用平台原生消息框显示致命错误（不依赖 Tauri runtime）
+#[cfg(target_os = "macos")]
+fn show_fatal_dialog(msg: &str) {
+    let _ = std::process::Command::new("osascript")
+        .args(["-e", &format!("display dialog \"{}\" buttons {{\"退出\"}} default button 1 with title \"SceneScript Desktop\" with icon stop", msg.replace('"', "\\\""))])
+        .status();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn show_fatal_dialog(msg: &str) {
+    eprintln!("{msg}");
 }

@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use tokio::process::Command;
 
-use crate::models::{AppSettings, VoicePreviewResult, VoiceProfile};
+use crate::{
+    ffmpeg,
+    models::{AppSettings, VoicePreviewResult, VoiceProfile},
+};
 
 #[derive(Debug, Deserialize)]
 struct PythonPreviewResult {
@@ -156,18 +159,17 @@ fn estimate_duration(text: &str) -> f64 {
 }
 
 async fn probe_duration(path: &Path) -> anyhow::Result<f64> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            &path.to_string_lossy(),
-        ])
-        .output()
-        .await?;
+    let mut cmd = Command::new("ffprobe");
+    cmd.args([
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        &path.to_string_lossy(),
+    ]);
+    let output = ffmpeg::run_with_timeout(&mut cmd, 30).await?;
 
     if !output.status.success() {
         anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr).trim());

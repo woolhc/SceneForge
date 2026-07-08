@@ -73,7 +73,7 @@ pub async fn segment_script(
         script = script
     );
 
-    let client = reqwest::Client::new();
+    let client = crate::ffmpeg::http_client();
     let response = client
         .post("https://api.deepseek.com/chat/completions")
         .bearer_auth(api_key)
@@ -150,9 +150,7 @@ pub async fn enrich_segments(
         .sentences
         .iter()
         .enumerate()
-        .map(|(i, s)| {
-            json!({ "index": i, "start": s.start, "end": s.end, "text": s.text })
-        })
+        .map(|(i, s)| json!({ "index": i, "start": s.start, "end": s.end, "text": s.text }))
         .collect();
 
     let system_prompt = "你是短视频剪辑助手。我会给你一组已经切好的句子（每句带时间戳）。你的任务是为每句配一个画面搜索词，但绝对不能改变句子的数量、顺序、时间。只返回 JSON。";
@@ -191,7 +189,7 @@ pub async fn enrich_segments(
         input = serde_json::to_string_pretty(&input).unwrap_or_default()
     );
 
-    let client = reqwest::Client::new();
+    let client = crate::ffmpeg::http_client();
     let response = client
         .post("https://api.deepseek.com/chat/completions")
         .bearer_auth(api_key)
@@ -251,7 +249,8 @@ pub async fn enrich_segments(
         .map_err(|e| anyhow::anyhow!("DeepSeek 富化 JSON 解析失败：{e}"))?;
 
     // 用原文句子的时间/text 作为权威，AI 字段按 index 对齐
-    let mut by_index: std::collections::HashMap<usize, &EnrichItem> = std::collections::HashMap::new();
+    let mut by_index: std::collections::HashMap<usize, &EnrichItem> =
+        std::collections::HashMap::new();
     for item in &payload.segments {
         let idx = item.index.unwrap_or(0);
         by_index.insert(idx, item);
@@ -267,16 +266,23 @@ pub async fn enrich_segments(
             let item = enrich.or(fallback);
             let duration = (s.end - s.start).max(0.5);
             AiSegment {
-                title: item.map(|x| x.title.clone()).filter(|t| !t.is_empty())
+                title: item
+                    .map(|x| x.title.clone())
+                    .filter(|t| !t.is_empty())
                     .unwrap_or_else(|| s.text.chars().take(10).collect()),
                 text: s.text.clone(),
-                visual_query: item.map(|x| x.visual_query.clone()).filter(|t| !t.is_empty())
+                visual_query: item
+                    .map(|x| x.visual_query.clone())
+                    .filter(|t| !t.is_empty())
                     .unwrap_or_else(|| "nature landscape".to_string()),
                 visual_query_zh: item.map(|x| x.visual_query_zh.clone()).unwrap_or_default(),
-                mood: item.map(|x| x.mood.clone()).filter(|t| !t.is_empty())
+                mood: item
+                    .map(|x| x.mood.clone())
+                    .filter(|t| !t.is_empty())
                     .unwrap_or_else(|| "neutral".to_string()),
                 estimated_duration: duration,
-                material_strategy: item.map(|x| x.material_strategy.clone())
+                material_strategy: item
+                    .map(|x| x.material_strategy.clone())
                     .unwrap_or_else(|| "auto_search".to_string()),
                 start: s.start,
                 end: s.end,

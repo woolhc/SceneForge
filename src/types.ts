@@ -54,13 +54,18 @@ export type TrackKind = "video" | "image" | "voiceover" | "audio" | "subtitle";
 
 export type MediaSource = {
   id: string;
-  /** "video" | "audio" */
-  kind: string;
+  // M7: union type 代替裸 string
+  kind: "video" | "audio" | "image";
   title: string;
   /** 远程下载地址（Pexels） */
   url?: string | null;
   /** 本地缓存路径（asset 协议播放用） */
   localPath?: string | null;
+  /** 低清代理路径：预览优先用，导出仍用 localPath/url 原片 */
+  proxyPath?: string | null;
+  proxyStatus?: "none" | "ready" | "failed" | null;
+  proxyWidth?: number | null;
+  proxyHeight?: number | null;
   thumbnailUrl?: string | null;
   width: number;
   height: number;
@@ -73,8 +78,22 @@ export type SubtitleStyle = {
   fontSize: number;
   color: string;
   strokeColor: string;
-  /** "bottom" | "center" | "top" | "custom" */
-  position: string;
+  /** 描边粗细（像素，0=无描边） */
+  strokeWidth?: number;
+  /** 背景色（CSS color string，"none"=透明） */
+  backgroundColor?: string;
+  /** 背景内边距（像素） */
+  backgroundPadding?: number;
+  /** 阴影颜色 */
+  shadowColor?: string;
+  /** 阴影模糊（像素，0=无阴影） */
+  shadowBlur?: number;
+  /** 字间距（像素，0=正常） */
+  letterSpacing?: number;
+  /** 行高（倍数，1.0=正常） */
+  lineHeight?: number;
+  // M7: union type 代替裸 string
+  position: "bottom" | "center" | "top" | "custom";
   fontFamily: string;
   /** 自由位置 X（0-100 百分比，50=居中） */
   x: number;
@@ -178,6 +197,19 @@ export type ClipMask = {
   invert: boolean;
 };
 
+/** 视觉特效项（剪映式"特效"面板） */
+export type ClipVisualEffect = {
+  /** 特效类型：vignette | flicker | shake | glow | mirror | invert | grayscale */
+  kind: string;
+  /** 强度 0-100 */
+  intensity: number;
+};
+
+export type TransitionConfig = {
+  name: string;
+  duration: number;
+};
+
 export type Clip = {
   id: string;
   trackId: string;
@@ -200,6 +232,8 @@ export type Clip = {
   fadeIn: number;
   /** 音频淡出时长（秒） */
   fadeOut: number;
+  /** 音频降噪强度 0-100（0=关闭；映射到 afftdn nr 0-25dB） */
+  noiseReduction?: number;
   /** 滤镜名称 */
   filter?: string | null;
   /** 色彩调节：亮度 -100~100 */
@@ -208,6 +242,10 @@ export type Clip = {
   contrast: number;
   /** 色彩调节：饱和度 -100~100 */
   saturation: number;
+  /** 色温 -100~100（负=冷蓝，正=暖红） */
+  temperature?: number;
+  /** 色调 -100~100（负=绿，正=品红） */
+  tint?: number;
   /** 画面变换（视频 clip 用，画中画） */
   transform?: ClipTransform | null;
   /** T4.2: 关键帧动画（位置/缩放/不透明度/旋转/音量） */
@@ -216,6 +254,8 @@ export type Clip = {
   mask?: ClipMask | null;
   /** 画面搜索词（视频 clip 用，AI 生成的英文 Pexels 关键词） */
   visualQuery?: string | null;
+  /** 视觉特效列表（剪映式"特效"面板） */
+  visualEffects?: ClipVisualEffect[] | null;
   /** 画面裁剪（源帧百分比） */
   crop?: ClipCrop | null;
   /** 字幕文案（字幕 clip 用） */
@@ -224,9 +264,9 @@ export type Clip = {
   /** 字幕逐词时间戳（用于逐字高亮；null/空表示无词级数据） */
   words?: WordCue[] | null;
   /** 入场转场 */
-  transitionIn?: string | null;
+  transitionIn?: string | TransitionConfig | null;
   /** 出场转场 */
-  transitionOut?: string | null;
+  transitionOut?: string | TransitionConfig | null;
 };
 
 export type Track = {
@@ -236,6 +276,10 @@ export type Track = {
   order: number;
   muted: boolean;
   locked: boolean;
+  /** 是否隐藏（不参与预览/导出） */
+  hidden?: boolean;
+  /** 轨道高度（像素，0=默认） */
+  height?: number;
 };
 
 export type RenderConfig = {
@@ -252,6 +296,8 @@ export type RenderConfig = {
   exportMode?: "video" | "audio-only";
   /** T4.5: 默认转场时长（秒） */
   transitionDuration?: number;
+  /** 字幕处理：burn 烧录到画面（默认）| none 不包含 */
+  subtitleMode?: "burn" | "srt" | "none";
 };
 
 export type Project = {
@@ -265,10 +311,22 @@ export type Project = {
   tracks: Track[];
   clips: Clip[];
   renderConfig: RenderConfig;
+  /** 章节标记（剪映式） */
+  chapters?: Chapter[];
+  /** 封面时间点（秒） */
+  coverTime?: number | null;
   previewPath?: string | null;
   finalPath?: string | null;
   createdAt: string;
   updatedAt: string;
+};
+
+/** 章节（剪映式章节标记） */
+export type Chapter = {
+  id: string;
+  /** 章节起点（秒） */
+  time: number;
+  title: string;
 };
 
 export type ProjectSummary = {
@@ -328,6 +386,13 @@ export const DEFAULT_SUBTITLE_STYLE: SubtitleStyle = {
   fontSize: 48,
   color: "#FFFFFF",
   strokeColor: "#000000",
+  strokeWidth: 2,
+  backgroundColor: "none",
+  backgroundPadding: 4,
+  shadowColor: "#000000",
+  shadowBlur: 0,
+  letterSpacing: 0,
+  lineHeight: 1.2,
   position: "bottom",
   fontFamily: "Noto Sans SC",
   x: 50,

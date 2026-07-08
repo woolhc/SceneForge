@@ -14,9 +14,16 @@ export class FilterRenderer {
   private videoTexture: WebGLTexture | null = null;
   private lutTexture: WebGLTexture | null = null;
   private canvas: HTMLCanvasElement;
-  private video: HTMLVideoElement;
+  private video: HTMLVideoElement | HTMLImageElement | null;
   private currentLutName: string | null = null;
   private lutSize = 33;
+
+
+  /** 当前要渲染的 clip（由 React effect 低频设置） */
+  private currentClip: Clip | null = null;
+  /** rAF 循环 ID（每帧自动绘制） */
+  private rafId: number | null = null;
+  private videoFrameCallbackId: number | null = null;
 
   private static readonly VS = `
     attribute vec2 a_position;
@@ -38,6 +45,8 @@ export class FilterRenderer {
     uniform float u_brightness;
     uniform float u_contrast;
     uniform float u_saturation;
+    uniform float u_temperature;
+    uniform float u_tint;
     uniform bool u_useLut;
 
     void main() {
@@ -48,6 +57,12 @@ export class FilterRenderer {
       color.rgb = (color.rgb - 0.5) * u_contrast + 0.5;
       float luma = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
       color.rgb = mix(vec3(luma), color.rgb, u_saturation);
+
+      // 色温/色调（colorbalance 等效）：温度正=暖（红增蓝减），色调正=品红（绿减）
+      // 强度系数与 ffmpeg 端 colorbalance rm/gm/bm 一致（最大 ±0.5）
+      color.r += u_temperature * 0.5;
+      color.b -= u_temperature * 0.5;
+      color.g -= u_tint * 0.5;
       color.rgb = clamp(color.rgb, 0.0, 1.0);
 
       // 第二步：LUT 采样（预设滤镜）
@@ -77,7 +92,7 @@ export class FilterRenderer {
     }
   `;
 
-  constructor(canvas: HTMLCanvasElement, video: HTMLVideoElement) {
+  constructor(canvas: HTMLCanvasElement, video: HTMLVideoElement | HTMLImageElement | null = null) {
     this.canvas = canvas;
     this.video = video;
     this.init();
@@ -151,21 +166,94 @@ export class FilterRenderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     this.currentLutName = name;
+    if (this.currentClip?.filter === name) {
+      this.render(this.currentClip);
+      this.startLoop();
+    }
   }
 
   /** 清除当前 LUT（回到无滤镜） */
   clearLut() {
     this.currentLutName = null;
+    if (this.currentClip) this.render(this.currentClip);
   }
 
-  /** 每帧调用 */
+  /** 设置当前要渲染的 clip（低频），内部 rAF 循环每帧绘制，不依赖 App 重渲染 */
+  setClip(clip: Clip | null) {
+    this.currentClip = clip;
+    if (clip) {
+      this.render(clip);
+      this.startLoop();
+    } else {
+      this.stopLoop();
+      this.canvas.style.display = "none";
+    }
+  }
+
+  /** 活跃媒体切换时更新读取的元素 */
+  setVideo(video: HTMLVideoElement | HTMLImageElement) {
+    this.video = video;
+    if (this.currentClip) {
+      this.render(this.currentClip);
+      this.restartLoop();
+    }
+  }
+
+
+
+  private startLoop() {
+    if (this.rafId !== null || this.videoFrameCallbackId !== null) return;
+    if (this.video instanceof HTMLVideoElement && "requestVideoFrameCallback" in this.video) {
+      const video = this.video as HTMLVideoElement & {
+        requestVideoFrameCallback: (callback: () => void) => number;
+      };
+      const loop = () => {
+        if (!this.currentClip || this.video !== video) {
+          this.videoFrameCallbackId = null;
+          return;
+        }
+        this.render(this.currentClip);
+        this.videoFrameCallbackId = video.requestVideoFrameCallback(loop);
+      };
+      this.videoFrameCallbackId = video.requestVideoFrameCallback(loop);
+      return;
+    }
+    const loop = () => {
+      if (this.currentClip) this.render(this.currentClip);
+      this.rafId = requestAnimationFrame(loop);
+    };
+    this.rafId = requestAnimationFrame(loop);
+  }
+
+  private stopLoop() {
+    if (this.videoFrameCallbackId !== null && this.video instanceof HTMLVideoElement && "cancelVideoFrameCallback" in this.video) {
+      const video = this.video as HTMLVideoElement & {
+        cancelVideoFrameCallback: (id: number) => void;
+      };
+      video.cancelVideoFrameCallback(this.videoFrameCallbackId);
+      this.videoFrameCallbackId = null;
+    }
+    if (this.rafId !== null) {
+      cancelAnimationFrame(this.rafId);
+      this.rafId = null;
+    }
+  }
+
+  private restartLoop() {
+    this.stopLoop();
+    this.startLoop();
+  }
+
   render(clip: Clip) {
     const gl = this.gl;
     if (!gl || !this.program) return;
-    if (this.video.readyState < 2) return;
+    if (!this.video) return;
+    if (this.video instanceof HTMLVideoElement && this.video.readyState < 2) return;
+    if (this.video instanceof HTMLImageElement && !this.video.complete) return;
 
     // 判断当前 clip 是否需要滤镜处理
-    const hasColor = (clip.brightness ?? 0) !== 0 || (clip.contrast ?? 0) !== 0 || (clip.saturation ?? 0) !== 0;
+    const hasColor = (clip.brightness ?? 0) !== 0 || (clip.contrast ?? 0) !== 0 || (clip.saturation ?? 0) !== 0
+      || (clip.temperature ?? 0) !== 0 || (clip.tint ?? 0) !== 0;
     const hasLut = clip.filter && clip.filter !== "none" && this.currentLutName === clip.filter;
     const needsRender = hasColor || hasLut;
 
@@ -176,8 +264,8 @@ export class FilterRenderer {
     }
     this.canvas.style.display = "block";
 
-    const w = this.video.videoWidth;
-    const h = this.video.videoHeight;
+    const w = this.video instanceof HTMLVideoElement ? this.video.videoWidth : this.video.naturalWidth;
+    const h = this.video instanceof HTMLVideoElement ? this.video.videoHeight : this.video.naturalHeight;
     if (w === 0 || h === 0) return;
     if (this.canvas.width !== w) this.canvas.width = w;
     if (this.canvas.height !== h) this.canvas.height = h;
@@ -191,7 +279,10 @@ export class FilterRenderer {
     gl.bindTexture(gl.TEXTURE_2D, this.videoTexture);
     try {
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.video);
-    } catch { return; }
+    } catch (error) {
+      console.warn("FilterRenderer failed to upload media texture", error);
+      return;
+    }
     gl.uniform1i(gl.getUniformLocation(this.program, "u_image"), 0);
 
     gl.activeTexture(gl.TEXTURE1);
@@ -201,18 +292,23 @@ export class FilterRenderer {
     const brightness = (clip.brightness ?? 0) / 100;
     const contrast = 1 + (clip.contrast ?? 0) / 100;
     const saturation = 1 + (clip.saturation ?? 0) / 100;
+    const temperature = (clip.temperature ?? 0) / 100;
+    const tint = (clip.tint ?? 0) / 100;
     gl.uniform1f(gl.getUniformLocation(this.program, "u_lutSize"), this.lutSize);
     gl.uniform1f(gl.getUniformLocation(this.program, "u_brightness"), brightness);
     gl.uniform1f(gl.getUniformLocation(this.program, "u_contrast"), contrast);
     gl.uniform1f(gl.getUniformLocation(this.program, "u_saturation"), saturation);
+    gl.uniform1f(gl.getUniformLocation(this.program, "u_temperature"), temperature);
+    gl.uniform1f(gl.getUniformLocation(this.program, "u_tint"), tint);
     gl.uniform1i(gl.getUniformLocation(this.program, "u_useLut"), hasLut ? 1 : 0);
 
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 
-  dispose() {
-    if (this.gl) {
-      if (this.videoTexture) this.gl.deleteTexture(this.videoTexture);
+ dispose() {
+   if (this.gl) {
+      this.stopLoop();
+     if (this.videoTexture) this.gl.deleteTexture(this.videoTexture);
       if (this.lutTexture) this.gl.deleteTexture(this.lutTexture);
       if (this.program) this.gl.deleteProgram(this.program);
     }

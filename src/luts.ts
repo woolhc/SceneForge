@@ -62,17 +62,25 @@ export function parseCubeData(cubeText: string, size = 33): Uint8Array {
  */
 export async function getLutData(lutId: string): Promise<Uint8Array | null> {
   if (lutCache.has(lutId)) return lutCache.get(lutId)!;
+  let lastError: unknown = null;
   try {
-    // 通过 Tauri invoke 读取 .cube 文件内容
     const { invoke } = await import("@tauri-apps/api/core");
-    const isTauri = "__TAURI_INTERNALS__" in window;
-    if (!isTauri) return null;
-
     const content = await invoke<string>("read_lut_file", { name: lutId });
     const data = parseCubeData(content);
     lutCache.set(lutId, data);
     return data;
-  } catch {
+  } catch (error) {
+    lastError = error;
+  }
+
+  try {
+    const response = await fetch(`/luts/${lutId}.cube`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = parseCubeData(await response.text());
+    lutCache.set(lutId, data);
+    return data;
+  } catch (error) {
+    console.warn("LUT load failed", { lutId, tauriError: lastError, fetchError: error });
     return null;
   }
 }

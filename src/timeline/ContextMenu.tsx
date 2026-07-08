@@ -25,7 +25,6 @@ export function ContextMenu({
     onSeparateVocals: () => void;
     onMute: () => void;
     onReverse: () => void;
-    onEnableToggle: () => void;
     onAddSubtitle: () => void;
     onEditText?: () => void;
   };

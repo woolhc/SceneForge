@@ -1,6 +1,6 @@
-import { ArrowDown, ArrowUp, Clock3, Image as ImageIcon, Lock, Mic2, MicOff, Unlock, Video } from "lucide-react";
+import { ArrowDown, ArrowUp, Clock3, Eye, EyeOff, Image as ImageIcon, Lock, Mic2, MicOff, SlidersHorizontal, Trash2, Unlock, Video } from "lucide-react";
 import React, { useEffect, useRef, useState } from "react";
-import type { Clip, MediaSource, Track } from "../types";
+import type { Clip, ClipKeyframes, Keyframe, MediaSource, Track } from "../types";
 import { desktopApi } from "../tauri";
 import { usePlaybackStore } from "../store/playbackStore";
 import {
@@ -22,12 +22,17 @@ function TimelineTrackInner({
   onSelectClip,
   onClipDrag,
   onClipCommit,
+  onBoxSelect,
   onDropAsset,
   onContextMenu,
   onToggleMute,
   onToggleLock,
+  onToggleHidden,
   onMoveUp,
   onMoveDown,
+  onDeleteTrack,
+  onKeyframeClick,
+  onEditSubtitleStyle,
 }: {
   track: Track;
   clips: Clip[];
@@ -38,19 +43,31 @@ function TimelineTrackInner({
   selectedClipId: string | null;
   selectedClipIds?: string[];
   locked: boolean;
-  onSelectClip: (id: string, additive: boolean) => void;
+  onSelectClip: (id: string, additive: boolean, range?: boolean) => void;
   onClipDrag: (clipId: string, patch: Partial<Clip>, commit: boolean) => void;
   onClipCommit: (clipId: string) => void;
+  onBoxSelect: (ids: string[], additive: boolean) => void;
   onDropAsset: (trackId: string, assetId: string, startOnTrack: number) => void;
   onContextMenu: (clip: Clip, trackKind: string, x: number, y: number) => void;
   onToggleMute: (trackId: string) => void;
   onToggleLock: (trackId: string) => void;
+  onToggleHidden?: (trackId: string) => void;
   onMoveUp: (trackId: string) => void;
   onMoveDown: (trackId: string) => void;
+  onDeleteTrack?: (trackId: string) => void;
+  onKeyframeClick?: (clipId: string, prop: keyof ClipKeyframes, time: number) => void;
+  onEditSubtitleStyle?: (trackId: string) => void;
 }) {
   const dragRef = useRef<DragState | null>(null);
+  const boxRef = useRef<{
+    pointerId: number;
+    startX: number;
+    currentX: number;
+    additive: boolean;
+  } | null>(null);
   const pxPerSecond = totalDuration > 0 ? timelineWidth / totalDuration : 1;
   const [dragOver, setDragOver] = useState(false);
+  const [boxSelection, setBoxSelection] = useState<{ left: number; width: number } | null>(null);
 
   function startDrag(
     event: React.PointerEvent<HTMLDivElement>,
@@ -60,7 +77,7 @@ function TimelineTrackInner({
     if (locked) return;
     event.stopPropagation();
     event.preventDefault();
-    onSelectClip(clip.id, event.metaKey || event.ctrlKey);
+    onSelectClip(clip.id, event.metaKey || event.ctrlKey, event.shiftKey);
     const peers = clips.filter((c) => c.id !== clip.id);
     dragRef.current = {
       clipId: clip.id,
@@ -105,6 +122,56 @@ function TimelineTrackInner({
     dragRef.current = null;
   }
 
+  function timeFromClientX(clientX: number, element: HTMLDivElement): number {
+    const rect = element.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    return ratio * totalDuration;
+  }
+
+  function startBoxSelect(event: React.PointerEvent<HTMLDivElement>) {
+    if (locked || event.button !== 0 || event.target !== event.currentTarget) return;
+    event.preventDefault();
+    const rect = event.currentTarget.getBoundingClientRect();
+    boxRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      currentX: event.clientX,
+      additive: event.metaKey || event.ctrlKey || event.shiftKey,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setBoxSelection({
+      left: Math.max(0, event.clientX - rect.left),
+      width: 0,
+    });
+  }
+
+  function moveBoxSelect(event: React.PointerEvent<HTMLDivElement>) {
+    const box = boxRef.current;
+    if (!box || box.pointerId !== event.pointerId) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    box.currentX = event.clientX;
+    const x0 = Math.max(0, Math.min(box.startX - rect.left, rect.width));
+    const x1 = Math.max(0, Math.min(event.clientX - rect.left, rect.width));
+    setBoxSelection({
+      left: Math.min(x0, x1),
+      width: Math.abs(x1 - x0),
+    });
+  }
+
+  function endBoxSelect(event: React.PointerEvent<HTMLDivElement>) {
+    const box = boxRef.current;
+    if (!box || box.pointerId !== event.pointerId) return;
+    event.currentTarget.releasePointerCapture(event.pointerId);
+    const start = timeFromClientX(Math.min(box.startX, box.currentX), event.currentTarget);
+    const end = timeFromClientX(Math.max(box.startX, box.currentX), event.currentTarget);
+    const ids = clips
+      .filter((clip) => clip.startOnTrack < end && clip.startOnTrack + clip.duration > start)
+      .map((clip) => clip.id);
+    onBoxSelect(ids, box.additive);
+    boxRef.current = null;
+    setBoxSelection(null);
+  }
+
   /** 素材库拖拽放置：按轨道类型判断是否接受该素材 */
   function isAssetAcceptable(assetId: string): boolean {
     const asset = media.find((m) => m.id === assetId);
@@ -147,11 +214,17 @@ function TimelineTrackInner({
 
   return (
     <div
-      className={`track track-${track.kind} ${dragOver ? "drag-over" : ""}`}
+      className={`track track-${track.kind} ${dragOver ? "drag-over" : ""} ${track.hidden ? "track-hidden" : ""}`}
+      style={{ height: track.height && track.height > 0 ? `${track.height}px` : undefined }}
+      onPointerDown={startBoxSelect}
+      onPointerMove={moveBoxSelect}
+      onPointerUp={endBoxSelect}
+      onPointerCancel={endBoxSelect}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
+      {boxSelection && <div className="track-selection-box" style={{ left: boxSelection.left, width: boxSelection.width }} />}
       <span className="track-label">
         {track.kind === "video" ? <Video size={15} /> : track.kind === "image" ? <ImageIcon size={15} /> : track.kind === "voiceover" ? <Mic2 size={15} /> : null}
         <span className="track-name">{track.name}</span>
@@ -162,6 +235,24 @@ function TimelineTrackInner({
         >
           {track.muted ? <MicOff size={12} /> : <Mic2 size={12} />}
         </button>
+        {onEditSubtitleStyle && track.kind === "subtitle" && (
+          <button
+            className="track-ctrl"
+            title="统一调整本轨字幕样式"
+            onClick={(e) => { e.stopPropagation(); onEditSubtitleStyle(track.id); }}
+          >
+            <SlidersHorizontal size={12} />
+          </button>
+        )}
+        {onToggleHidden && (
+          <button
+            className={`track-ctrl ${track.hidden ? "active" : ""}`}
+            title={track.hidden ? "显示轨道" : "隐藏轨道"}
+            onClick={(e) => { e.stopPropagation(); onToggleHidden(track.id); }}
+          >
+            {track.hidden ? <EyeOff size={12} /> : <Eye size={12} />}
+          </button>
+        )}
         <button
           className={`track-ctrl ${track.locked ? "active" : ""}`}
           title={track.locked ? "解锁" : "锁定"}
@@ -183,6 +274,21 @@ function TimelineTrackInner({
         >
           <ArrowDown size={12} />
         </button>
+        {onDeleteTrack && (
+          <button
+            className="track-ctrl danger"
+            title="删除轨道"
+            onClick={(e) => {
+              e.stopPropagation();
+              if (clips.length > 0) {
+                if (!confirm(`该轨道有 ${clips.length} 个片段，删除轨道会一并删除，确认？`)) return;
+              }
+              onDeleteTrack(track.id);
+            }}
+          >
+            <Trash2 size={12} />
+          </button>
+        )}
       </span>
       {clips.map((clip) => {
         const leftPct = totalDuration > 0 ? (clip.startOnTrack / totalDuration) * 100 : 0;
@@ -194,6 +300,7 @@ function TimelineTrackInner({
         const isVideoKind = track.kind === "video" || track.kind === "image";
         const showFilmstrip = isVideoKind && source && source.kind === "video" && clipWidthPx > 60;
         const showHandles = true;
+        const markers = keyframeMarkers(clip);
         return (
           <div
             key={clip.id}
@@ -212,7 +319,7 @@ function TimelineTrackInner({
             onContextMenu={(e) => {
               e.preventDefault();
               e.stopPropagation();
-              onSelectClip(clip.id, e.metaKey || e.ctrlKey);
+              onSelectClip(clip.id, e.metaKey || e.ctrlKey, e.shiftKey);
               onContextMenu(clip, track.kind, e.clientX, e.clientY);
             }}
           >
@@ -237,6 +344,19 @@ function TimelineTrackInner({
                 <em className="speed-badge">{clip.speed}x</em>
               )}
             </small>
+            {markers.map((m, index) => (
+              <span
+                key={`${m.prop}-${m.kfIndex}-${index}`}
+                className="clip-keyframe-marker"
+                style={{ left: `${m.left}%` }}
+                onPointerDown={(e) => {
+                  e.stopPropagation();
+                  e.preventDefault();
+                  onKeyframeClick?.(clip.id, m.prop, m.time);
+                }}
+                title={`${KEYFRAME_PROP_LABELS[m.prop]} @ ${m.time.toFixed(2)}s`}
+              />
+            ))}
             {/* 音频/配音轨显示波形 */}
             {(track.kind === "audio" || track.kind === "voiceover") && source?.localPath && (
               <WaveformCanvas
@@ -375,22 +495,41 @@ function Filmstrip({
 }) {
   // 按像素宽度决定取几帧（每帧约 80px）
   const count = Math.max(2, Math.min(8, Math.ceil(clipWidthPx / 80)));
-  const localPath = source.localPath || "";
+  const localPath = source.proxyPath || source.localPath || "";
   const cacheKey = `${localPath}|${sourceIn.toFixed(1)}-${sourceOut.toFixed(1)}|${count}`;
-  const [frames, setFrames] = useState<string[] | null>(filmstripCache.get(cacheKey) ?? null);
+  const cachedFrames = filmstripCache.get(cacheKey) ?? null;
+  const [frameState, setFrameState] = useState<{ key: string; frames: string[] } | null>(
+    cachedFrames ? { key: cacheKey, frames: cachedFrames } : null,
+  );
+  const frames = frameState?.key === cacheKey ? frameState.frames : null;
 
   useEffect(() => {
-    if (!localPath || frames) return;
+    if (!localPath) {
+      setFrameState(null);
+      return;
+    }
+    if (frameState?.key === cacheKey) return;
+    const cached = filmstripCache.get(cacheKey);
+    if (cached) {
+      setFrameState({ key: cacheKey, frames: cached });
+      return;
+    }
+    setFrameState(null);
     let cancelled = false;
-    void desktopApi.generateFilmstrip(localPath, sourceIn, sourceOut, count).then((paths) => {
-      if (cancelled || paths.length === 0) return;
-      const urls = paths.map((p) => desktopApi.mediaSrc(p) ?? "").filter(Boolean);
-      if (urls.length > 0) {
-        filmstripCache.set(cacheKey, urls);
-        setFrames(urls);
-      }
-    }).catch(() => { /* 静默失败，保持单张缩略图 */ });
-    return () => { cancelled = true; };
+    const timeout = window.setTimeout(() => {
+      void desktopApi.generateFilmstrip(localPath, sourceIn, sourceOut, count).then((paths) => {
+        if (cancelled || paths.length === 0) return;
+        const urls = paths.map((p) => desktopApi.mediaSrc(p) ?? "").filter(Boolean);
+        if (urls.length > 0) {
+          filmstripCache.set(cacheKey, urls);
+          setFrameState({ key: cacheKey, frames: urls });
+        }
+      }).catch(() => { /* 静默失败，保持单张缩略图 */ });
+    }, 300);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cacheKey]);
 
@@ -420,6 +559,41 @@ function Filmstrip({
       }}
     />
   );
+}
+
+type KeyframeMarkerInfo = {
+  left: number;
+  prop: keyof ClipKeyframes;
+  time: number;
+  kfIndex: number;
+};
+
+const KEYFRAME_PROP_LABELS: Record<keyof ClipKeyframes, string> = {
+  x: "X 位置",
+  y: "Y 位置",
+  scale: "缩放",
+  opacity: "不透明度",
+  rotation: "旋转",
+  volume: "音量",
+};
+
+function keyframeMarkers(clip: Clip): KeyframeMarkerInfo[] {
+  const keyframes = clip.keyframes;
+  if (!keyframes) return [];
+  const out: KeyframeMarkerInfo[] = [];
+  (Object.keys(keyframes) as (keyof ClipKeyframes)[]).forEach((prop) => {
+    const frames: Keyframe[] | undefined = keyframes[prop];
+    if (!frames) return;
+    frames.forEach((frame, kfIndex) => {
+      out.push({
+        left: Math.max(0, Math.min(100, (frame.time / Math.max(clip.duration, 0.001)) * 100)),
+        prop,
+        time: frame.time,
+        kfIndex,
+      });
+    });
+  });
+  return out;
 }
 
 // T2.2: memo 化，props 不变时不重渲染（播放头已从 store 读，不再触发）

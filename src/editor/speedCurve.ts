@@ -90,3 +90,57 @@ export function curveTimelineDuration(curve: SpeedPoint[], sourceDuration: numbe
   if (segs.length === 0) return sourceDuration;
   return segs.reduce((sum, seg) => sum + (seg.sourceOut - seg.sourceIn) / seg.speed, 0);
 }
+
+/** 把时间线内的相对时间映射到源素材相对时间（秒）。 */
+export function timelineToSourceTime(curve: SpeedPoint[], sourceDuration: number, relTime: number): number {
+  const segs = curveToSegments(curve, sourceDuration);
+  if (segs.length === 0) return Math.max(0, relTime);
+  let remaining = Math.max(0, relTime);
+  for (const seg of segs) {
+    const sourceSpan = seg.sourceOut - seg.sourceIn;
+    const timelineSpan = sourceSpan / seg.speed;
+    if (remaining <= timelineSpan) {
+      return seg.sourceIn + remaining * seg.speed;
+    }
+    remaining -= timelineSpan;
+  }
+  return segs[segs.length - 1].sourceOut;
+}
+
+/** 查询曲线在时间线相对时间处的播放倍速。 */
+export function speedAtTimelineTime(curve: SpeedPoint[], sourceDuration: number, relTime: number): number {
+  const segs = curveToSegments(curve, sourceDuration);
+  if (segs.length === 0) return 1;
+  let remaining = Math.max(0, relTime);
+  for (const seg of segs) {
+    const timelineSpan = (seg.sourceOut - seg.sourceIn) / seg.speed;
+    if (remaining <= timelineSpan) return seg.speed;
+    remaining -= timelineSpan;
+  }
+  return segs[segs.length - 1].speed;
+}
+
+/** 在曲线上添加/覆盖一个控制点（同 time ±tol 的旧点被移除）。返回新数组。 */
+export function addSpeedPoint(curve: SpeedPoint[] | null | undefined, point: SpeedPoint, tol = 0.02): SpeedPoint[] {
+  const arr = (curve ?? []).filter((p) => Math.abs(p.time - point.time) > tol);
+  arr.push({ ...point });
+  arr.sort((a, b) => a.time - b.time);
+  return arr;
+}
+
+/** 删除指定 time（±tol）的控制点。返回新数组。 */
+export function removeSpeedPointAt(curve: SpeedPoint[] | null | undefined, time: number, tol = 0.02): SpeedPoint[] {
+  return (curve ?? []).filter((p) => Math.abs(p.time - time) > tol);
+}
+
+/** 修改指定 time（±tol）控制点的属性。返回新数组。 */
+export function updateSpeedPoint(
+  curve: SpeedPoint[] | null | undefined,
+  time: number,
+  next: Partial<SpeedPoint>,
+  tol = 0.02,
+): SpeedPoint[] {
+  return (curve ?? [])
+    .map((p) => (Math.abs(p.time - time) <= tol ? { ...p, ...next } : p))
+    .sort((a, b) => a.time - b.time);
+}

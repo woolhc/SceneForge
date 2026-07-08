@@ -79,6 +79,7 @@ export function MediaLibrary({
         )}
         {media.map((asset) => {
           const thumb = desktopApi.mediaSrc(asset.thumbnailUrl || asset.localPath || null);
+          const targetLabel = asset.kind === "image" ? "图片轨" : asset.kind === "audio" ? "音频轨" : "视频轨";
           return (
             <div
               key={asset.id}
@@ -92,7 +93,7 @@ export function MediaLibrary({
               }}
               onMouseEnter={() => onPreview(asset)}
               onMouseLeave={() => onPreview(null)}
-              title={`${asset.title} · 悬停预览 / 点击加视频轨 / 拖到任意轨道`}
+              title={`${asset.title} · 悬停预览 / 点击加${targetLabel} / 拖到兼容轨道`}
               onClick={() => onAddToTimeline(asset)}
               onKeyDown={(event) => {
                 if (event.key === "Enter" || event.key === " ") {
@@ -112,6 +113,8 @@ export function MediaLibrary({
               <small>
                 {asset.width > 0 ? `${asset.width}x${asset.height} · ` : ""}
                 {asset.kind === "image" ? "图片" : `${asset.duration.toFixed(1)}s`} · {asset.source === "local" ? "本地" : asset.source === "tts" ? "配音" : "Pexels"}
+                {asset.kind === "video" && asset.proxyStatus === "ready" ? " · 代理" : ""}
+                {asset.kind === "video" && asset.proxyStatus === "failed" ? " · 代理失败" : ""}
               </small>
             </div>
           );
@@ -120,4 +123,3 @@ export function MediaLibrary({
     </div>
   );
 }
-

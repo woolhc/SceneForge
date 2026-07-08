@@ -5,15 +5,15 @@ use tauri::{Emitter, State};
 use crate::ai;
 use crate::asr;
 use crate::ffmpeg;
-use crate::pexels;
 use crate::models::{
-    AppInfo, AppSettings, CacheAssetRequest, Clip, CreateProjectRequest,
-    CreateVoiceProfileRequest, FfmpegStatus, FilmstripRequest, GenerateAudioRequest,
-    ImportMediaRequest, ImportVoiceProfileRequest, MediaSource, PexelsSearchRequest, Project,
-    ProjectSummary, RenderProjectRequest, ReplaceVoiceSampleRequest, RenderResult,
-    SegmentScriptRequest, SegmentScriptResult, SubtitleCue, ThumbnailRequest, Track, TrackKind,
-    UpdateVoiceProfileRequest, VoicePreviewRequest, VoicePreviewResult, VoiceProfile,
+    AppInfo, AppSettings, CacheAssetRequest, Clip, CreateProjectRequest, CreateVoiceProfileRequest,
+    FfmpegStatus, FilmstripRequest, GenerateAudioRequest, ImportMediaRequest,
+    ImportVoiceProfileRequest, MediaSource, PexelsSearchRequest, Project, ProjectSummary,
+    RenderProjectRequest, RenderResult, ReplaceVoiceSampleRequest, SegmentScriptRequest,
+    SegmentScriptResult, ThumbnailRequest, Track, TrackKind, UpdateVoiceProfileRequest,
+    VoicePreviewRequest, VoicePreviewResult, VoiceProfile,
 };
+use crate::pexels;
 use crate::storage;
 use crate::storage::AppState;
 use crate::tts;
@@ -29,7 +29,9 @@ pub async fn generate_waveform(
     request: ThumbnailRequest,
 ) -> Result<Vec<(f32, f32)>, String> {
     let path = PathBuf::from(&request.source_path);
-    let peaks = ffmpeg::generate_waveform(&path, 200).await.map_err(map_error)?;
+    let peaks = ffmpeg::generate_waveform(&path, 200)
+        .await
+        .map_err(map_error)?;
     Ok(peaks)
 }
 
@@ -68,9 +70,10 @@ pub fn reveal_path(path: String) -> Result<(), String> {
 #[tauri::command]
 pub fn read_lut_file(name: String) -> Result<String, String> {
     // 优先从 exe 同目录的 luts/ 读，回退到编译时 include 的默认
-    let lut_path = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|p| p.join("luts").join(format!("{name}.cube"))));
+    let lut_path = std::env::current_exe().ok().and_then(|exe| {
+        exe.parent()
+            .map(|p| p.join("luts").join(format!("{name}.cube")))
+    });
 
     if let Some(ref path) = lut_path {
         if path.exists() {
@@ -190,6 +193,8 @@ pub fn add_track(
         order: next_order,
         muted: false,
         locked: false,
+        hidden: false,
+        height: 0,
     });
     let saved = storage::save_project(&tx, &project).map_err(map_error)?;
     tx.commit().map_err(map_error)?;
@@ -281,7 +286,9 @@ pub async fn segment_script(
         let conn = state.db.lock().map_err(map_error)?;
         storage::load_settings(&conn).map_err(map_error)?
     };
-    ai::segment_script(&settings, request).await.map_err(map_error)
+    ai::segment_script(&settings, request)
+        .await
+        .map_err(map_error)
 }
 
 #[tauri::command]
@@ -293,7 +300,9 @@ pub async fn search_pexels_videos(
         let conn = state.db.lock().map_err(map_error)?;
         storage::load_settings(&conn).map_err(map_error)?
     };
-    pexels::search_videos(&settings, request).await.map_err(map_error)
+    pexels::search_videos(&settings, request)
+        .await
+        .map_err(map_error)
 }
 
 /// 搜索 Pexels 图片（图片复用视频轨，作为静态画面）
@@ -306,7 +315,9 @@ pub async fn search_pexels_photos(
         let conn = state.db.lock().map_err(map_error)?;
         storage::load_settings(&conn).map_err(map_error)?
     };
-    pexels::search_photos(&settings, request).await.map_err(map_error)
+    pexels::search_photos(&settings, request)
+        .await
+        .map_err(map_error)
 }
 
 /// 下载/缓存某个素材到 app 数据目录，更新 local_path 后返回。
@@ -320,6 +331,20 @@ pub async fn cache_asset_video(
         .map_err(map_error)?;
     let mut cached = request.asset;
     cached.local_path = Some(local_path.to_string_lossy().to_string());
+    if cached.kind == "video" {
+        match ffmpeg::generate_proxy_video(&state.paths.cache_dir, &local_path, &cached.id).await {
+            Ok((proxy, w, h)) => {
+                cached.proxy_path = Some(proxy.to_string_lossy().to_string());
+                cached.proxy_status = Some("ready".to_string());
+                cached.proxy_width = Some(w);
+                cached.proxy_height = Some(h);
+            }
+            Err(error) => {
+                eprintln!("代理视频生成失败（{}）：{error}", cached.id);
+                cached.proxy_status = Some("failed".to_string());
+            }
+        }
+    }
     Ok(cached)
 }
 
@@ -374,7 +399,7 @@ pub async fn generate_audio(
     let audio_dir = state.paths.projects_dir.join(&project.id).join("audio");
     // T1.10: 收集本次产物，await 后重读最新 project 定向合并（避免覆盖用户并发编辑）
     let mut generated_media: Vec<(String, MediaSource)> = Vec::new();
-    let mut generated_clip_updates: Vec<(String, f64)> = Vec::new();
+    let mut generated_clip_updates: Vec<(String, String, f64)> = Vec::new();
     for clip_id in voiceover_clips {
         let clip = project
             .clips
@@ -386,10 +411,16 @@ pub async fn generate_audio(
             continue;
         }
         let stem = sanitize_file_stem(&clip.id);
-        let (audio_path, real_duration) =
-            tts::synthesize_segment_audio(&settings, &state.paths.cache_dir, &audio_dir, &voice, &text, &stem)
-                .await
-                .map_err(|error| format!("片段「{}」配音失败：{}", clip_id, error))?;
+        let (audio_path, real_duration) = tts::synthesize_segment_audio(
+            &settings,
+            &state.paths.cache_dir,
+            &audio_dir,
+            &voice,
+            &text,
+            &stem,
+        )
+        .await
+        .map_err(|error| format!("片段「{}」配音失败：{}", clip_id, error))?;
 
         // 用真实时长对齐该 clip，并把同一 MediaSource（TTS 音频）登记到素材库
         let source_id = format!("tts-{}", clip_id);
@@ -399,6 +430,10 @@ pub async fn generate_audio(
             title: format!("配音 {}", clip_id),
             url: None,
             local_path: Some(audio_path.to_string_lossy().to_string()),
+            proxy_path: None,
+            proxy_status: Some("none".to_string()),
+            proxy_width: None,
+            proxy_height: None,
             thumbnail_url: None,
             width: 0,
             height: 0,
@@ -427,7 +462,7 @@ pub async fn generate_audio(
 
         // 记录本次产物，稍后合并到最新 project（避免覆盖用户并发编辑）
         generated_media.push((source_id.clone(), audio_source));
-        generated_clip_updates.push((clip_id.clone(), real_duration));
+        generated_clip_updates.push((clip_id.clone(), source_id.clone(), real_duration));
     }
 
     // T1.10 修复：重读最新 project（用户可能在 TTS 期间编辑过），定向合并本次产物
@@ -442,17 +477,12 @@ pub async fn generate_audio(
         }
     }
     // 合并 clip 更新（按 clip_id 定位；若用户已删除该 clip 则跳过）
-    for (clip_id, real_duration) in &generated_clip_updates {
+    for (clip_id, source_id, real_duration) in &generated_clip_updates {
         latest.clips.iter_mut().for_each(|c| {
             if c.id == *clip_id {
                 c.duration = real_duration.max(1.0);
                 c.source_out = real_duration.max(1.0);
-                // source_id 已在上面 media 合并时记录，这里补绑
-                for (sid, _) in &generated_media {
-                    if sid.contains(clip_id) {
-                        c.source_id = Some(sid.clone());
-                    }
-                }
+                c.source_id = Some(source_id.clone());
             }
         });
     }
@@ -476,7 +506,7 @@ pub async fn detach_audio(
     state: State<'_, AppState>,
     request: DetachAudioRequest,
 ) -> Result<Project, String> {
-    let mut project = {
+    let project = {
         let conn = state.db.lock().map_err(map_error)?;
         storage::get_project(&conn, &request.project_id).map_err(map_error)?
     };
@@ -517,30 +547,47 @@ pub async fn detach_audio(
         title: format!("音频 - {}", source.title),
         url: None,
         local_path: Some(audio_path.to_string_lossy().to_string()),
+        proxy_path: None,
+        proxy_status: Some("none".to_string()),
+        proxy_width: None,
+        proxy_height: None,
         thumbnail_url: None,
         width: 0,
         height: 0,
         duration,
         source: "extracted".to_string(),
     };
-    project.media.push(audio_source.clone());
+    let conn = state.db.lock().map_err(map_error)?;
+    let mut latest = storage::get_project(&conn, &request.project_id).map_err(map_error)?;
+    if !latest.clips.iter().any(|c| c.id == clip.id) {
+        return Ok(latest);
+    }
+    if let Some(idx) = latest.media.iter().position(|m| m.id == audio_source.id) {
+        latest.media[idx] = audio_source.clone();
+    } else {
+        latest.media.push(audio_source.clone());
+    }
 
-    // 找到或创建一个音频轨
-    let audio_track = project.tracks.iter().find(|t| t.kind == crate::models::TrackKind::Audio);
-    let audio_track_id = if let Some(t) = audio_track {
+    // 找到或创建一个音频轨（基于最新 project，避免覆盖并发编辑）
+    let audio_track_id = if let Some(t) = latest
+        .tracks
+        .iter()
+        .find(|t| t.kind == crate::models::TrackKind::Audio)
+    {
         t.id.clone()
     } else {
-        // 创建音频轨
         let new_track = Track {
             id: format!("track_audio_{}", uuid::Uuid::new_v4()),
             kind: crate::models::TrackKind::Audio,
             name: "音频".to_string(),
-            order: project.tracks.iter().map(|t| t.order).max().unwrap_or(0) + 1,
+            order: latest.tracks.iter().map(|t| t.order).max().unwrap_or(0) + 1,
             muted: false,
             locked: false,
+        hidden: false,
+        height: 0,
         };
         let tid = new_track.id.clone();
-        project.tracks.push(new_track);
+        latest.tracks.push(new_track);
         tid
     };
 
@@ -558,10 +605,13 @@ pub async fn detach_audio(
         volume: 1.0,
         fade_in: clip.fade_in,
         fade_out: clip.fade_out,
+        noise_reduction: 0.0,
         filter: None,
         brightness: 0.0,
         contrast: 0.0,
         saturation: 0.0,
+        temperature: 0.0,
+        tint: 0.0,
         transform: None,
         visual_query: None,
         text: None,
@@ -572,18 +622,23 @@ pub async fn detach_audio(
         transition_out: None,
         keyframes: None,
         mask: None,
+        visual_effects: None,
+        reverse: false,
     };
-    project.clips.push(audio_clip);
+    if let Some(idx) = latest.clips.iter().position(|c| c.id == audio_clip.id) {
+        latest.clips[idx] = audio_clip;
+    } else {
+        latest.clips.push(audio_clip);
+    }
 
     // 原视频 clip 静音
-    for c in project.clips.iter_mut() {
+    for c in latest.clips.iter_mut() {
         if c.id == clip.id {
             c.volume = 0.0;
         }
     }
 
-    let conn = state.db.lock().map_err(map_error)?;
-    storage::save_project(&conn, &project).map_err(map_error)
+    storage::save_project(&conn, &latest).map_err(map_error)
 }
 
 /// 分离人声：把视频 clip 的音频分离为人声轨 + 伴奏轨
@@ -592,25 +647,38 @@ pub async fn separate_vocals(
     state: State<'_, AppState>,
     request: DetachAudioRequest,
 ) -> Result<Project, String> {
-    let mut project = {
+    let project = {
         let conn = state.db.lock().map_err(map_error)?;
         storage::get_project(&conn, &request.project_id).map_err(map_error)?
     };
 
-    let clip = project.clips.iter().find(|c| c.id == request.clip_id)
-        .ok_or_else(|| "找不到片段".to_string())?.clone();
+    let clip = project
+        .clips
+        .iter()
+        .find(|c| c.id == request.clip_id)
+        .ok_or_else(|| "找不到片段".to_string())?
+        .clone();
 
-    let source = clip.source_id.as_ref()
+    let source = clip
+        .source_id
+        .as_ref()
         .and_then(|sid| project.media.iter().find(|m| m.id == *sid))
         .ok_or_else(|| "片段没有素材".to_string())?;
 
-    let media_path = ffmpeg::ensure_media_local(&state.paths.cache_dir, source).await.map_err(map_error)?;
+    let media_path = ffmpeg::ensure_media_local(&state.paths.cache_dir, source)
+        .await
+        .map_err(map_error)?;
 
     // 先提取纯音频
-    let audio_path = ffmpeg::extract_audio_from_video(&state.paths.cache_dir, &media_path).await.map_err(map_error)?;
+    let audio_path = ffmpeg::extract_audio_from_video(&state.paths.cache_dir, &media_path)
+        .await
+        .map_err(map_error)?;
 
     // 分离人声
-    let (vocals_path, instrumental_path) = ffmpeg::separate_vocals(&state.paths.cache_dir, &audio_path).await.map_err(map_error)?;
+    let (vocals_path, instrumental_path) =
+        ffmpeg::separate_vocals(&state.paths.cache_dir, &audio_path)
+            .await
+            .map_err(map_error)?;
 
     // 创建两个 MediaSource
     let vocals_source = MediaSource {
@@ -619,7 +687,13 @@ pub async fn separate_vocals(
         title: format!("人声 - {}", source.title),
         url: None,
         local_path: Some(vocals_path.to_string_lossy().to_string()),
-        thumbnail_url: None, width: 0, height: 0,
+        proxy_path: None,
+        proxy_status: Some("none".to_string()),
+        proxy_width: None,
+        proxy_height: None,
+        thumbnail_url: None,
+        width: 0,
+        height: 0,
         duration: clip.duration,
         source: "vocals".to_string(),
     };
@@ -629,33 +703,58 @@ pub async fn separate_vocals(
         title: format!("伴奏 - {}", source.title),
         url: None,
         local_path: Some(instrumental_path.to_string_lossy().to_string()),
-        thumbnail_url: None, width: 0, height: 0,
+        proxy_path: None,
+        proxy_status: Some("none".to_string()),
+        proxy_width: None,
+        proxy_height: None,
+        thumbnail_url: None,
+        width: 0,
+        height: 0,
         duration: clip.duration,
         source: "instrumental".to_string(),
     };
-    project.media.push(vocals_source.clone());
-    project.media.push(inst_source.clone());
-
-    // 找到或创建音频轨
-    let audio_track_id = {
-        if let Some(t) = project.tracks.iter().find(|t| t.kind == crate::models::TrackKind::Audio) {
-            t.id.clone()
+    let conn = state.db.lock().map_err(map_error)?;
+    let mut latest = storage::get_project(&conn, &request.project_id).map_err(map_error)?;
+    if !latest.clips.iter().any(|c| c.id == clip.id) {
+        return Ok(latest);
+    }
+    for source in [&vocals_source, &inst_source] {
+        if let Some(idx) = latest.media.iter().position(|m| m.id == source.id) {
+            latest.media[idx] = source.clone();
         } else {
-            let tid = format!("track_audio_{}", uuid::Uuid::new_v4());
-            project.tracks.push(Track {
-                id: tid.clone(),
-                kind: crate::models::TrackKind::Audio,
-                name: "音频".to_string(),
-                order: project.tracks.iter().map(|t| t.order).max().unwrap_or(0) + 1,
-                muted: false, locked: false,
-            });
-            tid
+            latest.media.push(source.clone());
         }
+    }
+
+    // 找到或创建音频轨（基于最新 project，避免覆盖并发编辑）
+    let audio_track_id = if let Some(t) = latest
+        .tracks
+        .iter()
+        .find(|t| t.kind == crate::models::TrackKind::Audio)
+    {
+        t.id.clone()
+    } else {
+        let tid = format!("track_audio_{}", uuid::Uuid::new_v4());
+        latest.tracks.push(Track {
+            id: tid.clone(),
+            kind: crate::models::TrackKind::Audio,
+            name: "音频".to_string(),
+            order: latest.tracks.iter().map(|t| t.order).max().unwrap_or(0) + 1,
+            muted: false,
+            locked: false,
+        hidden: false,
+        height: 0,
+        });
+        tid
     };
 
     // 创建人声 clip + 伴奏 clip（和原视频对齐）
-    for (sid, name) in [(vocals_source.id.clone(), "人声"), (inst_source.id.clone(), "伴奏")] {
-        project.clips.push(Clip {
+    let mut new_clips = Vec::new();
+    for (sid, name) in [
+        (vocals_source.id.clone(), "人声"),
+        (inst_source.id.clone(), "伴奏"),
+    ] {
+        new_clips.push(Clip {
             id: format!("clip_{}_{}", name, uuid::Uuid::new_v4()),
             track_id: audio_track_id.clone(),
             source_id: Some(sid),
@@ -666,21 +765,39 @@ pub async fn separate_vocals(
             speed: clip.speed,
             speed_curve: None,
             volume: if name == "人声" { 1.0 } else { 0.5 }, // 伴奏默认半音量
-            fade_in: 0.0, fade_out: 0.0,
-            filter: None, brightness: 0.0, contrast: 0.0, saturation: 0.0,
-            transform: None, visual_query: None, text: None, subtitle_style: None, words: None, keyframes: None, mask: None,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            noise_reduction: 0.0,
+            filter: None,
+            brightness: 0.0,
+            contrast: 0.0,
+            saturation: 0.0,
+        temperature: 0.0,
+        tint: 0.0,
+            transform: None,
+            visual_query: None,
+            text: None,
+            subtitle_style: None,
+            words: None,
+            keyframes: None,
+            mask: None,
+        visual_effects: None,
+        reverse: false,
             transition_in: None,
-        crop: None, transition_out: None,
+            crop: None,
+            transition_out: None,
         });
     }
+    latest.clips.extend(new_clips);
 
     // 原视频静音
-    for c in project.clips.iter_mut() {
-        if c.id == clip.id { c.volume = 0.0; }
+    for c in latest.clips.iter_mut() {
+        if c.id == clip.id {
+            c.volume = 0.0;
+        }
     }
 
-    let conn = state.db.lock().map_err(map_error)?;
-    storage::save_project(&conn, &project).map_err(map_error)
+    storage::save_project(&conn, &latest).map_err(map_error)
 }
 
 // ============================================================================
@@ -711,7 +828,11 @@ pub async fn generate_subtitles(
     };
 
     // 找字幕轨，没有则自动创建
-    let subtitle_track_id = if let Some(t) = project.tracks.iter().find(|t| t.kind == TrackKind::Subtitle) {
+    let subtitle_track_id = if let Some(t) = project
+        .tracks
+        .iter()
+        .find(|t| t.kind == TrackKind::Subtitle)
+    {
         t.id.clone()
     } else {
         let tid = format!("track_subtitle_{}", uuid::Uuid::new_v4());
@@ -722,6 +843,8 @@ pub async fn generate_subtitles(
             order: project.tracks.iter().map(|t| t.order).min().unwrap_or(0),
             muted: false,
             locked: false,
+        hidden: false,
+        height: 0,
         });
         tid
     };
@@ -760,43 +883,45 @@ pub async fn generate_subtitles(
     ));
     let mut list_content = String::new();
     for clip in &audio_clips {
-        let source = clip.source_id.as_ref().and_then(|sid| {
-            project.media.iter().find(|m| m.id == *sid)
-        });
+        let source = clip
+            .source_id
+            .as_ref()
+            .and_then(|sid| project.media.iter().find(|m| m.id == *sid));
         if let Some(s) = source {
             if let Some(local) = &s.local_path {
-                list_content.push_str(&format!(
-                    "file '{}'\n",
-                    local.replace('\'', "'\\''")
-                ));
+                list_content.push_str(&format!("file '{}'\n", local.replace('\'', "'\\''")));
             }
         }
     }
     if list_content.is_empty() {
         return Err("配音音频文件不存在，请先生成配音".to_string());
     }
-    tokio::fs::write(&list_path, &list_content).await.map_err(map_error)?;
-    let merge_output = tokio::process::Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            &list_path.to_string_lossy(),
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            "-c:a",
-            "pcm_s16le",
-            &merged_path.to_string_lossy(),
-        ])
-        .output()
+    tokio::fs::write(&list_path, &list_content)
+        .await
+        .map_err(map_error)?;
+    let mut merge_cmd = tokio::process::Command::new("ffmpeg");
+    merge_cmd.args([
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        &list_path.to_string_lossy(),
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        "-c:a",
+        "pcm_s16le",
+        &merged_path.to_string_lossy(),
+    ]);
+    let merge_output = ffmpeg::run_with_timeout(&mut merge_cmd, 1800)
         .await
         .map_err(map_error)?;
     if !merge_output.status.success() {
+        let _ = tokio::fs::remove_file(&list_path).await;
+        let _ = tokio::fs::remove_file(&merged_path).await;
         return Err(format!(
             "合并配音音频失败：{}",
             String::from_utf8_lossy(&merge_output.stderr).trim()
@@ -812,10 +937,47 @@ pub async fn generate_subtitles(
     let refined = asr::refine_subtitles(&settings, &raw_cues, request.translate)
         .await
         .map_err(map_error)?;
+    let _ = tokio::fs::remove_file(&list_path).await;
+    let _ = tokio::fs::remove_file(&merged_path).await;
 
-    // 清空字幕轨现有 clip，用识别结果重建
-    project.clips.retain(|c| c.track_id != subtitle_track_id);
+    // T1.10 修复：ASR/AI 完成后重读最新 project，只定向替换字幕轨，避免覆盖用户并发编辑。
+    let conn = state.db.lock().map_err(map_error)?;
+    let mut latest = storage::get_project(&conn, &request.project_id).map_err(map_error)?;
+    let subtitle_track_id = if latest.tracks.iter().any(|t| t.id == subtitle_track_id) {
+        subtitle_track_id
+    } else if let Some(t) = latest.tracks.iter().find(|t| t.kind == TrackKind::Subtitle) {
+        t.id.clone()
+    } else {
+        let tid = format!("track_subtitle_{}", uuid::Uuid::new_v4());
+        latest.tracks.push(Track {
+            id: tid.clone(),
+            kind: TrackKind::Subtitle,
+            name: "字幕".to_string(),
+            order: latest.tracks.iter().map(|t| t.order).min().unwrap_or(0),
+            muted: false,
+            locked: false,
+        hidden: false,
+        height: 0,
+        });
+        tid
+    };
+    latest.clips.retain(|c| c.track_id != subtitle_track_id);
     let _ = &audio_dir; // 预留
+
+    // 建立合并音频偏移到时间轴偏移的映射（修复字幕时间戳错位）
+    // 合并音频用 concat 拼接，丢弃了 clip 之间的间隙，whisper 时间戳是相对合并音频的
+    // 需要把 cue.start 映射回时间轴：找到 cue 所在的 clip，timeline_start = clip.start_on_track + (cue.start - clip 在合并音频中的偏移)
+    let mut clip_mappings: Vec<(f64, f64, f64)> = Vec::new(); // (merge_offset, clip_audio_duration, timeline_start)
+    let mut accumulated: f64 = 0.0;
+    for clip in &audio_clips {
+        let clip_audio_duration = (clip.source_out - clip.source_in).max(0.1);
+        clip_mappings.push((accumulated, clip_audio_duration, clip.start_on_track));
+        accumulated += clip_audio_duration;
+    }
+    // 单条配音从头开始且无间隙时，映射退化为恒等（cue.start == timeline_start）
+    let single_clip_aligned = audio_clips.len() == 1
+        && (audio_clips[0].start_on_track - 0.0).abs() < 0.01;
+
     for cue in &refined {
         let duration = (cue.end - cue.start).max(0.3);
         // 透传词级时间戳（非空时才存，避免空数组占用空间）
@@ -824,11 +986,30 @@ pub async fn generate_subtitles(
         } else {
             Some(cue.words.clone())
         };
-        project.clips.push(Clip {
+        // 把合并音频偏移映射回时间轴偏移
+        let timeline_start = if single_clip_aligned {
+            cue.start
+        } else {
+            let mut mapped = cue.start;
+            for (merge_offset, clip_dur, tl_start) in &clip_mappings {
+                if cue.start >= *merge_offset && cue.start < *merge_offset + *clip_dur {
+                    mapped = tl_start + (cue.start - merge_offset);
+                    break;
+                }
+            }
+            // 如果 cue.start 超出所有 clip 范围（尾部静音），用最后一个 clip 的末尾
+            if let Some((merge_offset, clip_dur, tl_start)) = clip_mappings.last() {
+                if cue.start >= *merge_offset + *clip_dur {
+                    mapped = tl_start + *clip_dur;
+                }
+            }
+            mapped
+        };
+        latest.clips.push(Clip {
             id: format!("sub-{}", uuid::Uuid::new_v4()),
             track_id: subtitle_track_id.clone(),
             source_id: None,
-            start_on_track: cue.start,
+            start_on_track: timeline_start,
             duration,
             source_in: 0.0,
             source_out: duration,
@@ -837,10 +1018,13 @@ pub async fn generate_subtitles(
             volume: 1.0,
             fade_in: 0.0,
             fade_out: 0.0,
+            noise_reduction: 0.0,
             filter: None,
             brightness: 0.0,
             contrast: 0.0,
             saturation: 0.0,
+        temperature: 0.0,
+        tint: 0.0,
             transform: None,
             visual_query: None,
             crop: None,
@@ -848,14 +1032,193 @@ pub async fn generate_subtitles(
             subtitle_style: None,
             words,
             keyframes: None,
-        mask: None,
+            mask: None,
+        visual_effects: None,
+        reverse: false,
             transition_in: None,
             transition_out: None,
         });
     }
 
+    storage::save_project(&conn, &latest).map_err(map_error)
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSrtRequest {
+    pub project_id: String,
+    pub srt_path: String,
+    /// 每条字幕相对 cue 时间戳的额外偏移（秒），用于手工对齐
+    #[serde(default)]
+    pub time_offset: f64,
+}
+
+/// 解析 SRT 时间戳 "00:00:01,500" 为秒
+fn parse_srt_time(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let h: f64 = parts[0].parse().ok()?;
+    let m: f64 = parts[1].parse().ok()?;
+    let sec_part = parts[2];
+    let (secs, millis) = if let Some(idx) = sec_part.find(|c| c == ',' || c == '.') {
+        let (a, b) = sec_part.split_at(idx);
+        (a.parse::<f64>().ok()?, &b[1..])
+    } else {
+        (sec_part.parse::<f64>().ok()?, "")
+    };
+    let ms: f64 = if millis.is_empty() {
+        0.0
+    } else if millis.len() >= 3 {
+        millis[..3].parse().ok()?
+    } else {
+        let v: f64 = millis.parse().ok()?;
+        v * 10f64.powi(3 - millis.len() as i32)
+    };
+    Some(h * 3600.0 + m * 60.0 + secs + ms / 1000.0)
+}
+
+/// 导入 SRT 字幕文件：解析 cue 时间戳 -> 生成字幕 clip 到字幕轨
+#[tauri::command]
+pub async fn import_srt(
+    state: State<'_, AppState>,
+    request: ImportSrtRequest,
+) -> Result<Project, String> {
+    let srt_path = PathBuf::from(&request.srt_path);
+    if !srt_path.is_file() {
+        return Err(format!("字幕文件不存在：{}", request.srt_path));
+    }
+    let content = tokio::fs::read_to_string(&srt_path)
+        .await
+        .map_err(map_error)?;
+
+    // 标准化换行：CRLF -> LF
+    let content = content.replace("\r\n", "\n").replace('\r', "\n");
+    // 按 blank line 分块（可能含空行）
+    let blocks: Vec<&str> = content.split("\n\n").collect();
+
+    #[derive(Debug)]
+    struct ParsedCue {
+        start: f64,
+        end: f64,
+        text: String,
+    }
+    let mut cues: Vec<ParsedCue> = Vec::new();
+    for block in blocks {
+        let block = block.trim();
+        if block.is_empty() {
+            continue;
+        }
+        let lines: Vec<&str> = block.split('\n').collect();
+        if lines.len() < 2 {
+            continue;
+        }
+        // 第 1 行可能是序号（数字），跳过；找带 "-->" 的行
+        let mut time_idx = 0;
+        for (i, l) in lines.iter().enumerate() {
+            if l.contains("-->") {
+                time_idx = i;
+                break;
+            }
+        }
+        let time_line = lines.get(time_idx).ok_or("SRT 时间行缺失")?;
+        let time_parts: Vec<&str> = time_line.split("-->").collect();
+        if time_parts.len() != 2 {
+            continue;
+        }
+        let start = match parse_srt_time(time_parts[0].trim()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let end_raw = time_parts[1].trim();
+        // 有些 SRT 在 end 时间后还有坐标/样式信息，只取第一个空白前部分
+        let end_str = end_raw.split_whitespace().next().unwrap_or(end_raw);
+        let end = match parse_srt_time(end_str) {
+            Some(v) => v,
+            None => continue,
+        };
+        if end <= start {
+            continue;
+        }
+        let text = lines[time_idx + 1..]
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.is_empty() {
+            continue;
+        }
+        cues.push(ParsedCue { start, end, text });
+    }
+    if cues.is_empty() {
+        return Err("SRT 文件未解析出任何字幕条目".to_string());
+    }
+
     let conn = state.db.lock().map_err(map_error)?;
-    storage::save_project(&conn, &project).map_err(map_error)
+    let mut latest = storage::get_project(&conn, &request.project_id).map_err(map_error)?;
+
+    // 找字幕轨，没有则创建
+    let subtitle_track_id = if let Some(t) = latest.tracks.iter().find(|t| t.kind == TrackKind::Subtitle) {
+        t.id.clone()
+    } else {
+        let tid = format!("track_subtitle_{}", uuid::Uuid::new_v4());
+        latest.tracks.push(Track {
+            id: tid.clone(),
+            kind: TrackKind::Subtitle,
+            name: "字幕".to_string(),
+            order: latest.tracks.iter().map(|t| t.order).min().unwrap_or(0),
+            muted: false,
+            locked: false,
+        hidden: false,
+        height: 0,
+        });
+        tid
+    };
+
+    // 移除该字幕轨现有 clips（可选：这里保留既有字幕，只追加）
+    let offset = request.time_offset.max(0.0);
+    for cue in cues {
+        let start_on_track = (cue.start + offset).max(0.0);
+        let duration = (cue.end - cue.start).max(0.2);
+        latest.clips.push(Clip {
+            id: format!("sub-{}", uuid::Uuid::new_v4()),
+            track_id: subtitle_track_id.clone(),
+            source_id: None,
+            start_on_track,
+            duration,
+            source_in: 0.0,
+            source_out: duration,
+            speed: 1.0,
+            speed_curve: None,
+            volume: 1.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            noise_reduction: 0.0,
+            filter: None,
+            brightness: 0.0,
+            contrast: 0.0,
+            saturation: 0.0,
+        temperature: 0.0,
+        tint: 0.0,
+            transform: None,
+            visual_query: None,
+            crop: None,
+            text: Some(cue.text.clone()),
+            subtitle_style: None,
+            words: None,
+            keyframes: None,
+            mask: None,
+        visual_effects: None,
+        reverse: false,
+            transition_in: None,
+            transition_out: None,
+        });
+    }
+
+    storage::save_project(&conn, &latest).map_err(map_error)
 }
 
 /// 导入本地文件：拷贝进 app 数据目录（绕过 assetProtocol scope 白名单），
@@ -892,10 +1255,40 @@ pub async fn import_media(
     let local_path = media_dir.join(format!("{id}.{ext}"));
     std::fs::copy(&source_path, &local_path).map_err(map_error)?;
 
-    let (kind, width, height, duration, thumbnail): (String, u32, u32, f64, Option<String>) = if is_image {
+    let (
+        kind,
+        width,
+        height,
+        duration,
+        thumbnail,
+        proxy_path,
+        proxy_status,
+        proxy_width,
+        proxy_height,
+    ): (
+        String,
+        u32,
+        u32,
+        f64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<u32>,
+        Option<u32>,
+    ) = if is_image {
         // 图片：读尺寸，无时长，缩略图就是图片本身
         let (w, h) = probe_image_dimensions(&local_path).await.unwrap_or((0, 0));
-        ("image".to_string(), w, h, 0.0, Some(local_path.to_string_lossy().to_string()))
+        (
+            "image".to_string(),
+            w,
+            h,
+            0.0,
+            Some(local_path.to_string_lossy().to_string()),
+            None,
+            Some("none".to_string()),
+            None,
+            None,
+        )
     } else {
         // 视频/音频：探测时长 + 分辨率 + 抽帧缩略图
         let duration = probe_media_duration(&local_path).await.unwrap_or(0.0);
@@ -909,7 +1302,33 @@ pub async fn import_media(
             None
         };
         let kind = infer_kind(&local_path, w, h);
-        (kind, w, h, duration, thumb)
+        let (proxy_path, proxy_status, proxy_width, proxy_height) = if kind == "video" {
+            match ffmpeg::generate_proxy_video(&state.paths.cache_dir, &local_path, &id).await {
+                Ok((proxy, pw, ph)) => (
+                    Some(proxy.to_string_lossy().to_string()),
+                    Some("ready".to_string()),
+                    Some(pw),
+                    Some(ph),
+                ),
+                Err(error) => {
+                    eprintln!("代理视频生成失败（{}）：{error}", id);
+                    (None, Some("failed".to_string()), None, None)
+                }
+            }
+        } else {
+            (None, Some("none".to_string()), None, None)
+        };
+        (
+            kind,
+            w,
+            h,
+            duration,
+            thumb,
+            proxy_path,
+            proxy_status,
+            proxy_width,
+            proxy_height,
+        )
     };
 
     Ok(MediaSource {
@@ -922,6 +1341,10 @@ pub async fn import_media(
             .to_string(),
         url: None,
         local_path: Some(local_path.to_string_lossy().to_string()),
+        proxy_path,
+        proxy_status,
+        proxy_width,
+        proxy_height,
         thumbnail_url: thumbnail,
         width,
         height,
@@ -959,7 +1382,10 @@ pub async fn generate_filmstrip(
     )
     .await
     .map_err(map_error)?;
-    Ok(paths.iter().map(|p| p.to_string_lossy().to_string()).collect())
+    Ok(paths
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect())
 }
 
 fn infer_kind(path: &std::path::Path, width: u32, height: u32) -> String {
@@ -983,20 +1409,19 @@ fn infer_kind(path: &std::path::Path, width: u32, height: u32) -> String {
 
 /// 读取图片的宽高（用 ffprobe）
 async fn probe_image_dimensions(path: &std::path::Path) -> anyhow::Result<(u32, u32)> {
-    let output = tokio::process::Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=width,height",
-            "-of",
-            "csv=s=x:p=0",
-            &path.to_string_lossy(),
-        ])
-        .output()
-        .await?;
+    let mut cmd = tokio::process::Command::new("ffprobe");
+    cmd.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "csv=s=x:p=0",
+        &path.to_string_lossy(),
+    ]);
+    let output = ffmpeg::run_with_timeout(&mut cmd, 30).await?;
     if !output.status.success() {
         anyhow::bail!("ffprobe 读图片尺寸失败");
     }
@@ -1005,22 +1430,28 @@ async fn probe_image_dimensions(path: &std::path::Path) -> anyhow::Result<(u32, 
     if parts.len() != 2 {
         anyhow::bail!("解析图片尺寸失败");
     }
-    Ok((parts[0].parse().unwrap_or(0), parts[1].parse().unwrap_or(0)))
+    // M20: 解析失败返回明确错误，不静默返回 0
+    let w: u32 = parts[0]
+        .parse()
+        .map_err(|_| anyhow::anyhow!("图片宽度解析失败: {}", parts[0]))?;
+    let h: u32 = parts[1]
+        .parse()
+        .map_err(|_| anyhow::anyhow!("图片高度解析失败: {}", parts[1]))?;
+    Ok((w, h))
 }
 
 async fn probe_media_duration(path: &std::path::Path) -> anyhow::Result<f64> {
-    let output = tokio::process::Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            &path.to_string_lossy(),
-        ])
-        .output()
-        .await?;
+    let mut cmd = tokio::process::Command::new("ffprobe");
+    cmd.args([
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        &path.to_string_lossy(),
+    ]);
+    let output = ffmpeg::run_with_timeout(&mut cmd, 30).await?;
     if !output.status.success() {
         anyhow::bail!("ffprobe 失败");
     }
@@ -1029,20 +1460,19 @@ async fn probe_media_duration(path: &std::path::Path) -> anyhow::Result<f64> {
 }
 
 async fn probe_video_resolution(path: &std::path::Path) -> anyhow::Result<(u32, u32)> {
-    let output = tokio::process::Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=width,height",
-            "-of",
-            "csv=s=x:p=0",
-            &path.to_string_lossy(),
-        ])
-        .output()
-        .await?;
+    let mut cmd = tokio::process::Command::new("ffprobe");
+    cmd.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "csv=s=x:p=0",
+        &path.to_string_lossy(),
+    ]);
+    let output = ffmpeg::run_with_timeout(&mut cmd, 30).await?;
     if !output.status.success() {
         anyhow::bail!("ffprobe 无视频流");
     }
@@ -1144,22 +1574,32 @@ pub async fn render_project(
         Err(_) => return Err("已有导出任务进行中，请等待完成或取消".to_string()),
     };
     // 重置取消标志
-    state.render_cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+    state
+        .render_cancel
+        .store(false, std::sync::atomic::Ordering::Relaxed);
 
     let project = {
         let conn = state.db.lock().map_err(map_error)?;
         storage::get_project(&conn, &request.project_id).map_err(map_error)?
     };
 
-    let _ = app_handle.emit("render-progress", serde_json::json!({ "progress": 0, "message": "准备渲染..." }));
+    let _ = app_handle.emit(
+        "render-progress",
+        serde_json::json!({ "progress": 0, "message": "准备渲染..." }),
+    );
 
     // T4.10: 仅导出音频模式 —— 跳过视频管线，直接混音输出 mp3/wav
     if project.render_config.export_mode == "audio-only" {
-        let _ = app_handle.emit("render-progress", serde_json::json!({ "progress": 30, "message": "正在混音导出..." }));
-        let audio_clips: Vec<&Clip> = project.clips.iter().collect();
+        let _ = app_handle.emit(
+            "render-progress",
+            serde_json::json!({ "progress": 30, "message": "正在混音导出..." }),
+        );
+        let audio_clips = ffmpeg::collect_mix_audio_clips(&project);
         // 决定输出路径
         let render_dir = state.paths.projects_dir.join(&project.id).join("renders");
-        tokio::fs::create_dir_all(&render_dir).await.map_err(map_error)?;
+        tokio::fs::create_dir_all(&render_dir)
+            .await
+            .map_err(map_error)?;
         let audio_out = if let Some(ref user_path) = request.output_path {
             if !user_path.is_empty() {
                 std::path::PathBuf::from(user_path)
@@ -1179,14 +1619,20 @@ pub async fn render_project(
         .await;
         match result {
             Ok(path) => {
-                let _ = app_handle.emit("render-progress", serde_json::json!({ "progress": 100, "message": "音频导出完成" }));
+                let _ = app_handle.emit(
+                    "render-progress",
+                    serde_json::json!({ "progress": 100, "message": "音频导出完成" }),
+                );
                 return Ok(RenderResult {
                     preview_path: path.to_string_lossy().to_string(),
                     command: "render-audio-only".to_string(),
                 });
             }
             Err(e) => {
-                let _ = app_handle.emit("render-progress", serde_json::json!({ "progress": 0, "message": format!("音频导出失败：{e}") }));
+                let _ = app_handle.emit(
+                    "render-progress",
+                    serde_json::json!({ "progress": 0, "message": format!("音频导出失败：{e}") }),
+                );
                 return Err(map_error(e));
             }
         }
@@ -1212,7 +1658,10 @@ pub async fn render_project(
     )
     .await
     .map_err(|e| {
-        let _ = app_handle.emit("render-progress", serde_json::json!({ "progress": 0, "message": format!("渲染失败：{e}") }));
+        let _ = app_handle.emit(
+            "render-progress",
+            serde_json::json!({ "progress": 0, "message": format!("渲染失败：{e}") }),
+        );
         map_error(e)
     })?;
 
@@ -1245,7 +1694,10 @@ pub async fn render_project(
         storage::save_project(&conn, &next_project).map_err(map_error)?;
     }
 
-    let _ = app_handle.emit("render-progress", serde_json::json!({ "progress": 100, "message": "导出完成" }));
+    let _ = app_handle.emit(
+        "render-progress",
+        serde_json::json!({ "progress": 100, "message": "导出完成" }),
+    );
 
     Ok(RenderResult {
         preview_path: final_output_path.to_string_lossy().to_string(),
@@ -1260,7 +1712,9 @@ pub async fn render_project(
 /// T3.3: 取消正在进行的渲染任务
 #[tauri::command]
 pub async fn cancel_render(state: State<'_, AppState>) -> Result<(), String> {
-    state.render_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    state
+        .render_cancel
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 

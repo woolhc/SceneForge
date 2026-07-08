@@ -19,6 +19,13 @@ export type SubtitleStyleLite = {
   fontSize: number;
   color: string;
   strokeColor: string;
+  strokeWidth?: number;
+  backgroundColor?: string;
+  backgroundPadding?: number;
+  shadowColor?: string;
+  shadowBlur?: number;
+  letterSpacing?: number;
+  lineHeight?: number;
   position: string;
   fontFamily: string;
   x: number;

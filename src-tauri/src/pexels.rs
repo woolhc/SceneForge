@@ -56,7 +56,7 @@ pub async fn search_videos(
         .append_pair("orientation", orientation)
         .append_pair("per_page", per_page.as_str());
 
-    let client = reqwest::Client::new();
+    let client = crate::ffmpeg::http_client();
     let response = client
         .get(url)
         .header("Authorization", api_key)
@@ -89,6 +89,10 @@ fn video_to_source(video: PexelsVideo, ratio: &str) -> Option<MediaSource> {
         // url = 下载链接，local_path 留空，前端绑定后调用 import/cache 下载
         url: Some(file.link.clone()),
         local_path: None,
+        proxy_path: None,
+        proxy_status: Some("none".to_string()),
+        proxy_width: None,
+        proxy_height: None,
         thumbnail_url: video.image.clone(),
         width,
         height,
@@ -186,7 +190,7 @@ pub async fn search_photos(
         .append_pair("orientation", orientation)
         .append_pair("per_page", per_page.as_str());
 
-    let client = reqwest::Client::new();
+    let client = crate::ffmpeg::http_client();
     let response = client
         .get(url)
         .header("Authorization", api_key)
@@ -216,6 +220,10 @@ fn photo_to_source(photo: PexelsPhoto) -> MediaSource {
         title: photo.alt.unwrap_or_else(|| format!("Pexels #{}", photo.id)),
         url: Some(photo.src.large.clone()),
         local_path: None,
+        proxy_path: None,
+        proxy_status: Some("none".to_string()),
+        proxy_width: None,
+        proxy_height: None,
         thumbnail_url: Some(photo.src.medium.clone()),
         width: photo.width,
         height: photo.height,

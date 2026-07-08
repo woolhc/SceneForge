@@ -326,6 +326,10 @@ async function webFallback<T>(command: string, args?: Record<string, unknown>): 
       title: `${request.query || "Pexels"} #${index + 1}`,
       url: null,
       localPath: null,
+      proxyPath: null,
+      proxyStatus: "none",
+      proxyWidth: null,
+      proxyHeight: null,
       thumbnailUrl: null,
       width: portrait ? 1080 : 1920,
       height: portrait ? 1920 : 1080,
@@ -349,6 +353,10 @@ async function webFallback<T>(command: string, args?: Record<string, unknown>): 
       title: name,
       url: null,
       localPath: request.sourcePath,
+      proxyPath: null,
+      proxyStatus: "none",
+      proxyWidth: null,
+      proxyHeight: null,
       thumbnailUrl: null,
       width: 1080,
       height: 1920,
@@ -427,8 +435,22 @@ export const desktopApi = {
           extensions: [
             "mp4", "mov", "mkv", "webm", "avi", "m4v",
             "mp3", "wav", "m4a", "aac", "flac", "ogg",
+            "jpg", "jpeg", "png", "webp", "gif", "bmp", "tiff",
           ],
         },
+      ],
+    });
+    if (typeof selected !== "string") return null;
+    return selected;
+  },
+  /** 弹出原生文件选择对话框，返回选中 SRT 字幕文件的绝对路径（桌面端）。浏览器返回 null。 */
+  pickSrtFile: async () => {
+    if (!isTauri) return null;
+    const selected = await open({
+      multiple: false,
+      filters: [
+        { name: "SRT 字幕", extensions: ["srt"] },
+        { name: "VTT 字幕", extensions: ["vtt"] },
       ],
     });
     if (typeof selected !== "string") return null;
@@ -498,6 +520,8 @@ export const desktopApi = {
     call<Project>("separate_vocals", { request }),
   generateSubtitles: (request: { projectId: string; translate: boolean }) =>
     call<Project>("generate_subtitles", { request }),
+  importSrt: (request: { projectId: string; srtPath: string; timeOffset?: number }) =>
+    call<Project>("import_srt", { request }),
   transcribeToText: (audioPath: string) =>
     call<string>("transcribe_to_text", { audioPath }),
   /** 音频模式：识别音频返回句子级时间戳（驱动分镜编排） */

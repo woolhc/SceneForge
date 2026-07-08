@@ -8,8 +8,8 @@ use uuid::Uuid;
 
 use crate::models::{
     AppInfo, AppSettings, CreateProjectRequest, CreateVoiceProfileRequest,
-    ImportVoiceProfileRequest, Project, ProjectSummary, RenderConfig,
-    ReplaceVoiceSampleRequest, Track, TrackKind, UpdateVoiceProfileRequest, VoiceProfile,
+    ImportVoiceProfileRequest, Project, ProjectSummary, RenderConfig, ReplaceVoiceSampleRequest,
+    Track, TrackKind, UpdateVoiceProfileRequest, VoiceProfile,
 };
 
 pub struct AppPaths {
@@ -92,7 +92,8 @@ fn initialize_schema(conn: &Connection) -> anyhow::Result<()> {
         "#,
     )?;
     // T3.5: 冗余列迁移（兼容旧库，SQLite 没有 ADD COLUMN IF NOT EXISTS，用 try 忽略重复列错误）
-    let _ = conn.execute_batch("ALTER TABLE projects ADD COLUMN clip_count INTEGER NOT NULL DEFAULT 0");
+    let _ =
+        conn.execute_batch("ALTER TABLE projects ADD COLUMN clip_count INTEGER NOT NULL DEFAULT 0");
     // schema 版本
     let _ = conn.execute(
         "INSERT OR IGNORE INTO settings (key, value) VALUES ('schema_version', '1')",
@@ -148,6 +149,8 @@ pub fn create_project(conn: &Connection, request: CreateProjectRequest) -> anyho
                 order: 0,
                 muted: false,
                 locked: false,
+                hidden: false,
+                height: 0,
             },
             Track {
                 id: "track_voiceover".to_string(),
@@ -156,6 +159,8 @@ pub fn create_project(conn: &Connection, request: CreateProjectRequest) -> anyho
                 order: 1,
                 muted: false,
                 locked: false,
+                hidden: false,
+                height: 0,
             },
             Track {
                 id: "track_image".to_string(),
@@ -164,6 +169,8 @@ pub fn create_project(conn: &Connection, request: CreateProjectRequest) -> anyho
                 order: 2,
                 muted: false,
                 locked: false,
+                hidden: false,
+                height: 0,
             },
             Track {
                 id: "track_video".to_string(),
@@ -172,10 +179,14 @@ pub fn create_project(conn: &Connection, request: CreateProjectRequest) -> anyho
                 order: 3,
                 muted: false,
                 locked: false,
+                hidden: false,
+                height: 0,
             },
         ],
         clips: Vec::new(),
         render_config: RenderConfig::default(),
+        chapters: Vec::new(),
+        cover_time: None,
         preview_path: None,
         final_path: None,
         created_at: now.clone(),

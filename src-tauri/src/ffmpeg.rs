@@ -1,21 +1,119 @@
 use std::path::{Path, PathBuf};
+use std::process::Output;
 use std::sync::OnceLock;
+use std::time::Duration;
 
+use futures_util::StreamExt;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio::time::timeout;
 
-/// 缓存的硬件编码器名称（首次检测后缓存）
-static HW_ENCODER: OnceLock<String> = OnceLock::new();
+/// 按 codec 缓存的编码器名称（首次检测后缓存）
+static H264_ENCODER: OnceLock<String> = OnceLock::new();
+static HEVC_ENCODER: OnceLock<String> = OnceLock::new();
+static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 /// 在首次渲染时调用，预检测硬件编码器
 pub async fn init_hw_encoder() {
-    if HW_ENCODER.get().is_some() {
+    if H264_ENCODER.get().is_some() {
         return;
     }
-    let encoder = detect_hw_encoder().await;
-    let _ = HW_ENCODER.set(encoder);
+    let encoder = detect_hw_encoder("h264").await;
+    let _ = H264_ENCODER.set(encoder);
 }
 
 use crate::models::{Clip, FfmpegStatus, MediaSource, Project, TrackKind};
+
+pub async fn run_with_timeout(cmd: &mut Command, secs: u64) -> anyhow::Result<Output> {
+    cmd.kill_on_drop(true);
+    match timeout(Duration::from_secs(secs), cmd.output()).await {
+        Ok(result) => Ok(result?),
+        Err(_) => anyhow::bail!("命令执行超时（{}s）", secs),
+    }
+}
+
+async fn run_with_timeout_and_cancel(
+    cmd: &mut Command,
+    secs: u64,
+    cancel_flag: Option<&std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<Output> {
+    cmd.kill_on_drop(true);
+    let output = cmd.output();
+    tokio::pin!(output);
+    let deadline = tokio::time::sleep(Duration::from_secs(secs));
+    tokio::pin!(deadline);
+    let cancel = async {
+        loop {
+            if let Some(flag) = cancel_flag {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    };
+    tokio::pin!(cancel);
+
+    tokio::select! {
+        result = &mut output => Ok(result?),
+        _ = &mut deadline => anyhow::bail!("命令执行超时（{}s）", secs),
+        _ = &mut cancel, if cancel_flag.is_some() => anyhow::bail!("渲染已取消"),
+    }
+}
+
+fn check_cancel(cancel_flag: Option<&std::sync::atomic::AtomicBool>) -> anyhow::Result<()> {
+    if let Some(flag) = cancel_flag {
+        if flag.load(std::sync::atomic::Ordering::Relaxed) {
+            anyhow::bail!("渲染已取消");
+        }
+    }
+    Ok(())
+}
+
+pub fn http_client() -> &'static reqwest::Client {
+    HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("failed to build reqwest client")
+    })
+}
+
+pub fn collect_mix_audio_clips(project: &Project) -> Vec<&Clip> {
+    let mut audio_clips: Vec<&Clip> = project
+        .clips
+        .iter()
+        .filter(|clip| {
+            if clip.volume <= 0.0 {
+                return false;
+            }
+            let Some(track) = project.tracks.iter().find(|t| t.id == clip.track_id) else {
+                return false;
+            };
+            if track.muted || track.hidden {
+                return false;
+            }
+            match track.kind {
+                TrackKind::Voiceover | TrackKind::Audio | TrackKind::Video => {}
+                TrackKind::Image | TrackKind::Subtitle => return false,
+            }
+            let Some(source_id) = &clip.source_id else {
+                return false;
+            };
+            let Some(media) = project.media.iter().find(|m| m.id == *source_id) else {
+                return false;
+            };
+            media.kind != "image"
+        })
+        .collect();
+    audio_clips.sort_by(|a, b| {
+        a.start_on_track
+            .partial_cmp(&b.start_on_track)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    audio_clips
+}
 
 pub async fn check_ffmpeg() -> FfmpegStatus {
     match Command::new("ffmpeg").arg("-version").output().await {
@@ -44,22 +142,27 @@ pub async fn check_ffmpeg() -> FfmpegStatus {
     }
 }
 
-/// 检测可用的硬件编码器（GPU 加速）。
-/// macOS: h264_videotoolbox
-/// Windows: h264_nvenc (NVIDIA) / h264_qsv (Intel)
-/// Linux: h264_vaapi
-/// 回退: libx264 (CPU)
-pub async fn detect_hw_encoder() -> String {
-    let candidates: &[&str] = &[
-        "h264_videotoolbox",  // macOS
-        "h264_nvenc",         // NVIDIA
-        "h264_qsv",           // Intel QuickSync
-        "h264_vaapi",         // Linux
-    ];
+/// 检测可用的硬件编码器（GPU 加速），按目标 codec 分开探测。
+pub async fn detect_hw_encoder(codec: &str) -> String {
+    let (candidates, fallback): (&[&str], &str) = if codec == "hevc" {
+        (
+            &["hevc_videotoolbox", "hevc_nvenc", "hevc_qsv", "hevc_vaapi"],
+            "libx265",
+        )
+    } else {
+        (
+            &["h264_videotoolbox", "h264_nvenc", "h264_qsv", "h264_vaapi"],
+            "libx264",
+        )
+    };
     // M15: -encoders 只跑一次（之前循环内重复跑）
-    let encoders_text = match Command::new("ffmpeg").args(["-hide_banner", "-encoders"]).output().await {
+    let encoders_text = match Command::new("ffmpeg")
+        .args(["-hide_banner", "-encoders"])
+        .output()
+        .await
+    {
         Ok(out) => String::from_utf8_lossy(&out.stdout).to_string(),
-        Err(_) => return "libx264".to_string(),
+        Err(_) => return fallback.to_string(),
     };
     for &encoder in candidates {
         if !encoders_text.contains(encoder) {
@@ -68,8 +171,16 @@ pub async fn detect_hw_encoder() -> String {
         // 验证能否真正工作（快速测试编码）
         let test = Command::new("ffmpeg")
             .args([
-                "-y", "-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.1",
-                "-c:v", encoder, "-f", "null", "-",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=64x64:d=0.1",
+                "-c:v",
+                encoder,
+                "-f",
+                "null",
+                "-",
             ])
             .output()
             .await;
@@ -79,49 +190,108 @@ pub async fn detect_hw_encoder() -> String {
             }
         }
     }
-    "libx264".to_string() // CPU 回退（M15: 删除读未初始化 OnceLock 的死代码）
+    fallback.to_string()
+}
+
+pub async fn pick_encoder(codec: &str) -> String {
+    if codec == "hevc" {
+        if let Some(encoder) = HEVC_ENCODER.get() {
+            return encoder.clone();
+        }
+        let encoder = detect_hw_encoder("hevc").await;
+        let _ = HEVC_ENCODER.set(encoder.clone());
+        return encoder;
+    }
+    if let Some(encoder) = H264_ENCODER.get() {
+        return encoder.clone();
+    }
+    let encoder = detect_hw_encoder("h264").await;
+    let _ = H264_ENCODER.set(encoder.clone());
+    encoder
 }
 
 /// 根据编码器返回 (encoder_name, extra_args)。
 /// 硬件编码器不需要 preset，需要 bitrate 控制。
 /// codec: "h264"（默认）| "hevc"（T4.10）
-pub fn encoder_args(encoder: &str, preview: bool) -> (String, Vec<String>) {
-    // 优先用传入的 encoder，回退到全局缓存的硬件编码器
-    let enc = if encoder == "libx264" || encoder == "libx265" {
-        HW_ENCODER.get().map(|s| s.as_str()).unwrap_or("libx264")
-    } else {
-        encoder
-    };
-    match enc {
+pub fn encoder_args(
+    encoder: &str,
+    preview: bool,
+    bitrate_mbps: Option<u32>,
+) -> (String, Vec<String>) {
+    let configured_bitrate = bitrate_mbps.filter(|b| *b > 0).map(|b| format!("{b}M"));
+    match encoder {
         "h264_videotoolbox" | "h264_nvenc" | "h264_qsv" | "h264_vaapi" => {
-            let bitrate = if preview { "2M" } else { "8M" };
-            (enc.to_string(), vec!["-b:v".to_string(), bitrate.to_string()])
+            let bitrate =
+                configured_bitrate.unwrap_or_else(|| if preview { "2M" } else { "8M" }.to_string());
+            (encoder.to_string(), vec!["-b:v".to_string(), bitrate])
         }
         "hevc_videotoolbox" | "hevc_nvenc" | "hevc_qsv" | "hevc_vaapi" => {
             // T4.10: HEVC 硬件编码
-            let bitrate = if preview { "2M" } else { "6M" }; // HEVC 同等质量码率更低
-            (enc.to_string(), vec!["-b:v".to_string(), bitrate.to_string()])
+            let bitrate =
+                configured_bitrate.unwrap_or_else(|| if preview { "2M" } else { "6M" }.to_string());
+            (encoder.to_string(), vec!["-b:v".to_string(), bitrate])
+        }
+        "libx265" => {
+            let preset = if preview { "ultrafast" } else { "medium" };
+            let crf = if preview { "30" } else { "26" };
+            let mut args = vec![
+                "-preset".to_string(),
+                preset.to_string(),
+                "-crf".to_string(),
+                crf.to_string(),
+            ];
+            if let Some(bitrate) = configured_bitrate {
+                let bufsize = format!(
+                    "{}M",
+                    bitrate
+                        .trim_end_matches('M')
+                        .parse::<u32>()
+                        .unwrap_or(0)
+                        .saturating_mul(2)
+                );
+                args.extend([
+                    "-maxrate".to_string(),
+                    bitrate,
+                    "-bufsize".to_string(),
+                    bufsize,
+                ]);
+            }
+            (encoder.to_string(), args)
         }
         _ => {
-            // 软编：libx264 或 libx265
-            let is_hevc = enc.contains("265") || encoder.contains("265") || encoder == "hevc";
-            let lib = if is_hevc { "libx265" } else { "libx264" };
+            // H.264 软编
             let preset = if preview { "ultrafast" } else { "veryfast" };
-            let crf = if preview { "30" } else { if is_hevc { "28" } else { "23" } };
-            (lib.to_string(), vec![
-                "-preset".to_string(), preset.to_string(),
-                "-crf".to_string(), crf.to_string(),
-            ])
+            let crf = if preview { "30" } else { "23" };
+            let mut args = vec![
+                "-preset".to_string(),
+                preset.to_string(),
+                "-crf".to_string(),
+                crf.to_string(),
+            ];
+            if let Some(bitrate) = configured_bitrate {
+                let bufsize = format!(
+                    "{}M",
+                    bitrate
+                        .trim_end_matches('M')
+                        .parse::<u32>()
+                        .unwrap_or(0)
+                        .saturating_mul(2)
+                );
+                args.extend([
+                    "-maxrate".to_string(),
+                    bitrate,
+                    "-bufsize".to_string(),
+                    bufsize,
+                ]);
+            }
+            ("libx264".to_string(), args)
         }
     }
 }
 
 /// 把素材下载 / 缓存到 app 数据目录，返回本地路径。
 /// 兼容：本地路径（已是本地则直接返回）、远程 url（下载）。
-pub async fn ensure_media_local(
-    cache_dir: &Path,
-    source: &MediaSource,
-) -> anyhow::Result<PathBuf> {
+pub async fn ensure_media_local(cache_dir: &Path, source: &MediaSource) -> anyhow::Result<PathBuf> {
     // 已有本地路径且存在
     if let Some(local) = source.local_path.as_deref() {
         let path = PathBuf::from(local);
@@ -141,8 +311,13 @@ pub async fn ensure_media_local(
     let ext = url_ext(url).unwrap_or_else(|| "mp4".to_string());
     let output_path = video_dir.join(format!("{}.{}", sanitize_file_stem(&source.id), ext));
     if !output_path.exists() || output_path.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
-        let bytes = reqwest::get(url).await?.bytes().await?;
-        tokio::fs::write(&output_path, bytes).await?;
+        let response = http_client().get(url).send().await?.error_for_status()?;
+        let mut stream = response.bytes_stream();
+        let mut file = tokio::fs::File::create(&output_path).await?;
+        while let Some(chunk) = stream.next().await {
+            file.write_all(&chunk?).await?;
+        }
+        file.flush().await?;
     }
     Ok(output_path)
 }
@@ -158,16 +333,20 @@ pub async fn extract_audio_from_video(
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("audio");
-    let output_path = audio_dir.join(format!("{}-{}.wav", stem, chrono::Utc::now().timestamp_millis()));
+    let output_path = audio_dir.join(format!(
+        "{}-{}.wav",
+        stem,
+        chrono::Utc::now().timestamp_millis()
+    ));
 
     let output = Command::new("ffmpeg")
         .args([
             "-y",
             "-i",
             &video_path.to_string_lossy(),
-            "-vn",          // 不要视频
+            "-vn", // 不要视频
             "-acodec",
-            "pcm_s16le",    // wav 格式
+            "pcm_s16le", // wav 格式
             "-ar",
             "44100",
             "-ac",
@@ -201,13 +380,18 @@ pub async fn separate_vocals(
     let timestamp = chrono::Utc::now().timestamp_millis();
 
     // 尝试 audio-separator（高质量，需要 pip install audio-separator）
-    let separator_check = Command::new("audio-separator").arg("--version").output().await;
+    let separator_check = Command::new("audio-separator")
+        .arg("--version")
+        .output()
+        .await;
     if separator_check.is_ok() && separator_check.unwrap().status.success() {
         let output = Command::new("audio-separator")
             .args([
                 &audio_path.to_string_lossy(),
-                "--two_stems", "vocals",
-                "-o", &out_dir.to_string_lossy(),
+                "--two_stems",
+                "vocals",
+                "-o",
+                &out_dir.to_string_lossy(),
             ])
             .output()
             .await;
@@ -232,27 +416,43 @@ pub async fn separate_vocals(
     // 人声近似：提取中置声道（L+R 的和）
     let vocals_out = Command::new("ffmpeg")
         .args([
-            "-y", "-i", &audio_path.to_string_lossy(),
-            "-af", "pan=mono|c0=0.5*FL+0.5*FR",  // 左右相加 = 中置（人声）
-            "-ar", "44100",
+            "-y",
+            "-i",
+            &audio_path.to_string_lossy(),
+            "-af",
+            "pan=mono|c0=0.5*FL+0.5*FR", // 左右相加 = 中置（人声）
+            "-ar",
+            "44100",
             &vocals_path.to_string_lossy(),
         ])
-        .output().await?;
+        .output()
+        .await?;
     if !vocals_out.status.success() {
-        anyhow::bail!("人声分离失败（FFmpeg）：{}", String::from_utf8_lossy(&vocals_out.stderr).trim());
+        anyhow::bail!(
+            "人声分离失败（FFmpeg）：{}",
+            String::from_utf8_lossy(&vocals_out.stderr).trim()
+        );
     }
 
     // 伴奏近似：左右相减消除中置（人声）
     let inst_out = Command::new("ffmpeg")
         .args([
-            "-y", "-i", &audio_path.to_string_lossy(),
-            "-af", "pan=stereo|c0=c0-c1|c1=c1-c0",  // 左右相减 = 消除中置
-            "-ar", "44100",
+            "-y",
+            "-i",
+            &audio_path.to_string_lossy(),
+            "-af",
+            "pan=stereo|c0=c0-c1|c1=c1-c0", // 左右相减 = 消除中置
+            "-ar",
+            "44100",
             &instrumental_path.to_string_lossy(),
         ])
-        .output().await?;
+        .output()
+        .await?;
     if !inst_out.status.success() {
-        anyhow::bail!("伴奏分离失败（FFmpeg）：{}", String::from_utf8_lossy(&inst_out.stderr).trim());
+        anyhow::bail!(
+            "伴奏分离失败（FFmpeg）：{}",
+            String::from_utf8_lossy(&inst_out.stderr).trim()
+        );
     }
 
     Ok((vocals_path, instrumental_path))
@@ -278,11 +478,7 @@ pub async fn generate_thumbnail(
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("media");
-    let id = format!(
-        "{}-{}",
-        sanitize_file_stem(stem),
-        (at * 1000.0) as u64
-    );
+    let id = format!("{}-{}", sanitize_file_stem(stem), (at * 1000.0) as u64);
     let output_path = thumb_dir.join(format!("{}.jpg", id));
     if output_path.exists() {
         return Ok(output_path);
@@ -313,6 +509,98 @@ pub async fn generate_thumbnail(
     Ok(output_path)
 }
 
+/// 生成预览代理视频：长边不超过 960px，H.264，短 GOP，方便时间线 seek。
+/// 导出仍使用原始 local_path/url；代理只给前端预览读取。
+pub async fn generate_proxy_video(
+    cache_dir: &Path,
+    source_path: &Path,
+    media_id: &str,
+) -> anyhow::Result<(PathBuf, u32, u32)> {
+    let proxy_dir = cache_dir.join("proxies");
+    tokio::fs::create_dir_all(&proxy_dir).await?;
+    let proxy_path = proxy_dir.join(format!("{media_id}-proxy-v2.mp4"));
+    if proxy_path.exists() {
+        let (w, h) = probe_video_resolution_public(&proxy_path)
+            .await
+            .unwrap_or((0, 0));
+        return Ok((proxy_path, w, h));
+    }
+
+    let scale = "scale='if(gte(iw,ih),min(960,iw),-2)':'if(gte(iw,ih),-2,min(960,ih))'";
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
+        "-y",
+        "-i",
+        &source_path.to_string_lossy(),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-vf",
+        scale,
+        "-r",
+        "30",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "28",
+        "-threads",
+        "2",
+        "-g",
+        "30",
+        "-keyint_min",
+        "30",
+        "-sc_threshold",
+        "0",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "96k",
+        "-movflags",
+        "+faststart",
+        &proxy_path.to_string_lossy(),
+    ]);
+    let output = run_with_timeout(&mut cmd, 1800).await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "生成代理视频失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let (w, h) = probe_video_resolution_public(&proxy_path)
+        .await
+        .unwrap_or((0, 0));
+    Ok((proxy_path, w, h))
+}
+
+async fn probe_video_resolution_public(path: &Path) -> anyhow::Result<(u32, u32)> {
+    let mut cmd = Command::new("ffprobe");
+    cmd.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "csv=s=x:p=0",
+        &path.to_string_lossy(),
+    ]);
+    let output = run_with_timeout(&mut cmd, 30).await?;
+    if !output.status.success() {
+        anyhow::bail!("ffprobe 无视频流");
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let parts: Vec<&str> = text.split('x').collect();
+    if parts.len() != 2 {
+        anyhow::bail!("解析代理分辨率失败");
+    }
+    Ok((parts[0].parse()?, parts[1].parse()?))
+}
+
 /// T4.7: 生成视频胶片条缩略图（均匀取 count 帧，输出到缓存目录）。
 /// 返回每帧的本地路径列表（前端用 asset 协议加载）。
 pub async fn generate_filmstrip(
@@ -333,12 +621,7 @@ pub async fn generate_filmstrip(
     for i in 0..count {
         // 均匀分布的取帧时间点（避免首尾边界）
         let t = source_in + dur * (i as f64 + 0.5) / count as f64;
-        let id = format!(
-            "{}-{}-{}",
-            sanitize_file_stem(stem),
-            (t * 1000.0) as u64,
-            i
-        );
+        let id = format!("{}-{}-{}", sanitize_file_stem(stem), (t * 1000.0) as u64, i);
         let output_path = filmstrip_dir.join(format!("{}.jpg", id));
         if !output_path.exists() {
             let output = Command::new("ffmpeg")
@@ -374,23 +657,29 @@ pub async fn generate_waveform(
     audio_path: &Path,
     samples_per_second: u32,
 ) -> anyhow::Result<Vec<(f32, f32)>> {
-    // 用高采样率解码，保留细节（44100Hz = 原始 CD 质量）
-    let sample_rate = 44100u32;
+    // M16: 降采样到 8000Hz（波形显示不需要 CD 质量），大幅减少内存占用
+    let sample_rate = 8000u32;
     let output = Command::new("ffmpeg")
         .args([
             "-y",
             "-i",
             &audio_path.to_string_lossy(),
-            "-ac", "1",           // 单声道
-            "-ar", &sample_rate.to_string(),
-            "-f", "f32le",        // 32-bit float little-endian PCM
-            "pipe:1",             // 输出到 stdout
+            "-ac",
+            "1", // 单声道
+            "-ar",
+            &sample_rate.to_string(),
+            "-f",
+            "f32le",  // 32-bit float little-endian PCM
+            "pipe:1", // 输出到 stdout
         ])
         .output()
         .await?;
 
     if !output.status.success() {
-        anyhow::bail!("波形生成失败：{}", String::from_utf8_lossy(&output.stderr).trim());
+        anyhow::bail!(
+            "波形生成失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
 
     // 解析 PCM 数据
@@ -432,25 +721,9 @@ pub async fn render_project_video(
     // T3.3: 取消标志（为 true 时中断渲染）
     cancel_flag: Option<&std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<PathBuf> {
-    // 首次渲染时检测硬件编码器（GPU 加速），后续从缓存读取
-    if HW_ENCODER.get().is_none() {
-        init_hw_encoder().await;
-    }
-    // T4.10: 根据用户选的 codec（h264/hevc）决定编码器
-    let want_hevc = project.render_config.codec == "hevc";
-    let hw = if want_hevc {
-        // HEVC 模式：把 h264 硬件编码器名替换为 hevc 变体
-        match HW_ENCODER.get().map(|s| s.as_str()).unwrap_or("libx264") {
-            "h264_videotoolbox" => "hevc_videotoolbox",
-            "h264_nvenc" => "hevc_nvenc",
-            "h264_qsv" => "hevc_qsv",
-            "h264_vaapi" => "hevc_vaapi",
-            _ => "libx265",
-        }
-    } else {
-        HW_ENCODER.get().map(|s| s.as_str()).unwrap_or("libx264")
-    }.to_string();
-    eprintln!("使用编码器: {hw}");
+    // T4.10: 根据用户选的 codec（h264/hevc）决定编码器。
+    let encoder = pick_encoder(&project.render_config.codec).await;
+    eprintln!("使用编码器: {encoder}");
 
     // 统一计算目标尺寸：preview 用 540p 短边，导出用 renderConfig.resolution
     // 保证所有段 + 字幕坐标系 + xfade 合并全部使用同一组尺寸
@@ -464,7 +737,7 @@ pub async fn render_project_video(
     let mut video_tracks: Vec<&crate::models::Track> = project
         .tracks
         .iter()
-        .filter(|t| t.kind == TrackKind::Video || t.kind == TrackKind::Image)
+        .filter(|t| (t.kind == TrackKind::Video || t.kind == TrackKind::Image) && !t.hidden)
         .collect();
     video_tracks.sort_by(|a, b| b.order.cmp(&a.order)); // order 大在前=底层
     let video_track_ids: Vec<String> = video_tracks.iter().map(|t| t.id.clone()).collect();
@@ -504,56 +777,146 @@ pub async fn render_project_video(
             segments.push((start, end));
         }
     }
+    let render_units = build_render_units(
+        &video_clips,
+        total_duration,
+        project.render_config.transition_duration.max(0.1),
+    );
+
+    if let Some(single_pass_graph) =
+        plan_single_pass_video_graph(project, &video_clips, &video_track_ids, total_duration)
+    {
+        eprintln!(
+            "渲染路径: 单遍 (base_clips={}, overlay_clips={})",
+            single_pass_graph.base_clips.len(),
+            single_pass_graph.overlay_clips.len()
+        );
+        let render_dir = projects_dir.join(&project.id).join("renders");
+        tokio::fs::create_dir_all(&render_dir).await?;
+        let raw_output = render_dir.join(if preview {
+            "preview-raw.mp4"
+        } else {
+            "final-raw.mp4"
+        });
+        if let Some(cb) = progress_cb {
+            cb(35, "正在单遍渲染视频图...");
+        }
+        check_cancel(cancel_flag)?;
+        render_single_pass_video_graph(
+            cache_dir,
+            project,
+            &single_pass_graph,
+            &raw_output,
+            preview,
+            &encoder,
+            target_w,
+            target_h,
+            cancel_flag,
+        )
+        .await?;
+
+        let transition_shrink_points: Vec<(f64, f64)> = Vec::new();
+        if let Some(cb) = progress_cb {
+            cb(85, "正在烧录字幕和混音...");
+        }
+        check_cancel(cancel_flag)?;
+        let result = burn_subtitle_and_mix_audio(
+            cache_dir,
+            projects_dir,
+            project,
+            &raw_output,
+            preview,
+            &transition_shrink_points,
+            &encoder,
+            cancel_flag,
+        )
+        .await?;
+        if let Some(cb) = progress_cb {
+            cb(100, "渲染完成");
+        }
+        return Ok(result);
+    }
 
     // T2.5: 用 TempDirGuard 管理段渲染临时目录，函数返回时自动清理
-    let render_tmp_base = std::path::PathBuf::from("/tmp/scenescript-render");
+    let render_tmp_base = std::env::temp_dir().join("scenescript-render");
     tokio::fs::create_dir_all(&render_tmp_base).await.ok();
     let segment_guard = crate::temp::TempDirGuard::new(&render_tmp_base, "segments")?;
     let segment_dir = segment_guard.path().to_path_buf();
     tokio::fs::create_dir_all(&segment_dir).await?;
 
+    eprintln!(
+        "渲染路径: 段渲染 (segments={}, total_duration={:.2}s)"
+    , segments.len(), total_duration);
     // 渲染每一段
     let mut segment_paths = Vec::new();
-    let total_segs = segments.len();
-    for (seg_index, (seg_start, seg_end)) in segments.iter().enumerate() {
-        // T3.3: 检查取消标志
-        if let Some(flag) = cancel_flag {
-            if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                anyhow::bail!("渲染已取消");
-            }
-        }
+    let mut rendered_segment_durations = Vec::new();
+    let total_segs = render_units.len();
+    for (seg_index, unit) in render_units.iter().enumerate() {
+        check_cancel(cancel_flag)?;
         // T3.3: 段级进度（0-70% 分配给段渲染）
         if let Some(cb) = progress_cb {
             let percent = ((seg_index as f64 / total_segs.max(1) as f64) * 70.0) as u32;
             cb(percent, &format!("渲染片段 {}/{total_segs}", seg_index + 1));
         }
-        let seg_duration = seg_end - seg_start;
-        // 找到该段内活跃的 clip（按轨道层次顺序：底层在前）
-        let mut active_clips: Vec<&Clip> = video_clips
-            .iter()
-            .filter(|c| {
-                c.start_on_track < *seg_end - 0.01
-                    && c.start_on_track + c.duration > *seg_start + 0.01
-            })
-            .copied()
-            .collect();
-        // 按轨道层次排序：video_track_ids 顺序即层次（前=底层）
-        active_clips.sort_by_key(|c| video_track_ids.iter().position(|t| *t == c.track_id).unwrap_or(0));
+        let (seg_start, seg_end, is_transition, boundary) = match unit {
+            RenderUnit::Normal { start, end } => (*start, *end, false, *start),
+            RenderUnit::Transition {
+                start,
+                boundary,
+                end,
+            } => (*start, *end, true, *boundary),
+        };
+        let render_duration = seg_end - seg_start;
+        let active_clips =
+            active_clips_for_window(&video_clips, &video_track_ids, seg_start, seg_end);
+
+        if is_transition {
+            let path = render_transition_unit(
+                cache_dir,
+                &segment_dir,
+                project,
+                &video_clips,
+                &video_track_ids,
+                seg_start,
+                boundary,
+                render_duration,
+                seg_index,
+                preview,
+                &encoder,
+                target_w,
+                target_h,
+                cancel_flag,
+            )
+            .await?;
+            if let Ok(meta) = tokio::fs::metadata(&path).await {
+                eprintln!(
+                    "段 {seg_index:03}: 类型=transition 时长={render_duration:.2}s 大小={}KB",
+                    meta.len() / 1024
+                );
+            }
+            segment_paths.push(path);
+            rendered_segment_durations.push(render_duration);
+            continue;
+        }
 
         // 空段（无活跃 clip）：渲染纯黑背景，保证时间线连续
         if active_clips.is_empty() {
             let path = render_black_segment(
                 &segment_dir,
                 project,
-                seg_duration,
+                render_duration,
                 seg_index,
                 preview,
-                &hw,
+                &encoder,
                 target_w,
                 target_h,
             )
             .await?;
+            eprintln!(
+                "段 {seg_index:03}: 类型=black 时长={render_duration:.2}s（空段）"
+            );
             segment_paths.push(path);
+            rendered_segment_durations.push(render_duration);
             continue;
         }
 
@@ -562,30 +925,58 @@ pub async fn render_project_video(
             &segment_dir,
             project,
             &active_clips,
-            *seg_start,
-            seg_duration,
+            seg_start,
+            render_duration,
             seg_index,
             preview,
-            &hw,
+            &encoder,
             target_w,
             target_h,
         )
         .await?;
+        // 诊断：记录每段输出文件大小 + ffprobe 时长
+        if let Ok(meta) = tokio::fs::metadata(&path).await {
+            let size_kb = meta.len() / 1024;
+            let probe_dur = tokio::process::Command::new("ffprobe")
+                .args([
+                    "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    &path.to_string_lossy(),
+                ])
+                .output()
+                .await
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_else(|| "?".to_string());
+            eprintln!(
+                "段 {seg_index:03}: 类型=overlay 时长={render_duration:.2}s 实际={probe_dur}s 大小={size_kb}KB clips={}",
+                active_clips.iter().map(|c| c.id.as_str()).collect::<Vec<_>>().join(",")
+            );
+        }
         segment_paths.push(path);
+        rendered_segment_durations.push(render_duration);
     }
 
     // 合并所有段：有转场的相邻段用 xfade，否则 concat
     let render_dir = projects_dir.join(&project.id).join("renders");
     tokio::fs::create_dir_all(&render_dir).await?;
-    let raw_output = render_dir.join(if preview { "preview-raw.mp4" } else { "final-raw.mp4" });
-
-    // 检查是否有任何 clip 设置了转场
-    let has_transitions = video_clips.iter().any(|c| {
-        c.transition_in.is_some() && c.transition_in.as_deref() != Some("none")
+    let raw_output = render_dir.join(if preview {
+        "preview-raw.mp4"
+    } else {
+        "final-raw.mp4"
     });
 
+    // R3.2: transition 已经作为独立 RenderUnit 渲染，最终合并只需要 concat。
+    let has_transitions = false;
+
+    check_cancel(cancel_flag)?;
     if !has_transitions || segment_paths.len() <= 1 {
-        // 无转场：用 concat copy（快）
+        // 先尝试 concat copy（快），若失败则 fallback 到 concat filter（重编码）
+        // 注意：concat copy 要求所有段的编码参数（timebase/SAR/profile/pix_fmt）严格一致，
+        // 不同源视频/图片/黑屏段混排时往往不一致，会导致输出"时长对但后半黑屏"。
+        // 因此 fallback 路径用 concat filter 重新编码保证统一。
         let list_path = cache_dir.join(format!(
             "concat-{}-{}.txt",
             project.id,
@@ -597,24 +988,151 @@ pub async fn render_project_video(
             .collect::<String>();
         tokio::fs::write(&list_path, list_content).await?;
 
-        let output = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-f", "concat", "-safe", "0",
-                "-i", &list_path.to_string_lossy(),
-                "-c", "copy", "-movflags", "+faststart",
-                &raw_output.to_string_lossy(),
-            ])
-            .output()
-            .await?;
-        if !output.status.success() {
-            anyhow::bail!("拼接失败：{}", String::from_utf8_lossy(&output.stderr).trim());
+        // 先尝试 concat copy
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args([
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            &list_path.to_string_lossy(),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            &raw_output.to_string_lossy(),
+        ]);
+        let copy_output = run_with_timeout_and_cancel(&mut cmd, 1800, cancel_flag).await?;
+
+        if copy_output.status.success() {
+            // 验证输出时长是否接近 total_duration（容差 0.5s）
+            // 若偏差过大说明 concat copy 失败，走 fallback
+            let probe_ok = tokio::process::Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    &raw_output.to_string_lossy(),
+                ])
+                .output()
+                .await
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .trim()
+                        .parse::<f64>()
+                        .ok()
+                });
+
+            let duration_ok = probe_ok
+                .map(|d| (d - total_duration).abs() < 0.5)
+                .unwrap_or(false);
+
+            if duration_ok {
+                // concat copy 成功且时长正确，跳过 fallback
+            } else {
+                eprintln!(
+                    "concat copy 输出时长异常（probe={:?}, 期望 {total_duration}），回退到 concat filter 重编码",
+                    probe_ok
+                );
+                // fallback: concat filter（re-encode）
+                let mut fb_args: Vec<String> = vec!["-y".to_string()];
+                for p in &segment_paths {
+                    fb_args.push("-i".to_string());
+                    fb_args.push(p.to_string_lossy().to_string());
+                }
+                let concat_labels: String = (0..segment_paths.len())
+                    .map(|i| format!("[{i}:v]"))
+                    .collect::<String>();
+                let fb_filter = format!(
+                    "{concat_labels}concat=n={}:v=1:a=0[vout]",
+                    segment_paths.len()
+                );
+                fb_args.push("-filter_complex".to_string());
+                fb_args.push(fb_filter);
+                fb_args.push("-map".to_string());
+                fb_args.push("[vout]".to_string());
+                fb_args.push("-r".to_string());
+                fb_args.push(format!("{}", project.render_config.fps));
+                let (fb_enc_name, fb_enc_extra) =
+                    encoder_args(&encoder, preview, Some(project.render_config.bitrate_mbps));
+                fb_args.push("-c:v".to_string());
+                fb_args.push(fb_enc_name);
+                fb_args.extend(fb_enc_extra);
+                fb_args.push("-an".to_string());
+                fb_args.push("-movflags".to_string());
+                fb_args.push("+faststart".to_string());
+                fb_args.push(raw_output.to_string_lossy().to_string());
+
+                check_cancel(cancel_flag)?;
+                let mut fb_cmd = Command::new("ffmpeg");
+                fb_cmd.args(&fb_args);
+                let fb_output =
+                    run_with_timeout_and_cancel(&mut fb_cmd, 1800, cancel_flag).await?;
+                if !fb_output.status.success() {
+                    anyhow::bail!(
+                        "concat filter 重编码失败：{}",
+                        String::from_utf8_lossy(&fb_output.stderr).trim()
+                    );
+                }
+            }
+        } else {
+            // concat copy 直接失败，走 fallback
+            eprintln!(
+                "concat copy 失败，回退到 concat filter 重编码：{}",
+                String::from_utf8_lossy(&copy_output.stderr).trim()
+            );
+            let mut fb_args: Vec<String> = vec!["-y".to_string()];
+            for p in &segment_paths {
+                fb_args.push("-i".to_string());
+                fb_args.push(p.to_string_lossy().to_string());
+            }
+            let concat_labels: String = (0..segment_paths.len())
+                .map(|i| format!("[{i}:v]"))
+                .collect::<String>();
+            let fb_filter = format!(
+                "{concat_labels}concat=n={}:v=1:a=0[vout]",
+                segment_paths.len()
+            );
+            fb_args.push("-filter_complex".to_string());
+            fb_args.push(fb_filter);
+            fb_args.push("-map".to_string());
+            fb_args.push("[vout]".to_string());
+            fb_args.push("-r".to_string());
+            fb_args.push(format!("{}", project.render_config.fps));
+            let (fb_enc_name, fb_enc_extra) =
+                encoder_args(&encoder, preview, Some(project.render_config.bitrate_mbps));
+            fb_args.push("-c:v".to_string());
+            fb_args.push(fb_enc_name);
+            fb_args.extend(fb_enc_extra);
+            fb_args.push("-an".to_string());
+            fb_args.push("-movflags".to_string());
+            fb_args.push("+faststart".to_string());
+            fb_args.push(raw_output.to_string_lossy().to_string());
+
+            check_cancel(cancel_flag)?;
+            let mut fb_cmd = Command::new("ffmpeg");
+            fb_cmd.args(&fb_args);
+            let fb_output =
+                run_with_timeout_and_cancel(&mut fb_cmd, 1800, cancel_flag).await?;
+            if !fb_output.status.success() {
+                anyhow::bail!(
+                    "concat filter 重编码失败：{}",
+                    String::from_utf8_lossy(&fb_output.stderr).trim()
+                );
+            }
         }
     } else {
         // 有转场：用 filter_complex xfade 逐段合并
-        let transition_duration = project.render_config.transition_duration.max(0.1);
-        // 收集每段的时长
-        let seg_durations: Vec<f64> = segments.iter().map(|(s, e)| e - s).collect();
+        let fallback_transition_duration = project.render_config.transition_duration.max(0.1);
+        // R3.2: 有入场转场的段已额外渲染 handle，用 xfade 吃掉 overlap 后总时长仍等于原时间线。
+        let seg_durations = rendered_segment_durations.clone();
         // 构建 filter_complex
         let mut args: Vec<String> = vec!["-y".to_string()];
         for p in &segment_paths {
@@ -628,13 +1146,14 @@ pub async fn render_project_video(
             // 查这个段对应的 clip 是否有转场
             let seg_start = segments[i].0;
             let clip_with_trans = video_clips.iter().find(|c| {
-                (c.start_on_track - seg_start).abs() < 0.5
-                    && c.transition_in.is_some()
-                    && c.transition_in.as_deref() != Some("none")
+                (c.start_on_track - seg_start).abs() < 0.5 && transition_name(c).is_some()
             });
             let xfade_type = clip_with_trans
-                .and_then(|c| c.transition_in.as_deref())
+                .and_then(|c| transition_name(c))
                 .unwrap_or("fade");
+            let transition_duration = clip_with_trans
+                .map(|clip| transition_duration(clip, fallback_transition_duration))
+                .unwrap_or(fallback_transition_duration);
             // T4.5: xfade 名映射 —— 新种类（已是 xfade 原生名）直接透传，旧短名兼容
             let xfade_name = match xfade_type {
                 "slide" => "slideleft",
@@ -642,15 +1161,13 @@ pub async fn render_project_video(
                 "wipe" => "wipeleft",
                 "blur" => "dissolve",
                 // 以下已是 xfade 原生名，直接透传
-                "fade" | "dissolve" | "fadeblack" | "fadewhite"
-                | "wipeleft" | "wiperight" | "wipeup" | "wipedown"
-                | "slideleft" | "slideright" | "slideup" | "slidedown"
-                | "smoothleft" | "smoothright" | "smoothup" | "smoothdown"
-                | "circleopen" | "circleclose" | "radial"
-                | "horzopen" | "horzclose" | "vertopen" | "vertclose"
-                | "diagbl" | "diagbr" | "diagtl" | "diagtr"
-                | "hlslice" | "hrslice" | "vuslice" | "vdslice"
-                | "hblur" | "fadegrays" | "pixellize" | "sshred" => xfade_type,
+                "fade" | "dissolve" | "fadeblack" | "fadewhite" | "wipeleft" | "wiperight"
+                | "wipeup" | "wipedown" | "slideleft" | "slideright" | "slideup" | "slidedown"
+                | "smoothleft" | "smoothright" | "smoothup" | "smoothdown" | "circleopen"
+                | "circleclose" | "radial" | "horzopen" | "horzclose" | "vertopen"
+                | "vertclose" | "diagbl" | "diagbr" | "diagtl" | "diagtr" | "hlslice"
+                | "hrslice" | "vuslice" | "vdslice" | "hblur" | "fadegrays" | "pixellize"
+                | "sshred" => xfade_type,
                 _ => "fade",
             };
             let this_label = format!("[{}:v]", i);
@@ -670,7 +1187,8 @@ pub async fn render_project_video(
         args.push("-map".to_string());
         args.push(prev_label);
         // 编码器：统一用 encoder_args（硬件编码器用 bitrate，软编用 preset+crf）
-        let (xfade_enc_name, xfade_enc_extra) = encoder_args(&hw, preview);
+        let (xfade_enc_name, xfade_enc_extra) =
+            encoder_args(&encoder, preview, Some(project.render_config.bitrate_mbps));
         args.push("-c:v".to_string());
         args.push(xfade_enc_name);
         args.extend(xfade_enc_extra);
@@ -681,18 +1199,49 @@ pub async fn render_project_video(
         args.push("+faststart".to_string());
         args.push(raw_output.to_string_lossy().to_string());
 
-        let output = Command::new("ffmpeg").args(&args).output().await?;
+        check_cancel(cancel_flag)?;
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(&args);
+        let output = run_with_timeout_and_cancel(&mut cmd, 1800, cancel_flag).await?;
         if !output.status.success() {
             // xfade 失败时回退到 concat
-            eprintln!("xfade 转场失败，回退到 concat：{}", String::from_utf8_lossy(&output.stderr).trim());
-            let list_path = cache_dir.join(format!("concat-fallback-{}-{}.txt", project.id, chrono::Utc::now().timestamp_millis()));
-            let list_content = segment_paths.iter().map(|path| format!("file '{}'\n", path.to_string_lossy().replace('\'', "'\\''"))).collect::<String>();
+            eprintln!(
+                "xfade 转场失败，回退到 concat：{}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            let list_path = cache_dir.join(format!(
+                "concat-fallback-{}-{}.txt",
+                project.id,
+                chrono::Utc::now().timestamp_millis()
+            ));
+            let list_content = segment_paths
+                .iter()
+                .map(|path| format!("file '{}'\n", path.to_string_lossy().replace('\'', "'\\''")))
+                .collect::<String>();
             tokio::fs::write(&list_path, list_content).await?;
-            let fallback = Command::new("ffmpeg")
-                .args(["-y", "-f", "concat", "-safe", "0", "-i", &list_path.to_string_lossy(), "-c", "copy", "-movflags", "+faststart", &raw_output.to_string_lossy()])
-                .output().await?;
+            check_cancel(cancel_flag)?;
+            let mut fallback_cmd = Command::new("ffmpeg");
+            fallback_cmd.args([
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                &list_path.to_string_lossy(),
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                &raw_output.to_string_lossy(),
+            ]);
+            let fallback =
+                run_with_timeout_and_cancel(&mut fallback_cmd, 1800, cancel_flag).await?;
             if !fallback.status.success() {
-                anyhow::bail!("拼接失败：{}", String::from_utf8_lossy(&fallback.stderr).trim());
+                anyhow::bail!(
+                    "拼接失败：{}",
+                    String::from_utf8_lossy(&fallback.stderr).trim()
+                );
             }
         }
     }
@@ -702,39 +1251,313 @@ pub async fn render_project_video(
     if let Some(cb) = progress_cb {
         cb(70, "视频拼接完成，正在烧录字幕和混音...");
     }
-    // 转场偏移表：xfade 会让视频总长缩短，音频/字幕需要同步平移
-    // 收集所有转场的发生时间点（转场前一段的结束时间）和缩短量
-    let transition_shrink_points = if has_transitions && segments.len() > 1 {
-        let td = project.render_config.transition_duration.max(0.1);
-        let mut points: Vec<(f64, f64)> = Vec::new();
-        let mut acc = segments[0].1 - segments[0].0; // 第一段时长
-        for i in 1..segments.len() {
-            let seg_start = segments[i].0;
-            let has_trans = video_clips.iter().any(|c| {
-                (c.start_on_track - seg_start).abs() < 0.5
-                    && c.transition_in.is_some()
-                    && c.transition_in.as_deref() != Some("none")
-            });
-            if has_trans {
-                // 转场在 acc - td 处发生（前一段末尾开始重叠）
-                // 该转场使后续时间线累计缩短 td
-                points.push((acc, td));
-                acc += (segments[i].1 - segments[i].0) - td;
-            } else {
-                acc += segments[i].1 - segments[i].0;
-            }
-        }
-        points
-    } else {
-        Vec::new()
-    };
+    check_cancel(cancel_flag)?;
+    // R3.2: 转场段通过额外 handle 抵消 xfade overlap，视频总时长保持原时间线长度。
+    // 因此音频/字幕不再需要 shrink 平移。
+    let transition_shrink_points: Vec<(f64, f64)> = Vec::new();
 
-    let result = burn_subtitle_and_mix_audio(cache_dir, projects_dir, project, &raw_output, preview, &transition_shrink_points).await?;
+    if let Some(cb) = progress_cb {
+        cb(85, "正在烧录字幕和混音...");
+    }
+    check_cancel(cancel_flag)?;
+    let result = burn_subtitle_and_mix_audio(
+        cache_dir,
+        projects_dir,
+        project,
+        &raw_output,
+        preview,
+        &transition_shrink_points,
+        &encoder,
+        cancel_flag,
+    )
+    .await?;
     // T3.3: 进度 100%
     if let Some(cb) = progress_cb {
         cb(100, "渲染完成");
     }
     Ok(result)
+}
+
+struct SinglePassVideoGraph<'a> {
+    base_clips: Vec<&'a Clip>,
+    overlay_clips: Vec<&'a Clip>,
+}
+
+fn plan_single_pass_video_graph<'a>(
+    project: &Project,
+    video_clips: &[&'a Clip],
+    video_track_ids: &[String],
+    total_duration: f64,
+) -> Option<SinglePassVideoGraph<'a>> {
+    if video_clips.is_empty() || video_track_ids.is_empty() {
+        return None;
+    }
+
+    let base_track_id = &video_track_ids[0];
+    let mut base_clips: Vec<&Clip> = video_clips
+        .iter()
+        .copied()
+        .filter(|clip| &clip.track_id == base_track_id)
+        .collect();
+    if base_clips.is_empty() {
+        return None;
+    }
+    base_clips.sort_by(|a, b| {
+        a.start_on_track
+            .partial_cmp(&b.start_on_track)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut cursor = 0.0;
+    for clip in &base_clips {
+        if !single_pass_common_supported(project, clip)
+            || clip.mask.is_some()
+            || clip.keyframes.is_some()
+            || !clip_transform_is_identity(clip.transform.as_ref())
+            || (clip.start_on_track - cursor).abs() > 0.03
+        {
+            return None;
+        }
+        cursor = clip.start_on_track + clip.duration;
+    }
+    if cursor + 0.03 < total_duration {
+        return None;
+    }
+
+    let mut overlay_clips: Vec<&Clip> = video_clips
+        .iter()
+        .copied()
+        .filter(|clip| &clip.track_id != base_track_id)
+        .collect();
+    overlay_clips.sort_by(|a, b| {
+        let track_order = video_track_ids
+            .iter()
+            .position(|track_id| *track_id == a.track_id)
+            .unwrap_or(usize::MAX)
+            .cmp(
+                &video_track_ids
+                    .iter()
+                    .position(|track_id| *track_id == b.track_id)
+                    .unwrap_or(usize::MAX),
+            );
+        track_order.then_with(|| {
+            a.start_on_track
+                .partial_cmp(&b.start_on_track)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+    for clip in &overlay_clips {
+        if !single_pass_common_supported(project, clip)
+            || clip.keyframes.is_some()
+            || clip.mask.is_some()
+            || !overlay_transform_supported(clip.transform.as_ref())
+        {
+            return None;
+        }
+    }
+    Some(SinglePassVideoGraph {
+        base_clips,
+        overlay_clips,
+    })
+}
+
+fn single_pass_common_supported(project: &Project, clip: &Clip) -> bool {
+    if transition_name(clip).is_some()
+        || clip.transition_out.is_some()
+        || clip.speed <= 0.0
+        || clip
+            .speed_curve
+            .as_ref()
+            .is_some_and(|curve| !curve.is_empty())
+        || clip.source_id.is_none()
+    {
+        return false;
+    }
+    project
+        .media
+        .iter()
+        .find(|media| Some(&media.id) == clip.source_id.as_ref())
+        .is_some_and(|source| source.kind == "video" || source.kind == "image")
+}
+
+fn clip_transform_is_identity(transform: Option<&crate::models::ClipTransform>) -> bool {
+    let Some(transform) = transform else {
+        return true;
+    };
+    (transform.x - 50.0).abs() < 0.01
+        && (transform.y - 50.0).abs() < 0.01
+        && (transform.scale - 100.0).abs() < 0.01
+        && (transform.opacity - 100.0).abs() < 0.01
+        && transform.corner_radius == 0
+        && transform.mix == "normal"
+        && transform.rotation.abs() < 0.01
+}
+
+fn overlay_transform_supported(transform: Option<&crate::models::ClipTransform>) -> bool {
+    let Some(transform) = transform else {
+        return true;
+    };
+    transform.corner_radius == 0 && transform.mix == "normal" && transform.rotation.abs() < 0.01
+}
+
+async fn render_single_pass_video_graph(
+    cache_dir: &Path,
+    project: &Project,
+    graph: &SinglePassVideoGraph<'_>,
+    output_path: &Path,
+    preview: bool,
+    encoder: &str,
+    width: u32,
+    height: u32,
+    cancel_flag: Option<&std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<()> {
+    let mut args: Vec<String> = vec!["-y".to_string()];
+    let all_clips: Vec<&Clip> = graph
+        .base_clips
+        .iter()
+        .chain(graph.overlay_clips.iter())
+        .copied()
+        .collect();
+    for clip in &all_clips {
+        let source = project
+            .media
+            .iter()
+            .find(|media| Some(&media.id) == clip.source_id.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("单遍导出缺少素材：{}", clip.id))?;
+        let local_path = ensure_media_local(cache_dir, source).await?;
+        if source.kind == "image" {
+            args.extend([
+                "-loop".to_string(),
+                "1".to_string(),
+                "-t".to_string(),
+                format!("{:.3}", clip.duration),
+                "-i".to_string(),
+                local_path.to_string_lossy().to_string(),
+            ]);
+        } else {
+            args.extend([
+                "-ss".to_string(),
+                format!("{:.3}", clip.source_in),
+                "-stream_loop".to_string(),
+                "-1".to_string(),
+                "-t".to_string(),
+                format!("{:.3}", clip.duration),
+                "-i".to_string(),
+                local_path.to_string_lossy().to_string(),
+            ]);
+        }
+    }
+
+    let mut filter = String::new();
+    for (index, clip) in graph.base_clips.iter().enumerate() {
+        let scale_filter = format!(
+            "scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height}"
+        );
+        let source_crop = clip_source_crop(clip);
+        let mut chain = if source_crop.is_empty() {
+            scale_filter
+        } else {
+            format!("{},{}", source_crop.trim_start_matches(','), scale_filter)
+        };
+        if (clip.speed - 1.0).abs() > f64::EPSILON {
+            chain.push_str(&format!(",setpts={:.6}*(PTS-STARTPTS)", 1.0 / clip.speed));
+        } else {
+            chain.push_str(",setpts=PTS-STARTPTS");
+        }
+        chain.push_str(&clip_color_filter(clip));
+        chain.push_str(",format=yuv420p");
+        filter.push_str(&format!("[{index}:v]{chain}[base{index}];"));
+    }
+    let concat_inputs = (0..graph.base_clips.len())
+        .map(|index| format!("[base{index}]"))
+        .collect::<String>();
+    filter.push_str(&format!(
+        "{concat_inputs}concat=n={}:v=1:a=0[baseout];",
+        graph.base_clips.len()
+    ));
+    let mut prev_label = "[baseout]".to_string();
+    for (overlay_index, clip) in graph.overlay_clips.iter().enumerate() {
+        let input_index = graph.base_clips.len() + overlay_index;
+        let default_tf = crate::models::ClipTransform::default();
+        let transform = clip.transform.as_ref().unwrap_or(&default_tf);
+        let scale_pct = transform.scale.max(1.0) / 100.0;
+        let target_w = ((width as f64) * scale_pct).round().max(1.0) as u32;
+        let target_h = ((height as f64) * scale_pct).round().max(1.0) as u32;
+        let source_crop = clip_source_crop(clip);
+        let mut chain = if source_crop.is_empty() {
+            format!("scale={target_w}:{target_h}:force_original_aspect_ratio=decrease")
+        } else {
+            format!(
+                "{},scale={target_w}:{target_h}:force_original_aspect_ratio=decrease",
+                source_crop.trim_start_matches(',')
+            )
+        };
+        if (clip.speed - 1.0).abs() > f64::EPSILON {
+            chain.push_str(&format!(
+                ",setpts={:.6}*(PTS-STARTPTS)+{:.3}/TB",
+                1.0 / clip.speed,
+                clip.start_on_track
+            ));
+        } else {
+            chain.push_str(&format!(
+                ",setpts=PTS-STARTPTS+{:.3}/TB",
+                clip.start_on_track
+            ));
+        }
+        chain.push_str(&clip_color_filter(clip));
+        chain.push_str(",format=yuva420p");
+        let opacity = (transform.opacity).clamp(0.0, 100.0) / 100.0;
+        if opacity < 1.0 {
+            chain.push_str(&format!(",colorchannelmixer=aa={:.3}", opacity));
+        }
+        let overlay_label = format!("[ov{overlay_index}]");
+        filter.push_str(&format!("[{input_index}:v]{chain}{overlay_label};"));
+        let x_pct = transform.x.clamp(0.0, 100.0) / 100.0;
+        let y_pct = transform.y.clamp(0.0, 100.0) / 100.0;
+        let x_expr = format!("(w-W)*{x_pct:.4}");
+        let y_expr = format!("(h-H)*{y_pct:.4}");
+        let out_label = format!("[mix{overlay_index}]");
+        let end = clip.start_on_track + clip.duration;
+        filter.push_str(&format!(
+            "{prev_label}{overlay_label}overlay={x_expr}:{y_expr}:enable='between(t,{:.3},{:.3})'{out_label};",
+            clip.start_on_track,
+            end
+        ));
+        prev_label = out_label;
+    }
+    filter.push_str(&format!("{prev_label}format=yuv420p[vout]"));
+
+    let (enc_name, enc_extra) =
+        encoder_args(encoder, preview, Some(project.render_config.bitrate_mbps));
+    args.extend([
+        "-filter_complex".to_string(),
+        filter,
+        "-map".to_string(),
+        "[vout]".to_string(),
+        "-r".to_string(),
+        project.render_config.fps.to_string(),
+        "-c:v".to_string(),
+        enc_name,
+    ]);
+    args.extend(enc_extra);
+    args.extend([
+        "-an".to_string(),
+        "-movflags".to_string(),
+        "+faststart".to_string(),
+        output_path.to_string_lossy().to_string(),
+    ]);
+
+    check_cancel(cancel_flag)?;
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(&args);
+    let output = run_with_timeout_and_cancel(&mut cmd, 1800, cancel_flag).await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "单遍视频图渲染失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// 渲染纯黑背景段（无活跃 clip 的时间段，保证时间线连续）。
@@ -748,20 +1571,29 @@ async fn render_black_segment(
     width: u32,
     height: u32,
 ) -> anyhow::Result<PathBuf> {
-    let (enc_name, enc_extra) = encoder_args(encoder, preview);
+    let (enc_name, enc_extra) =
+        encoder_args(encoder, preview, Some(project.render_config.bitrate_mbps));
     let output_path = segment_dir.join(format!("seg-{:03}.mp4", seg_index));
-    let filter = format!("color=c=black:s={width}x{height}:r={},format=yuv420p", project.render_config.fps);
+    let filter = format!(
+        "color=c=black:s={width}x{height}:r={},format=yuv420p",
+        project.render_config.fps
+    );
     let mut args: Vec<String> = vec![
         "-y".to_string(),
-        "-f".to_string(), "lavfi".to_string(),
-        "-i".to_string(), filter,
-        "-t".to_string(), format!("{:.3}", seg_duration),
-        "-c:v".to_string(), enc_name,
+        "-f".to_string(),
+        "lavfi".to_string(),
+        "-i".to_string(),
+        filter,
+        "-t".to_string(),
+        format!("{:.3}", seg_duration),
+        "-c:v".to_string(),
+        enc_name,
     ];
     args.extend(enc_extra);
     args.extend([
         "-an".to_string(),
-        "-movflags".to_string(), "+faststart".to_string(),
+        "-movflags".to_string(),
+        "+faststart".to_string(),
         output_path.to_string_lossy().to_string(),
     ]);
     let output = Command::new("ffmpeg").args(&args).output().await?;
@@ -796,7 +1628,17 @@ async fn render_segment_with_overlay(
     if active_clips.len() == 1 {
         let clip = active_clips[0];
         return render_single_clip_for_segment(
-            cache_dir, segment_dir, project, clip, seg_start, seg_duration, seg_index, preview, encoder, width, height,
+            cache_dir,
+            segment_dir,
+            project,
+            clip,
+            seg_start,
+            seg_duration,
+            seg_index,
+            preview,
+            encoder,
+            width,
+            height,
         )
         .await;
     }
@@ -808,7 +1650,8 @@ async fn render_segment_with_overlay(
         let source = match project
             .media
             .iter()
-            .find(|m| Some(&m.id) == clip.source_id.as_ref()) {
+            .find(|m| Some(&m.id) == clip.source_id.as_ref())
+        {
             Some(s) => s,
             None => continue, // 跳过未绑定素材的 clip（避免渲染崩溃）
         };
@@ -858,10 +1701,23 @@ async fn render_segment_with_overlay(
                 "scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height}"
             )
         } else {
-            let scale_pct = tf.map(|t| t.scale).unwrap_or(100.0).max(1.0) / 100.0;
-            let target_w = ((width as f64) * scale_pct).round() as u32;
-            let target_h = ((height as f64) * scale_pct).round() as u32;
-            format!("scale={target_w}:{target_h}:force_original_aspect_ratio=decrease")
+            let scale_kfs = clip
+                .keyframes
+                .as_ref()
+                .and_then(|k| k.scale.as_ref().filter(|v| !v.is_empty()));
+            if let Some(kfs) = scale_kfs {
+                // B3: scale 关键帧 -- 用表达式 + eval=frame 每帧重算
+                let offset = clip.start_on_track - seg_start;
+                let expr = keyframes_to_value_expr(kfs, tf.map(|t| t.scale).unwrap_or(100.0), offset);
+                format!(
+                    "scale=w='{width}*({expr})/100':h='{height}*({expr})/100':eval=frame:force_original_aspect_ratio=decrease"
+                )
+            } else {
+                let scale_pct = tf.map(|t| t.scale).unwrap_or(100.0).max(1.0) / 100.0;
+                let target_w = ((width as f64) * scale_pct).round() as u32;
+                let target_h = ((height as f64) * scale_pct).round() as u32;
+                format!("scale={target_w}:{target_h}:force_original_aspect_ratio=decrease")
+            }
         };
 
         // 画面裁剪（在 scale 之前，操作源帧）
@@ -869,8 +1725,29 @@ async fn render_segment_with_overlay(
         let mut chain = if source_crop.is_empty() {
             scale_expr
         } else {
-            format!("{}{}", source_crop.trim_start_matches(','), scale_expr)
+            format!("{},{}", source_crop.trim_start_matches(','), scale_expr)
         };
+        // B2/B4: 旋转（仅叠加层，避免底层旋转导致黑边）
+        if i > 0 {
+            let rot_kfs = clip
+                .keyframes
+                .as_ref()
+                .and_then(|k| k.rotation.as_ref().filter(|v| !v.is_empty()));
+            if let Some(kfs) = rot_kfs {
+                // B4: 关键帧旋转 -- 用 rotate + 表达式
+                let offset = clip.start_on_track - seg_start;
+                let deg_expr = keyframes_to_value_expr(kfs, tf.map(|t| t.rotation).unwrap_or(0.0), offset);
+                chain.push_str(&format!(
+                    ",format=rgba,rotate=angle='({deg_expr})*PI/180':fillcolor=black@0:ow=hypot(iw,ih):oh=hypot(iw,ih):eval=frame,format=yuva420p"
+                ));
+            } else if let Some(t) = tf {
+                // B2: 静态旋转
+                let rot = rotation_filter(t.rotation);
+                if !rot.is_empty() {
+                    chain.push_str(&rot);
+                }
+            }
+        }
         // 圆角：用 geq 在 alpha 通道上做四角圆切（radius 像素）
         if let Some(t) = tf {
             if t.corner_radius > 0 {
@@ -890,6 +1767,15 @@ async fn render_segment_with_overlay(
             let opacity = (t.opacity).clamp(0.0, 100.0) / 100.0;
             if opacity < 1.0 {
                 chain.push_str(&format!(",colorchannelmixer=aa={:.3}", opacity));
+            }
+        }
+        if i > 0 {
+            if let Some(opacity_kfs) = clip.keyframes.as_ref().and_then(|k| k.opacity.as_ref()) {
+                if let Some(opacity_fade) =
+                    opacity_keyframes_to_fade_filters(opacity_kfs, clip.start_on_track - seg_start)
+                {
+                    chain.push_str(&opacity_fade);
+                }
             }
         }
         // T4.4: 蒙版（geq alpha）
@@ -924,9 +1810,18 @@ async fn render_segment_with_overlay(
             let this_label = format!("[v{}]", i);
             filter.push_str(&format!("{in_label}{chain}{this_label};"));
             let merged = format!("[m{}]", i);
-            filter.push_str(&format!(
-                "{prev_label}{this_label}overlay={x_expr}:{y_expr}{merged};"
-            ));
+            // B1: 混合模式（overlay/screen/multiply）用 overlay 滤镜的 mode 参数
+            // overlay 的 mode 参数直接支持 blend 模式，且正确处理 alpha 通道
+            let mix_mode = tf.mix.as_str();
+            if mix_mode != "normal" && !mix_mode.is_empty() {
+                filter.push_str(&format!(
+                    "{prev_label}{this_label}overlay={x_expr}:{y_expr}:mode={mix_mode}{merged};"
+                ));
+            } else {
+                filter.push_str(&format!(
+                    "{prev_label}{this_label}overlay={x_expr}:{y_expr}{merged};"
+                ));
+            }
             prev_label = merged;
         }
     }
@@ -940,7 +1835,8 @@ async fn render_segment_with_overlay(
     args.push("-r".to_string());
     args.push(format!("{}", fps));
     // 编码器：统一用 encoder_args
-    let (ovl_enc_name, ovl_enc_extra) = encoder_args(encoder, preview);
+    let (ovl_enc_name, ovl_enc_extra) =
+        encoder_args(encoder, preview, Some(project.render_config.bitrate_mbps));
     args.push("-c:v".to_string());
     args.push(ovl_enc_name);
     args.extend(ovl_enc_extra);
@@ -955,6 +1851,132 @@ async fn render_segment_with_overlay(
     if !output.status.success() {
         anyhow::bail!(
             "叠加渲染段 {} 失败：{}",
+            seg_index,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output_path)
+}
+
+async fn render_transition_unit(
+    cache_dir: &Path,
+    segment_dir: &Path,
+    project: &Project,
+    video_clips: &[&Clip],
+    video_track_ids: &[String],
+    start: f64,
+    boundary: f64,
+    duration: f64,
+    seg_index: usize,
+    preview: bool,
+    encoder: &str,
+    width: u32,
+    height: u32,
+    cancel_flag: Option<&std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<PathBuf> {
+    // 先查 transition_in（incoming clip 的入场转场），再查 transition_out（outgoing clip 的出场转场）
+    let transition_clip_in = video_clips.iter().copied().find(|clip| {
+        (clip.start_on_track - boundary).abs() < 0.05 && transition_name(clip).is_some()
+    });
+    let transition_clip_out = video_clips.iter().copied().find(|clip| {
+        (clip.start_on_track + clip.duration - boundary).abs() < 0.05
+            && transition_out_name(clip).is_some()
+    });
+    // transition_in 优先；若无则用 transition_out
+    let xfade_name = if let Some(clip) = transition_clip_in {
+        transition_name(clip).map(xfade_filter_name).unwrap_or("fade")
+    } else if let Some(clip) = transition_clip_out {
+        transition_out_name(clip).map(xfade_filter_name).unwrap_or("fade")
+    } else {
+        "fade"
+    };
+
+    let work_dir = segment_dir.join(format!("transition-{:03}", seg_index));
+    tokio::fs::create_dir_all(&work_dir).await?;
+
+    let prev_clips = active_clips_for_window(video_clips, video_track_ids, start, boundary);
+    let next_clips =
+        active_clips_for_window(video_clips, video_track_ids, boundary, boundary + duration);
+
+    let prev_path = if prev_clips.is_empty() {
+        render_black_segment(
+            &work_dir, project, duration, 0, preview, encoder, width, height,
+        )
+        .await?
+    } else {
+        render_segment_with_overlay(
+            cache_dir,
+            &work_dir,
+            project,
+            &prev_clips,
+            start,
+            duration,
+            0,
+            preview,
+            encoder,
+            width,
+            height,
+        )
+        .await?
+    };
+    let next_path = if next_clips.is_empty() {
+        render_black_segment(
+            &work_dir, project, duration, 1, preview, encoder, width, height,
+        )
+        .await?
+    } else {
+        render_segment_with_overlay(
+            cache_dir,
+            &work_dir,
+            project,
+            &next_clips,
+            boundary,
+            duration,
+            1,
+            preview,
+            encoder,
+            width,
+            height,
+        )
+        .await?
+    };
+
+    let output_path = segment_dir.join(format!("seg-{:03}.mp4", seg_index));
+    let filter = format!(
+        "[0:v][1:v]xfade=transition={xfade_name}:duration={duration:.3}:offset=0,format=yuv420p[vout]"
+    );
+    let (enc_name, enc_extra) =
+        encoder_args(encoder, preview, Some(project.render_config.bitrate_mbps));
+    let mut args: Vec<String> = vec![
+        "-y".to_string(),
+        "-i".to_string(),
+        prev_path.to_string_lossy().to_string(),
+        "-i".to_string(),
+        next_path.to_string_lossy().to_string(),
+        "-filter_complex".to_string(),
+        filter,
+        "-map".to_string(),
+        "[vout]".to_string(),
+        "-r".to_string(),
+        project.render_config.fps.to_string(),
+        "-c:v".to_string(),
+        enc_name,
+    ];
+    args.extend(enc_extra);
+    args.extend([
+        "-an".to_string(),
+        "-movflags".to_string(),
+        "+faststart".to_string(),
+        output_path.to_string_lossy().to_string(),
+    ]);
+
+    check_cancel(cancel_flag)?;
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(&args);
+    let output = run_with_timeout_and_cancel(&mut cmd, 1800, cancel_flag).await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "转场渲染段 {} 失败：{}",
             seg_index,
             String::from_utf8_lossy(&output.stderr).trim()
         );
@@ -979,33 +2001,56 @@ async fn render_single_clip_for_segment(
     let source = match project
         .media
         .iter()
-        .find(|m| Some(&m.id) == clip.source_id.as_ref()) {
+        .find(|m| Some(&m.id) == clip.source_id.as_ref())
+    {
         Some(s) => s,
         None => {
             // 未绑定素材 → 渲染纯黑段（避免崩溃）
-            return render_black_segment(segment_dir, project, seg_duration, seg_index, preview, encoder, width, height).await;
+            return render_black_segment(
+                segment_dir,
+                project,
+                seg_duration,
+                seg_index,
+                preview,
+                encoder,
+                width,
+                height,
+            )
+            .await;
         }
     };
     let local_path = ensure_media_local(cache_dir, source).await?;
     let scale_filter = format!(
         "scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},format=yuv420p"
     );
-    // T4.3: 曲线变速导出 —— v1 用曲线控制点的平均速度作为该 clip 的等效常速
-    // （真正的逐段变速需拆子段渲染，留作后续增强；数据模型 speed_curve 已就绪）
-    let speed_abs = if let Some(curve) = clip.speed_curve.as_ref().filter(|c| !c.is_empty()) {
-        let avg: f64 = curve.iter().map(|p| p.speed.abs()).sum::<f64>() / curve.len() as f64;
-        avg.clamp(0.0625, 16.0)
-    } else {
-        clip.speed.abs().clamp(0.25, 4.0)
-    };
-    let is_reverse = clip.speed < 0.0;
+    let is_image = source.kind == "image";
+    if !is_image && clip.speed_curve.as_ref().is_some_and(|c| !c.is_empty()) {
+        return render_curve_speed_clip_for_segment(
+            segment_dir,
+            project,
+            clip,
+            &local_path,
+            seg_start,
+            seg_duration,
+            seg_index,
+            preview,
+            encoder,
+            width,
+            height,
+            &scale_filter,
+        )
+        .await;
+    }
+
+    let speed_abs = clip.speed.abs().clamp(0.25, 4.0);
+    let is_reverse = clip.speed < 0.0 || clip.reverse;
     let color_fx = clip_color_filter(clip);
     let source_crop = clip_source_crop(clip);
     // crop 在 scale 之前执行（操作源帧）
     let mut video_filter = if source_crop.is_empty() {
         scale_filter.clone()
     } else {
-        format!("{}{}", source_crop.trim_start_matches(','), scale_filter)
+        format!("{},{}", source_crop.trim_start_matches(','), scale_filter)
     };
     if is_reverse {
         video_filter.push_str(",reverse");
@@ -1019,7 +2064,6 @@ async fn render_single_clip_for_segment(
     let source_time = clip.source_in + offset_into_clip * speed_abs;
     let output_path = segment_dir.join(format!("seg-{:03}.mp4", seg_index));
 
-    let is_image = source.kind == "image";
     let local_str = local_path.to_string_lossy().to_string();
     let mut args: Vec<String> = vec!["-y".to_string()];
     if is_image {
@@ -1044,7 +2088,8 @@ async fn render_single_clip_for_segment(
     args.push("-r".to_string());
     args.push(format!("{}", project.render_config.fps));
     // 编码器：统一用 encoder_args
-    let (sc_enc_name, sc_enc_extra) = encoder_args(encoder, preview);
+    let (sc_enc_name, sc_enc_extra) =
+        encoder_args(encoder, preview, Some(project.render_config.bitrate_mbps));
     args.push("-c:v".to_string());
     args.push(sc_enc_name);
     args.extend(sc_enc_extra);
@@ -1064,6 +2109,233 @@ async fn render_single_clip_for_segment(
     Ok(output_path)
 }
 
+#[derive(Debug, Clone)]
+struct CurveRenderSegment {
+    source_in: f64,
+    speed: f64,
+    timeline_start: f64,
+    timeline_end: f64,
+}
+
+fn speed_curve_to_segments(
+    curve: &[crate::models::SpeedPoint],
+    source_duration: f64,
+) -> Vec<CurveRenderSegment> {
+    if curve.is_empty() || source_duration <= 0.0 {
+        return vec![];
+    }
+    let mut points = curve.to_vec();
+    points.sort_by(|a, b| {
+        a.time
+            .partial_cmp(&b.time)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if let Some(first) = points.first().cloned() {
+        if first.time > 0.0 {
+            points.insert(
+                0,
+                crate::models::SpeedPoint {
+                    time: 0.0,
+                    speed: first.speed,
+                },
+            );
+        }
+    }
+    if let Some(last) = points.last().cloned() {
+        if last.time < 1.0 {
+            points.push(crate::models::SpeedPoint {
+                time: 1.0,
+                speed: last.speed,
+            });
+        }
+    }
+
+    let mut segments = Vec::new();
+    let mut timeline_cursor = 0.0;
+    for pair in points.windows(2) {
+        let t0 = pair[0].time * source_duration;
+        let t1 = pair[1].time * source_duration;
+        let span = t1 - t0;
+        if span <= 0.0 {
+            continue;
+        }
+        let sub_count = (span / 0.5).ceil().max(1.0) as usize;
+        for s in 0..sub_count {
+            let sub_t0 = t0 + (span * s as f64) / sub_count as f64;
+            let sub_t1 = t0 + (span * (s + 1) as f64) / sub_count as f64;
+            let r = (s as f64 + 0.5) / sub_count as f64;
+            let speed = (pair[0].speed + (pair[1].speed - pair[0].speed) * r)
+                .abs()
+                .clamp(0.0625, 16.0);
+            let timeline_span = (sub_t1 - sub_t0) / speed;
+            segments.push(CurveRenderSegment {
+                source_in: sub_t0,
+                speed,
+                timeline_start: timeline_cursor,
+                timeline_end: timeline_cursor + timeline_span,
+            });
+            timeline_cursor += timeline_span;
+        }
+    }
+    segments
+}
+
+async fn render_curve_speed_clip_for_segment(
+    segment_dir: &Path,
+    project: &Project,
+    clip: &Clip,
+    local_path: &Path,
+    seg_start: f64,
+    seg_duration: f64,
+    seg_index: usize,
+    preview: bool,
+    encoder: &str,
+    width: u32,
+    height: u32,
+    scale_filter: &str,
+) -> anyhow::Result<PathBuf> {
+    let curve = clip.speed_curve.as_ref().expect("checked by caller");
+    let source_duration = (clip.source_out - clip.source_in).max(0.0);
+    let curve_segments = speed_curve_to_segments(curve, source_duration);
+    if curve_segments.is_empty() {
+        return render_black_segment(
+            segment_dir,
+            project,
+            seg_duration,
+            seg_index,
+            preview,
+            encoder,
+            width,
+            height,
+        )
+        .await;
+    }
+
+    let rel_start = (seg_start - clip.start_on_track).max(0.0);
+    let rel_end = rel_start + seg_duration;
+    let source_crop = clip_source_crop(clip);
+    let color_fx = clip_color_filter(clip);
+    let base_filter = if source_crop.is_empty() {
+        scale_filter.to_string()
+    } else {
+        format!("{},{}", source_crop.trim_start_matches(','), scale_filter)
+    };
+    let output_path = segment_dir.join(format!("seg-{:03}.mp4", seg_index));
+    let mut part_paths = Vec::new();
+
+    for (part_index, curve_seg) in curve_segments.iter().enumerate() {
+        let part_start = rel_start.max(curve_seg.timeline_start);
+        let part_end = rel_end.min(curve_seg.timeline_end);
+        if part_end <= part_start {
+            continue;
+        }
+        let source_part_in =
+            curve_seg.source_in + (part_start - curve_seg.timeline_start) * curve_seg.speed;
+        let source_part_out =
+            curve_seg.source_in + (part_end - curve_seg.timeline_start) * curve_seg.speed;
+        let source_span = (source_part_out - source_part_in).max(0.001);
+        let timeline_span = part_end - part_start;
+        let mut video_filter = base_filter.clone();
+        if (curve_seg.speed - 1.0).abs() > f64::EPSILON {
+            video_filter = format!("{video_filter},setpts={:.6}*PTS", 1.0 / curve_seg.speed);
+        }
+        video_filter.push_str(&color_fx);
+
+        let part_path =
+            segment_dir.join(format!("seg-{:03}-curve-{:03}.mp4", seg_index, part_index));
+        let mut args: Vec<String> = vec![
+            "-y".to_string(),
+            "-ss".to_string(),
+            format!("{:.3}", clip.source_in + source_part_in),
+            "-i".to_string(),
+            local_path.to_string_lossy().to_string(),
+            "-t".to_string(),
+            format!("{:.3}", source_span),
+            "-vf".to_string(),
+            video_filter,
+            "-r".to_string(),
+            format!("{}", project.render_config.fps),
+        ];
+        let (enc_name, enc_extra) =
+            encoder_args(encoder, preview, Some(project.render_config.bitrate_mbps));
+        args.push("-c:v".to_string());
+        args.push(enc_name);
+        args.extend(enc_extra);
+        args.push("-an".to_string());
+        args.push("-movflags".to_string());
+        args.push("+faststart".to_string());
+        args.push("-t".to_string());
+        args.push(format!("{:.3}", timeline_span));
+        args.push(part_path.to_string_lossy().to_string());
+
+        let output = Command::new("ffmpeg").args(&args).output().await?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "曲线变速子段 {}-{} 渲染失败：{}",
+                seg_index,
+                part_index,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        part_paths.push(part_path);
+    }
+
+    if part_paths.is_empty() {
+        return render_black_segment(
+            segment_dir,
+            project,
+            seg_duration,
+            seg_index,
+            preview,
+            encoder,
+            width,
+            height,
+        )
+        .await;
+    }
+    if part_paths.len() == 1 {
+        tokio::fs::copy(&part_paths[0], &output_path).await?;
+        return Ok(output_path);
+    }
+
+    let list_path = segment_dir.join(format!(
+        "curve-concat-{}-{}.txt",
+        seg_index,
+        chrono::Utc::now().timestamp_millis()
+    ));
+    let list_content = part_paths
+        .iter()
+        .map(|path| format!("file '{}'\n", path.to_string_lossy().replace('\'', "'\\''")))
+        .collect::<String>();
+    tokio::fs::write(&list_path, list_content).await?;
+
+    let output = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            &list_path.to_string_lossy(),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            &output_path.to_string_lossy(),
+        ])
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "曲线变速段 {} 拼接失败：{}",
+            seg_index,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output_path)
+}
+
 /// 第二遍：把配音轨混进视频、字幕轨烧录到画面。
 /// （Phase 6 前先用占位实现：若有配音轨则混入，字幕留到 Phase 6。）
 async fn burn_subtitle_and_mix_audio(
@@ -1074,57 +2346,21 @@ async fn burn_subtitle_and_mix_audio(
     preview: bool,
     // 转场偏移表：(转场发生时间点, 缩短量)。音频/字幕按此平移以对齐 xfade 后的视频
     transition_shrink_points: &[(f64, f64)],
+    encoder: &str,
+    cancel_flag: Option<&std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<PathBuf> {
     let render_dir = projects_dir.join(&project.id).join("renders");
     let output_path = render_dir.join(if preview { "preview.mp4" } else { "final.mp4" });
 
-    // 收集配音轨 clip 的音频文件（按时间顺序），用于混音
-    // 收集音频源 clip：配音轨 + 音频轨 + 未静音的视频轨（视频原声）
-    // TrackKind::Video/Image 的 clip 如果 track.muted=false 且 clip.volume>0，
-    // 其视频文件的音频流也参与混音（T3.4：视频原声参与导出）
-    let mut audio_track_ids: Vec<String> = Vec::new();
-    let mut muted_track_ids: Vec<String> = Vec::new();
-    for t in &project.tracks {
-        match t.kind {
-            TrackKind::Voiceover | TrackKind::Audio => {
-                audio_track_ids.push(t.id.clone());
-            }
-            TrackKind::Video | TrackKind::Image => {
-                if !t.muted {
-                    audio_track_ids.push(t.id.clone());
-                } else {
-                    muted_track_ids.push(t.id.clone());
-                }
-            }
-            TrackKind::Subtitle => {}
-        }
-    }
-    let mut audio_clips: Vec<&Clip> = project
-        .clips
-        .iter()
-        .filter(|c| {
-            // 排除静音轨 + 排除 clip.volume==0 的视频 clip
-            if muted_track_ids.contains(&c.track_id) {
-                return false;
-            }
-            if audio_track_ids.contains(&c.track_id) {
-                // 视频轨 clip 只在 volume > 0 时参与（volume=0 表示用户单独静音了该 clip）
-                return c.volume > 0.0;
-            }
-            false
-        })
-        .collect();
-    audio_clips.sort_by(|a, b| {
-        a.start_on_track
-            .partial_cmp(&b.start_on_track)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // 收集音频源 clip：配音轨 + 音频轨 + 未静音的视频轨（视频原声）。
+    // 图片轨/图片素材没有音频流，必须排除，否则提取失败会导致后续混音索引错位。
+    let audio_clips = collect_mix_audio_clips(project);
 
     // 收集字幕轨 clip，生成 .ass 字幕文件
     let subtitle_track_ids: Vec<String> = project
         .tracks
         .iter()
-        .filter(|t| t.kind == TrackKind::Subtitle)
+        .filter(|t| t.kind == TrackKind::Subtitle && !t.hidden)
         .map(|t| t.id.clone())
         .collect();
     let mut subtitle_clips: Vec<&Clip> = project
@@ -1139,18 +2375,29 @@ async fn burn_subtitle_and_mix_audio(
     });
 
     let has_subtitles = !subtitle_clips.is_empty();
-    let has_audio = audio_clips
-        .iter()
-        .any(|c| c.source_id.is_some());
+    let has_audio = audio_clips.iter().any(|c| c.source_id.is_some());
 
     // 无字幕且无配音 → 直接拷贝
     if !has_subtitles && !has_audio {
+        check_cancel(cancel_flag)?;
         tokio::fs::copy(video_input, &output_path).await?;
         return Ok(output_path);
     }
 
-    // 生成 .ass 字幕文件
-    let ass_path = if has_subtitles {
+    // 生成 .ass 字幕文件（subtitle_mode="none" 或 "srt" 时跳过烧录）
+    // SRT 模式：单独生成 .srt 文件，不烧录到画面
+    let srt_mode = project.render_config.subtitle_mode == "srt";
+    let burn_subtitles = project.render_config.subtitle_mode != "none" && !srt_mode;
+
+    // SRT 模式：生成 .srt 文件到 render_dir（与 final.mp4 同目录同名）
+    if has_subtitles && srt_mode {
+        let srt = generate_srt_subtitles(&subtitle_clips, transition_shrink_points);
+        let srt_path = render_dir.join(if preview { "preview.srt" } else { "final.srt" });
+        tokio::fs::create_dir_all(&render_dir).await?;
+        tokio::fs::write(&srt_path, &srt).await?;
+    }
+
+    let ass_path = if has_subtitles && burn_subtitles {
         let ass = generate_ass_subtitles(&subtitle_clips, project, transition_shrink_points);
         let ass_file = cache_dir.join(format!(
             "subtitles-{}-{}.ass",
@@ -1170,7 +2417,16 @@ async fn burn_subtitle_and_mix_audio(
             project.id,
             chrono::Utc::now().timestamp_millis()
         ));
-        match merge_audio_clips(cache_dir, &merged, &audio_clips, project, &project.media, transition_shrink_points).await {
+        match merge_audio_clips(
+            cache_dir,
+            &merged,
+            &audio_clips,
+            project,
+            &project.media,
+            transition_shrink_points,
+        )
+        .await
+        {
             Ok(p) => Some(p),
             Err(e) => {
                 eprintln!("音频混音失败，导出将无音轨：{e}");
@@ -1182,7 +2438,11 @@ async fn burn_subtitle_and_mix_audio(
     };
 
     // 构造 ffmpeg 命令：烧录字幕 + 混入配音
-    let mut args: Vec<String> = vec!["-y".to_string(), "-i".to_string(), video_input.to_string_lossy().to_string()];
+    let mut args: Vec<String> = vec![
+        "-y".to_string(),
+        "-i".to_string(),
+        video_input.to_string_lossy().to_string(),
+    ];
 
     // 如果有配音，加入第二个输入
     if let Some(ref audio_path) = merged_audio_path {
@@ -1195,7 +2455,8 @@ async fn burn_subtitle_and_mix_audio(
     if let Some(ref ass_file) = ass_path {
         // subtitles 滤镜烧录 .ass；force_style 可覆盖样式（.ass 内已含样式）
         // M14: 转义单引号 + 冒号（ffmpeg 滤镜路径语法）
-        let ass_str = escape_filter_path(&ass_file.to_string_lossy().replace('\\', "/")).replace(':', "\\:");
+        let ass_str =
+            escape_filter_path(&ass_file.to_string_lossy().replace('\\', "/")).replace(':', "\\:");
         vf = format!("subtitles='{}'", ass_str);
     }
 
@@ -1216,10 +2477,8 @@ async fn burn_subtitle_and_mix_audio(
 
     args.push("-c:v".to_string());
     // 编码器：统一用 encoder_args（硬件用 bitrate，软编用 preset+crf）
-    let (burn_enc_name, burn_enc_extra) = encoder_args(
-        HW_ENCODER.get().map(|s| s.as_str()).unwrap_or("libx264"),
-        preview,
-    );
+    let (burn_enc_name, burn_enc_extra) =
+        encoder_args(encoder, preview, Some(project.render_config.bitrate_mbps));
     args.push(burn_enc_name);
     args.extend(burn_enc_extra);
 
@@ -1236,16 +2495,29 @@ async fn burn_subtitle_and_mix_audio(
     args.push("+faststart".to_string());
     args.push(output_path.to_string_lossy().to_string());
 
-    let output = Command::new("ffmpeg").args(&args).output().await?;
+    check_cancel(cancel_flag)?;
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(&args);
+    let output = run_with_timeout_and_cancel(&mut cmd, 1800, cancel_flag).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         // 字幕/混音失败时尝试无字幕版本（去掉 subtitles 滤镜重试一次）
         eprintln!("字幕烧录/混音失败，尝试无字幕重试：{stderr}");
         // 重新构造命令：去掉 subtitles 滤镜
-        let mut retry_args: Vec<String> = vec!["-y".to_string(), "-i".to_string(), video_input.to_string_lossy().to_string()];
+        let mut retry_args: Vec<String> = vec![
+            "-y".to_string(),
+            "-i".to_string(),
+            video_input.to_string_lossy().to_string(),
+        ];
         if merged_audio_path.is_some() {
             retry_args.push("-i".to_string());
-            retry_args.push(merged_audio_path.as_ref().unwrap().to_string_lossy().to_string());
+            retry_args.push(
+                merged_audio_path
+                    .as_ref()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
+            );
         }
         retry_args.push("-map".to_string());
         retry_args.push("0:v".to_string());
@@ -1255,10 +2527,8 @@ async fn burn_subtitle_and_mix_audio(
         }
         retry_args.push("-c:v".to_string());
         // 重试也用 encoder_args（保持编码器一致，避免 concat 花屏）
-        let (retry_enc_name, retry_enc_extra) = encoder_args(
-            HW_ENCODER.get().map(|s| s.as_str()).unwrap_or("libx264"),
-            preview,
-        );
+        let (retry_enc_name, retry_enc_extra) =
+            encoder_args(encoder, preview, Some(project.render_config.bitrate_mbps));
         retry_args.push(retry_enc_name);
         retry_args.extend(retry_enc_extra);
         if merged_audio_path.is_some() {
@@ -1270,10 +2540,17 @@ async fn burn_subtitle_and_mix_audio(
         retry_args.push("-movflags".to_string());
         retry_args.push("+faststart".to_string());
         retry_args.push(output_path.to_string_lossy().to_string());
-        let retry_output = Command::new("ffmpeg").args(&retry_args).output().await?;
+        check_cancel(cancel_flag)?;
+        let mut retry_cmd = Command::new("ffmpeg");
+        retry_cmd.args(&retry_args);
+        let retry_output = run_with_timeout_and_cancel(&mut retry_cmd, 1800, cancel_flag).await?;
         if !retry_output.status.success() {
             // 最终回退：无字幕无混音的裸拷贝
-            eprintln!("无字幕重试也失败，输出裸视频：{}", String::from_utf8_lossy(&retry_output.stderr).trim());
+            eprintln!(
+                "无字幕重试也失败，输出裸视频：{}",
+                String::from_utf8_lossy(&retry_output.stderr).trim()
+            );
+            check_cancel(cancel_flag)?;
             tokio::fs::copy(video_input, &output_path).await?;
         }
     }
@@ -1334,7 +2611,11 @@ fn generate_ass_subtitles(
             "center" => 5,
             _ => 2,
         };
-        let margin_v = if style.position == "center" { height as i32 / 2 } else { (height as f64 * 0.06).round() as i32 };
+        let margin_v = if style.position == "center" {
+            height as i32 / 2
+        } else {
+            (height as f64 * 0.06).round() as i32
+        };
         styles_str.push_str(&format!(
             "Style: {name},{font},{size},{primary},{secondary},{outline},&H80000000,0,0,0,0,{sx},{sy},0,{rot},1,4,1,{align},{mlr},{mlr},{mv},1\n",
             name = name,
@@ -1382,12 +2663,15 @@ fn generate_ass_subtitles(
             .iter()
             .filter(|(t, _)| *t <= clip.start_on_track)
             .map(|(_, d)| *d)
-            .sum();
+            .last()
+            .unwrap_or(0.0);
         let start = seconds_to_ass_time((clip.start_on_track - shrink_before).max(0.0));
-        let end = seconds_to_ass_time((clip.start_on_track + clip.duration - shrink_before).max(0.0));
+        let end =
+            seconds_to_ass_time((clip.start_on_track + clip.duration - shrink_before).max(0.0));
 
         let style_name = if let Some(ref s) = clip.subtitle_style {
-            style_names.iter()
+            style_names
+                .iter()
                 .find(|(_, existing)| {
                     existing.font_family == s.font_family
                         && existing.font_size == s.font_size
@@ -1412,13 +2696,19 @@ fn generate_ass_subtitles(
                 if !words.is_empty() {
                     build_karaoke_text(words, clip.start_on_track, clip.duration)
                 } else {
-                    text.replace('{', "\\{").replace('}', "\\}").replace('\n', "\\N")
+                    text.replace('{', "\\{")
+                        .replace('}', "\\}")
+                        .replace('\n', "\\N")
                 }
             } else {
-                text.replace('{', "\\{").replace('}', "\\}").replace('\n', "\\N")
+                text.replace('{', "\\{")
+                    .replace('}', "\\}")
+                    .replace('\n', "\\N")
             }
         } else {
-            text.replace('{', "\\{").replace('}', "\\}").replace('\n', "\\N")
+            text.replace('{', "\\{")
+                .replace('}', "\\}")
+                .replace('\n', "\\N")
         };
 
         // T4.8: 入场/出场动画 → ASS \fad(in,out) 标签（单位厘秒）
@@ -1426,15 +2716,26 @@ fn generate_ass_subtitles(
         let anim_dur = (style.map(|s| s.animation_duration).unwrap_or(0.3) * 100.0) as u32;
         let anim_in = style.map(|s| s.animation_in.as_str()).unwrap_or("");
         let anim_out = style.map(|s| s.animation_out.as_str()).unwrap_or("");
-        let fade_in_cs = if anim_in == "fadeIn" || anim_in == "slideUp" || anim_in == "scaleIn" { anim_dur } else { 0 };
-        let fade_out_cs = if anim_out == "fadeOut" || anim_out == "slideDown" || anim_out == "scaleOut" { anim_dur } else { 0 };
+        let fade_in_cs = if anim_in == "fadeIn" || anim_in == "slideUp" || anim_in == "scaleIn" {
+            anim_dur
+        } else {
+            0
+        };
+        let fade_out_cs =
+            if anim_out == "fadeOut" || anim_out == "slideDown" || anim_out == "scaleOut" {
+                anim_dur
+            } else {
+                0
+            };
         let fade_tag = if fade_in_cs > 0 || fade_out_cs > 0 {
             format!("{{\\fad({fade_in_cs},{fade_out_cs})}}")
         } else {
             String::new()
         };
 
-        ass.push_str(&format!("Dialogue: 0,{start},{end},{style_name},,0,0,0,,{fade_tag}{escaped}\n"));
+        ass.push_str(&format!(
+            "Dialogue: 0,{start},{end},{style_name},,0,0,0,,{fade_tag}{escaped}\n"
+        ));
     }
     ass
 }
@@ -1475,8 +2776,12 @@ fn build_karaoke_text(
         // 每个词相对字幕块开始的偏移时长（秒）→ 厘秒
         let word_dur = ((w.end - w.start) * scale).max(0.01);
         let cs = (word_dur * 100.0).round().clamp(1.0, 8600.0) as u32; // ASS \kf 上限约 86s
-        // 转义花括号（词文本一般不含，但保险）
-        let escaped = w.text.replace('\\', "\\\\").replace('{', "\\{").replace('}', "\\}");
+                                                                       // 转义花括号（词文本一般不含，但保险）
+        let escaped = w
+            .text
+            .replace('\\', "\\\\")
+            .replace('{', "\\{")
+            .replace('}', "\\}");
         out.push_str(&format!("{{\\kf{cs}}}{escaped}"));
     }
     // 触发 ASS 重绘对齐：开头的 \kf 从字幕块 0 时刻开始
@@ -1508,6 +2813,54 @@ fn seconds_to_ass_time(seconds: f64) -> String {
     format!("{h:01}:{m:02}:{s:02}.{cs:02}")
 }
 
+/// SRT 时间格式：HH:MM:SS,mmm（毫秒，3 位）
+fn seconds_to_srt_time(seconds: f64) -> String {
+    let total_ms = (seconds * 1000.0).round() as u64;
+    let ms = total_ms % 1000;
+    let total_s = total_ms / 1000;
+    let s = total_s % 60;
+    let total_m = total_s / 60;
+    let m = total_m % 60;
+    let h = total_m / 60;
+    format!("{h:02}:{m:02}:{s:02},{ms:03}")
+}
+
+/// 生成 SRT 字幕文件内容（不支持逐字高亮/动画/样式，仅纯文本 + 时间戳）
+fn generate_srt_subtitles(
+    subtitle_clips: &[&Clip],
+    transition_shrink_points: &[(f64, f64)],
+) -> String {
+    let mut srt = String::new();
+    let mut index = 1u32;
+    for clip in subtitle_clips {
+        let text = clip.text.as_deref().unwrap_or("");
+        if text.trim().is_empty() {
+            continue;
+        }
+        let shrink_before: f64 = transition_shrink_points
+            .iter()
+            .filter(|(t, _)| *t <= clip.start_on_track)
+            .map(|(_, d)| *d)
+            .last()
+            .unwrap_or(0.0);
+        let start = (clip.start_on_track - shrink_before).max(0.0);
+        let end = (clip.start_on_track + clip.duration - shrink_before).max(start + 0.001);
+
+        srt.push_str(&format!("{index}\n"));
+        srt.push_str(&format!(
+            "{} --> {}\n",
+            seconds_to_srt_time(start),
+            seconds_to_srt_time(end)
+        ));
+        // SRT 换行用真实换行符；ASS 的 \N 在 SRT 里无意义，转成换行
+        let escaped = text.replace("\\N", "\n").replace("\\n", "\n");
+        srt.push_str(&escaped);
+        srt.push_str("\n\n");
+        index += 1;
+    }
+    srt
+}
+
 /// 合并配音音频 clip 为一个 wav（按时间线排列，空隙静音）
 /// T4.10: 仅导出音频（跳过视频管线，混音后输出 mp3）。
 pub async fn render_audio_only(
@@ -1523,6 +2876,17 @@ pub async fn render_audio_only(
         chrono::Utc::now().timestamp_millis()
     ));
     merge_audio_clips(cache_dir, &wav_path, audio_clips, project, media, &[]).await?;
+    if output
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("wav"))
+        .unwrap_or(false)
+    {
+        tokio::fs::copy(&wav_path, output).await?;
+        let _ = tokio::fs::remove_file(&wav_path).await;
+        return Ok(output.to_path_buf());
+    }
+
     // wav → mp3（libmp3lame）
     let mp3_output = if output.extension().and_then(|e| e.to_str()) == Some("mp3") {
         output.to_path_buf()
@@ -1530,19 +2894,18 @@ pub async fn render_audio_only(
         // 用户没指定 .mp3 后缀，强制改
         output.with_extension("mp3")
     };
-    let convert = Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-i",
-            &wav_path.to_string_lossy(),
-            "-c:a",
-            "libmp3lame",
-            "-b:a",
-            "192k",
-            &mp3_output.to_string_lossy(),
-        ])
-        .output()
-        .await?;
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
+        "-y",
+        "-i",
+        &wav_path.to_string_lossy(),
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "192k",
+        &mp3_output.to_string_lossy(),
+    ]);
+    let convert = run_with_timeout(&mut cmd, 1800).await?;
     if !convert.status.success() {
         anyhow::bail!(
             "音频转 mp3 失败：{}",
@@ -1578,28 +2941,25 @@ async fn merge_audio_clips(
     cache_dir: &Path,
     output: &Path,
     audio_clips: &[&Clip],
-    project: &Project,
+    _project: &Project,
     media: &[crate::models::MediaSource],
     // 转场偏移表：(转场发生时间点, 缩短量)。clip 的 adelay 减去它之前所有转场的累计缩短量
     transition_shrink_points: &[(f64, f64)],
 ) -> anyhow::Result<PathBuf> {
-    let total_duration = audio_clips
-        .iter()
-        .map(|c| c.start_on_track + c.duration)
-        .fold(0.0_f64, f64::max);
-
     let tmp_dir = cache_dir.join("audio-merge");
     tokio::fs::create_dir_all(&tmp_dir).await?;
 
-    // 为每个 clip 生成一段音频（在时间线上偏移 + 时长对齐）
-    let mut segment_paths: Vec<PathBuf> = Vec::new();
+    // 为每个 clip 生成一段音频（在时间线上偏移 + 时长对齐），并只保留提取成功的配对。
+    let mut extracted: Vec<(&Clip, PathBuf)> = Vec::new();
     for (i, clip) in audio_clips.iter().enumerate() {
         let source = clip
             .source_id
             .as_ref()
             .and_then(|sid| media.iter().find(|m| m.id == *sid));
         let Some(source) = source else { continue };
-        let Some(local_path) = &source.local_path else { continue };
+        let Some(local_path) = &source.local_path else {
+            continue;
+        };
 
         let seg_path = tmp_dir.join(format!("audio-{i}.wav"));
         let start = clip.source_in;
@@ -1638,33 +2998,38 @@ async fn merge_audio_clips(
         if !extract.status.success() {
             continue;
         }
-        segment_paths.push(seg_path);
+        extracted.push((*clip, seg_path));
     }
 
-    if segment_paths.is_empty() {
+    if extracted.is_empty() {
         anyhow::bail!("没有可用的音频片段");
     }
+    let total_duration = extracted
+        .iter()
+        .map(|(clip, _)| clip.start_on_track + clip.duration)
+        .fold(0.0_f64, f64::max);
 
     // 用 adelay + amix 把各段按 startOnTrack 偏移混合
     // 简化版：用 concat + adelay（每段前面插入静音 = startOnTrack - 前一段结束）
     let mut args: Vec<String> = vec!["-y".to_string()];
-    for p in &segment_paths {
+    for (_, p) in &extracted {
         args.push("-i".to_string());
         args.push(p.to_string_lossy().to_string());
     }
 
     // 构造 filter：每个输入加 adelay（按 startOnTrack 偏移）+ afade（淡入淡出），然后 amix
     let mut filter = String::new();
-    let n = segment_paths.len();
+    let n = extracted.len();
     // 默认最小淡入淡出 30ms（消除 clip 首尾波形硬切导致的爆音，借鉴 video-use 的切点交叉淡入淡出）
     const DEFAULT_FADE: f64 = 0.03;
-    for (i, clip) in audio_clips.iter().enumerate().take(n) {
+    for (i, (clip, _)) in extracted.iter().enumerate() {
         // 转场偏移：clip 起点之前所有转场累计缩短的时长，adelay 要减去它
         let shrink_before: f64 = transition_shrink_points
             .iter()
             .filter(|(t, _)| *t <= clip.start_on_track)
             .map(|(_, d)| *d)
-            .sum();
+            .last()
+            .unwrap_or(0.0);
         let adjusted_start = (clip.start_on_track - shrink_before).max(0.0);
         let delay_ms = (adjusted_start * 1000.0).round() as u64;
         let dur = clip.duration;
@@ -1681,9 +3046,26 @@ async fn merge_audio_clips(
         };
         let fade_out_start = (dur - fade_out).max(0.0);
         let vol = clip.volume.max(0.0); // 线性增益，0=静音
-        // adelay + volume(clip音量) + afade 淡入淡出
+        // 降噪：noise_reduction 0-100 映射到 afftdn nr 0-25dB（剪映默认强度适中，避免过降噪损伤人声）
+        let nr_db = (clip.noise_reduction / 100.0 * 25.0).clamp(0.0, 25.0);
+        let nr_filter = if nr_db > 0.01 {
+            format!(",afftdn=nr={nr_db:.2}:nf=-25")
+        } else {
+            String::new()
+        };
+        // B5: volume 关键帧 -- 有则用动态表达式，否则静态值
+        let vol_filter = if let Some(vol_kfs) = clip
+            .keyframes
+            .as_ref()
+            .and_then(|k| k.volume.as_ref().filter(|v| !v.is_empty()))
+        {
+            keyframes_to_volume_filter(vol_kfs, vol)
+        } else {
+            format!("volume={vol:.4}")
+        };
+        // adelay + volume(clip音量/关键帧) + 降噪 + afade 淡入淡出
         filter.push_str(&format!(
-            "[{i}:a]adelay={delay_ms}|{delay_ms},volume={vol:.4},afade=t=in:st=0:d={fade_in:.3},afade=t=out:st={fade_out_start:.3}:d={fade_out:.3}[d{i}];"
+            "[{i}:a]adelay={delay_ms}|{delay_ms},{vol_filter}{nr_filter},afade=t=in:st=0:d={fade_in:.3},afade=t=out:st={fade_out_start:.3}:d={fade_out:.3}[d{i}];"
         ));
     }
     let inputs_label: String = (0..n).map(|i| format!("[d{i}]")).collect();
@@ -1744,8 +3126,79 @@ fn clip_color_filter(clip: &Clip) -> String {
     let brightness = clip.brightness / 100.0;
     let contrast = 1.0 + clip.contrast / 100.0;
     let saturation = 1.0 + clip.saturation / 100.0;
-    if brightness.abs() > 0.001 || (contrast - 1.0).abs() > 0.001 || (saturation - 1.0).abs() > 0.001 {
-        parts.push(format!("eq=brightness={brightness:.3}:contrast={contrast:.3}:saturation={saturation:.3}"));
+    if brightness.abs() > 0.001
+        || (contrast - 1.0).abs() > 0.001
+        || (saturation - 1.0).abs() > 0.001
+    {
+        parts.push(format!(
+            "eq=brightness={brightness:.3}:contrast={contrast:.3}:saturation={saturation:.3}"
+        ));
+    }
+
+    // 色温/色调（colorbalance 滤镜）
+    // temperature -100..100 映射到 rs/rm/rh (-0.5..0.5)：正=暖（红增强），负=冷（蓝增强）
+    // tint -100..100 映射到 gs/gm/gh (-0.5..0.5)：正=品红（绿减少），负=绿（绿增强）
+    let temperature = clip.temperature / 100.0;
+    let tint = clip.tint / 100.0;
+    if temperature.abs() > 0.001 || tint.abs() > 0.001 {
+        // 色温：红正向，蓝反向（-temperature）使冷色更冷
+        // 色调：绿反向（-tint）使正值为品红
+        let rs = temperature * 0.3;
+        let rm = temperature * 0.5;
+        let rh = temperature * 0.3;
+        let gs = -tint * 0.3;
+        let gm = -tint * 0.5;
+        let gh = -tint * 0.3;
+        let bs = -temperature * 0.3;
+        let bm = -temperature * 0.5;
+        let bh = -temperature * 0.3;
+        parts.push(format!(
+            "colorbalance=rs={rs:.4}:gs={gs:.4}:bs={bs:.4}:rm={rm:.4}:gm={gm:.4}:bm={bm:.4}:rh={rh:.4}:gh={gh:.4}:bh={bh:.4}"
+        ));
+    }
+
+    // 视觉特效（剪映式"特效"面板）
+    if let Some(effects) = &clip.visual_effects {
+        for eff in effects {
+            let intensity = eff.intensity.max(0.0).min(100.0) / 100.0;
+            match eff.kind.as_str() {
+                // 暗角：vignette 滤镜
+                "vignette" => {
+                    let k = intensity * 0.8;
+                    parts.push(format!("vignette=PI/5+{k:.4}"));
+                }
+                // 边缘发光：gblur 简化版（完整 glow 需 overlay blend，这里单独模糊）
+                "glow" => {
+                    let sigma = 1.0 + intensity * 4.0;
+                    parts.push(format!("gblur=sigma={sigma:.2}"));
+                }
+                // 镜像
+                "mirror" => {
+                    parts.push("hflip".to_string());
+                }
+                // 反色
+                "invert" => {
+                    parts.push("negate".to_string());
+                }
+                // 灰度
+                "grayscale" => {
+                    parts.push("format=gray,format=yuv420p".to_string());
+                }
+                // 闪烁：hue 周期性偏移
+                "flicker" => {
+                    let h = intensity * 30.0;
+                    parts.push(format!("hue=h='{h}*sin(t)'"));
+                }
+                // 抖动：crop 周期性偏移
+                "shake" => {
+                    let amp = intensity * 8.0;
+                    parts.push(format!(
+                        "crop=iw-2*{amp}:ih-2*{amp}:x='{amp}+{amp}*sin(2*PI*t)':y='{amp}+{amp}*cos(3*PI*t)'"
+                    ));
+                }
+                _ => {}
+            }
+        }
     }
 
     // 第二步：LUT 预设滤镜（lut3d，和预览 WebGL LUT 一致 → WYSIWYG）
@@ -1758,7 +3211,9 @@ fn clip_color_filter(clip: &Clip) -> String {
                     let lut_path = temp_dir.join(format!("scenescript-lut-{filter_name}.cube"));
                     if std::fs::write(&lut_path, lut_content).is_ok() {
                         // M14: 统一路径转义（单引号 + 冒号）
-                        let lut_str = escape_filter_path(&lut_path.to_string_lossy().replace('\\', "/")).replace(':', "\\:");
+                        let lut_str =
+                            escape_filter_path(&lut_path.to_string_lossy().replace('\\', "/"))
+                                .replace(':', "\\:");
                         parts.push(format!("lut3d=file='{lut_str}'"));
                     }
                 }
@@ -1814,40 +3269,50 @@ fn export_dimensions_for_project(project: &Project) -> (u32, u32) {
 /// 转义 ffmpeg 滤镜参数里的单引号（M14）：' → '\''（用于 subtitles/lut3d 的 file= 路径）
 
 /// T4.4: 生成蒙版的 alpha 滤镜表达式（用于 geq 的 a 通道）。
-/// 返回 None 表示无蒙版。返回的字符串是 geq 的 a= 表达式（不含 "a=" 前缀）。
-/// feather 用 smoothstep 近似：clip((edge-d)/feather,0,1)*255
+/// 返回的字符串是 geq 的 a= 表达式（不含 "a=" 前缀）。
 fn mask_alpha_expr(mask: &crate::models::ClipMask) -> String {
-    let inv = if mask.invert { "255-" } else { "" };
-    match mask.kind.as_str() {
+    let feather = mask.feather.max(0.0);
+    let base = match mask.kind.as_str() {
         "circle" => {
-            // 到中心的椭圆距离，与半径比较
             let rx = (mask.width / 2.0).max(0.01);
             let ry = (mask.height / 2.0).max(0.01);
             let cx = mask.cx;
             let cy = mask.cy;
-            let feather = mask.feather.max(0.001);
-            format!(
-                "{inv}clip((1-sqrt(pow((X/w-{cx})*{rx},2)+pow((Y/h-{cy})*{ry},2)))/{feather},0,1)*255"
-            )
+            let d = format!("pow((X/W-{cx})/{rx},2)+pow((Y/H-{cy})/{ry},2)");
+            if feather <= 0.0001 {
+                format!("if(gt(({d}),1),0,255)")
+            } else {
+                format!("255*clip((1+{feather}-({d}))/{feather},0,1)")
+            }
         }
         "rect" => {
             let l = mask.cx - mask.width / 2.0;
             let r = mask.cx + mask.width / 2.0;
             let t = mask.cy - mask.height / 2.0;
             let b = mask.cy + mask.height / 2.0;
-            let feather = mask.feather.max(0.001);
-            // 在矩形内为 1（255），边界羽化
-            format!(
-                "{inv}clip(min(min((X/w-{l})/{feather},({r}-X/w)/{feather}),min((Y/h-{t})/{feather},({b}-Y/h)/{feather})),0,1)*255"
-            )
+            let edge_dist = format!("min(min(X/W-{l},{r}-X/W),min(Y/H-{t},{b}-Y/H))");
+            if feather <= 0.0001 {
+                format!("if(lt({edge_dist},0),0,255)")
+            } else {
+                format!("255*clip(({edge_dist})/{feather},0,1)")
+            }
         }
         "linear" | "mirror" => {
-            // 线性渐变：按 X 位置（0-1）
-            let feather = mask.feather.max(0.001);
-            format!("{inv}clip((X/w)/{feather},0,1)*255")
+            let f = feather.max(0.0001);
+            if mask.kind == "mirror" {
+                format!("255*clip((1-abs(2*X/W-1))/{f},0,1)")
+            } else {
+                format!("255*clip((X/W)/{f},0,1)")
+            }
         }
-        _ => format!("{inv}255"),
-    }
+        _ => "255".to_string(),
+    };
+    let masked = if mask.invert {
+        format!("255-({base})")
+    } else {
+        base
+    };
+    format!("alpha(X,Y)*({masked})/255")
 }
 
 /// T4.2: 把关键帧序列编译为 ffmpeg overlay 的 x/y 分段线性表达式。
@@ -1867,7 +3332,11 @@ fn keyframes_to_overlay_expr(
     }
     // 按 time 排序
     let mut sorted: Vec<&crate::models::Keyframe> = kfs.iter().collect();
-    sorted.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(|a, b| {
+        a.time
+            .partial_cmp(&b.time)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // 对百分比（0-100 数值）做分段线性插值，默认取末帧值
     let mut expr = format!("{:.4}", sorted[sorted.len() - 1].value);
@@ -1879,11 +3348,126 @@ fn keyframes_to_overlay_expr(
         let span = (tb - ta).max(0.001);
         expr = format!(
             "if(lt(t,{tb:.4}),{va:.4}+(t-{ta:.4})*{dv:.4}/{span:.4},{expr})",
-            tb = tb, va = a.value, ta = ta, dv = b.value - a.value, span = span, expr = expr
+            tb = tb,
+            va = a.value,
+            ta = ta,
+            dv = b.value - a.value,
+            span = span,
+            expr = expr
         );
     }
     // 外层转像素：0-100 百分比 → (主画面-叠加画面) * pct/100
     format!("({dim}-{dim_cap})*({expr})/100")
+}
+
+/// B5: 把 volume 关键帧编译为 ffmpeg volume 滤镜的表达式。
+/// volume 值是线性增益（1.0=原音量，0.0=静音）。
+/// t 变量在 adelay 之后从 0 开始，对应 clip 播放时间，所以 offset=0。
+fn keyframes_to_volume_filter(kfs: &[crate::models::Keyframe], fallback: f64) -> String {
+    if kfs.is_empty() {
+        return format!("volume={fallback:.4}");
+    }
+    let expr = keyframes_to_value_expr(kfs, fallback, 0.0);
+    format!("volume='{expr}':eval=frame")
+}
+
+/// B3/B4: 通用关键帧分段线性插值表达式（返回纯表达式，不带滤镜前缀）。
+/// t 是 ffmpeg 内置时间变量。offset 把关键帧相对 clip 时间对齐到段内时间。
+fn keyframes_to_value_expr(
+    kfs: &[crate::models::Keyframe],
+    fallback: f64,
+    offset: f64,
+) -> String {
+    if kfs.is_empty() {
+        return format!("{:.4}", fallback);
+    }
+    let mut sorted: Vec<&crate::models::Keyframe> = kfs.iter().collect();
+    sorted.sort_by(|a, b| {
+        a.time
+            .partial_cmp(&b.time)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut expr = format!("{:.4}", sorted[sorted.len() - 1].value);
+    for i in (1..sorted.len()).rev() {
+        let a = sorted[i - 1];
+        let b = sorted[i];
+        let ta = a.time + offset;
+        let tb = b.time + offset;
+        let span = (tb - ta).max(0.001);
+        expr = format!(
+            "if(lt(t,{tb:.4}),{va:.4}+(t-{ta:.4})*{dv:.4}/{span:.4},{expr})",
+            tb = tb,
+            va = a.value,
+            ta = ta,
+            dv = b.value - a.value,
+            span = span,
+            expr = expr
+        );
+    }
+    expr
+}
+
+/// B2: 静态旋转滤镜。90/180/270 度用 transpose（更快），其他角度用 rotate。
+/// 返回的字符串不含前导逗号（调用方自行加）。
+fn rotation_filter(rotation: f64) -> String {
+    if rotation.abs() < 0.01 {
+        return String::new();
+    }
+    let deg = rotation % 360.0;
+    if (deg - 90.0).abs() < 0.5 {
+        ",transpose=1".to_string()
+    } else if (deg - 180.0).abs() < 0.5 {
+        ",transpose=1,transpose=1".to_string()
+    } else if (deg - 270.0).abs() < 0.5 || (deg + 90.0).abs() < 0.5 {
+        ",transpose=2".to_string()
+    } else {
+        let rad = deg * std::f64::consts::PI / 180.0;
+        format!(",format=rgba,rotate={rad:.6}:fillcolor=black@0:ow=hypot(iw,ih):oh=hypot(iw,ih),format=yuva420p")
+    }
+}
+
+/// T4.2: opacity 关键帧导出近似。
+/// ffmpeg 的 overlay alpha 动画无法像 x/y 一样直接表达每帧透明度，这里严格按文档只取首尾关键帧：
+/// 首帧 < 末帧 → alpha fade in；首帧 > 末帧 → alpha fade out；中间关键帧暂按预览 only。
+fn opacity_keyframes_to_fade_filters(
+    kfs: &[crate::models::Keyframe],
+    offset: f64,
+) -> Option<String> {
+    if kfs.len() < 2 {
+        return None;
+    }
+    let mut sorted: Vec<&crate::models::Keyframe> = kfs.iter().collect();
+    sorted.sort_by(|a, b| {
+        a.time
+            .partial_cmp(&b.time)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    // B6: 支持任意数量关键帧 -- 用 geq 在 alpha 通道做分段线性插值
+    // opacity value 是 0-100 百分比，转为 0-1 的 alpha 值
+    let mut expr = format!("{:.4}", sorted[sorted.len() - 1].value / 100.0);
+    for i in (1..sorted.len()).rev() {
+        let a = sorted[i - 1];
+        let b = sorted[i];
+        let ta = a.time + offset;
+        let tb = b.time + offset;
+        let span = (tb - ta).max(0.001);
+        let va = a.value / 100.0;
+        let vb = b.value / 100.0;
+        expr = format!(
+            "if(lt(t,{tb:.4}),{va:.4}+(t-{ta:.4})*{dv:.4}/{span:.4},{expr})",
+            tb = tb,
+            va = va,
+            ta = ta,
+            dv = vb - va,
+            span = span,
+            expr = expr
+        );
+    }
+    // geq 设置 alpha = 原alpha * expr / 1（expr 已是 0-1）
+    // format=rgba 确保有 alpha 通道
+    Some(format!(
+        ",format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*{expr}'"
+    ))
 }
 
 fn escape_filter_path(path: &str) -> String {
@@ -1895,4 +3479,419 @@ fn sanitize_file_stem(value: &str) -> String {
         .chars()
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
         .collect()
+}
+
+fn transition_name(clip: &Clip) -> Option<&str> {
+    let name = clip.transition_in.as_ref()?.name();
+    if name == "none" {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+fn transition_duration(clip: &Clip, fallback: f64) -> f64 {
+    clip.transition_in
+        .as_ref()
+        .map(|transition| transition.duration(fallback))
+        .unwrap_or(fallback)
+        .max(0.1)
+}
+
+fn transition_out_name(clip: &Clip) -> Option<&str> {
+    let name = clip.transition_out.as_ref()?.name();
+    if name == "none" {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+fn transition_out_duration(clip: &Clip, fallback: f64) -> f64 {
+    clip.transition_out
+        .as_ref()
+        .map(|transition| transition.duration(fallback))
+        .unwrap_or(fallback)
+        .max(0.1)
+}
+
+fn xfade_filter_name(name: &str) -> &str {
+    match name {
+        "slide" => "slideleft",
+        "zoom" => "smoothleft",
+        "wipe" => "wipeleft",
+        "blur" => "dissolve",
+        "fade" | "dissolve" | "fadeblack" | "fadewhite" | "wipeleft" | "wiperight" | "wipeup"
+        | "wipedown" | "slideleft" | "slideright" | "slideup" | "slidedown" | "smoothleft"
+        | "smoothright" | "smoothup" | "smoothdown" | "circleopen" | "circleclose" | "radial"
+        | "horzopen" | "horzclose" | "vertopen" | "vertclose" | "diagbl" | "diagbr" | "diagtl"
+        | "diagtr" | "hlslice" | "hrslice" | "vuslice" | "vdslice" | "hblur" | "fadegrays"
+        | "pixellize" | "sshred" => name,
+        _ => "fade",
+    }
+}
+
+fn active_clips_for_window<'a>(
+    video_clips: &[&'a Clip],
+    video_track_ids: &[String],
+    start: f64,
+    end: f64,
+) -> Vec<&'a Clip> {
+    let mut active_clips: Vec<&Clip> = video_clips
+        .iter()
+        .filter(|clip| {
+            clip.start_on_track < end - 0.01 && clip.start_on_track + clip.duration > start + 0.01
+        })
+        .copied()
+        .collect();
+    active_clips.sort_by_key(|clip| {
+        video_track_ids
+            .iter()
+            .position(|track_id| *track_id == clip.track_id)
+            .unwrap_or(0)
+    });
+    active_clips
+}
+
+#[derive(Debug, Clone)]
+enum RenderUnit {
+    Normal { start: f64, end: f64 },
+    Transition { start: f64, boundary: f64, end: f64 },
+}
+
+fn build_render_units(
+    video_clips: &[&Clip],
+    total_duration: f64,
+    fallback_transition_duration: f64,
+) -> Vec<RenderUnit> {
+    let mut transitions: Vec<(f64, f64)> = Vec::new();
+    for incoming in video_clips {
+        let Some(_) = transition_name(incoming) else {
+            continue;
+        };
+        let boundary = incoming.start_on_track;
+        if boundary <= 0.05 {
+            continue;
+        }
+        let Some(prev) = video_clips.iter().copied().find(|candidate| {
+            candidate.track_id == incoming.track_id
+                && (candidate.start_on_track + candidate.duration - boundary).abs() < 0.05
+        }) else {
+            continue;
+        };
+        let duration = transition_duration(incoming, fallback_transition_duration)
+            .min(prev.duration)
+            .min(incoming.duration)
+            .min(boundary)
+            .max(0.0);
+        if duration > 0.05 {
+            transitions.push((boundary, duration));
+        }
+    }
+    // B7: transition_out 扫描 -- outgoing clip 结束时与下一个 clip 的转场
+    for outgoing in video_clips {
+        let Some(_) = transition_out_name(outgoing) else {
+            continue;
+        };
+        let boundary = outgoing.start_on_track + outgoing.duration;
+        if boundary >= total_duration - 0.05 {
+            continue;
+        }
+        let Some(next) = video_clips.iter().copied().find(|candidate| {
+            candidate.track_id == outgoing.track_id
+                && (candidate.start_on_track - boundary).abs() < 0.05
+        }) else {
+            continue;
+        };
+        let duration = transition_out_duration(outgoing, fallback_transition_duration)
+            .min(outgoing.duration)
+            .min(next.duration)
+            .min(boundary)
+            .max(0.0);
+        if duration > 0.05 && !transitions.iter().any(|(b, _)| (*b - boundary).abs() < 0.05) {
+            transitions.push((boundary, duration));
+        }
+    }
+    transitions.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // 收集所有 clip 边界（用于切分 Normal 段）
+    // 关键：如果不按 clip 边界切分，单轨多 clip 的整个时间线会被当成 1 个 segment，
+    // render_segment_with_overlay 把所有 clip 作为 overlay 输入，主输入素材短会导致输出被截断
+    let mut clip_boundaries: Vec<f64> = Vec::new();
+    for clip in video_clips {
+        clip_boundaries.push(clip.start_on_track);
+        clip_boundaries.push(clip.start_on_track + clip.duration);
+    }
+    clip_boundaries.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    clip_boundaries.dedup_by(|a, b| (*a - *b).abs() < 0.05);
+
+    let mut units = Vec::new();
+    let mut cursor = 0.0;
+    for (boundary, duration) in transitions {
+        let start = (boundary - duration).max(cursor);
+        // Normal 段 [cursor, start]：按 clip 边界进一步切分
+        if start - cursor > 0.05 {
+            units.extend(split_normal_by_clip_boundaries(&clip_boundaries, cursor, start));
+        }
+        if boundary - start > 0.05 {
+            units.push(RenderUnit::Transition {
+                start,
+                boundary,
+                end: boundary,
+            });
+        }
+        cursor = boundary;
+    }
+    // 最后的 Normal 段 [cursor, total_duration]：按 clip 边界切分
+    if total_duration - cursor > 0.05 {
+        units.extend(split_normal_by_clip_boundaries(&clip_boundaries, cursor, total_duration));
+    }
+    units
+}
+
+/// 在 [seg_start, seg_end] 区间内，按 clip 边界把 Normal 段切分成多个子段。
+/// 这样每个子段内只有 1 个活跃 clip（单轨情况），走 render_single_clip_for_segment 路径，
+/// 该路径有 -stream_loop -1，能正确处理素材短于段时长的情况。
+fn split_normal_by_clip_boundaries(
+    clip_boundaries: &[f64],
+    seg_start: f64,
+    seg_end: f64,
+) -> Vec<RenderUnit> {
+    let mut boundaries: Vec<f64> = vec![seg_start];
+    for &b in clip_boundaries {
+        if b > seg_start + 0.05 && b < seg_end - 0.05 {
+            boundaries.push(b);
+        }
+    }
+    boundaries.push(seg_end);
+    boundaries.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    boundaries.dedup_by(|a, b| (*a - *b).abs() < 0.05);
+
+    let mut units = Vec::new();
+    for window in boundaries.windows(2) {
+        let start = window[0];
+        let end = window[1];
+        if end - start > 0.05 {
+            units.push(RenderUnit::Normal { start, end });
+        }
+    }
+    units
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{
+        ClipTransform, ClipTransition, MediaSource, Project, RenderConfig, Track, TrackKind,
+        TransitionConfig,
+    };
+
+    fn clip(id: &str, track_id: &str, start: f64, duration: f64) -> Clip {
+        Clip {
+            id: id.to_string(),
+            track_id: track_id.to_string(),
+            source_id: Some(format!("source-{id}")),
+            start_on_track: start,
+            duration,
+            source_in: 0.0,
+            source_out: duration,
+            speed: 1.0,
+            speed_curve: None,
+            volume: 1.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            noise_reduction: 0.0,
+            filter: None,
+            brightness: 0.0,
+            contrast: 0.0,
+            saturation: 0.0,
+        temperature: 0.0,
+        tint: 0.0,
+            transform: None,
+            keyframes: None,
+            mask: None,
+        visual_effects: None,
+        reverse: false,
+            visual_query: None,
+            crop: None,
+            text: None,
+            subtitle_style: None,
+            words: None,
+            transition_in: None,
+            transition_out: None,
+        }
+    }
+
+    fn total_unit_duration(units: &[RenderUnit]) -> f64 {
+        units
+            .iter()
+            .map(|unit| match unit {
+                RenderUnit::Normal { start, end } => end - start,
+                RenderUnit::Transition { start, end, .. } => end - start,
+            })
+            .sum()
+    }
+
+    fn media(id: &str) -> MediaSource {
+        MediaSource {
+            id: id.to_string(),
+            kind: "video".to_string(),
+            title: id.to_string(),
+            url: None,
+            local_path: Some(format!("/tmp/{id}.mp4")),
+            proxy_path: None,
+            proxy_status: None,
+            proxy_width: None,
+            proxy_height: None,
+            thumbnail_url: None,
+            width: 1920,
+            height: 1080,
+            duration: 10.0,
+            source: "local".to_string(),
+        }
+    }
+
+    fn track(id: &str, order: u32) -> Track {
+        Track {
+            id: id.to_string(),
+            kind: TrackKind::Video,
+            name: id.to_string(),
+            order,
+            muted: false,
+            locked: false,
+        hidden: false,
+        height: 0,
+        }
+    }
+
+    fn project_for(clips: Vec<Clip>) -> Project {
+        let media = clips
+            .iter()
+            .filter_map(|clip| clip.source_id.as_deref())
+            .map(media)
+            .collect();
+        Project {
+            id: "p".to_string(),
+            title: "p".to_string(),
+            script: String::new(),
+            ratio: "16:9".to_string(),
+            fps: 30,
+            media,
+            tracks: vec![track("v1", 2), track("v2", 1)],
+            clips,
+            render_config: RenderConfig::default(),
+            preview_path: None,
+            final_path: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn render_units_keep_timeline_duration_for_config_transition() {
+        let a = clip("a", "v1", 0.0, 2.0);
+        let mut b = clip("b", "v1", 2.0, 2.0);
+        b.transition_in = Some(ClipTransition::Config(TransitionConfig {
+            name: "fade".to_string(),
+            duration: 0.5,
+        }));
+        let clips = vec![&a, &b];
+
+        let units = build_render_units(&clips, 4.0, 0.75);
+
+        assert_eq!(units.len(), 3);
+        assert!((total_unit_duration(&units) - 4.0).abs() < 0.001);
+        assert!(matches!(
+            units[1],
+            RenderUnit::Transition {
+                start,
+                boundary,
+                end
+            } if (start - 1.5).abs() < 0.001
+                && (boundary - 2.0).abs() < 0.001
+                && (end - 2.0).abs() < 0.001
+        ));
+    }
+
+    #[test]
+    fn render_units_keep_timeline_duration_for_legacy_transition() {
+        let a = clip("a", "v1", 0.0, 2.0);
+        let mut b = clip("b", "v1", 2.0, 2.0);
+        b.transition_in = Some(ClipTransition::Legacy("fade".to_string()));
+        let clips = vec![&a, &b];
+
+        let units = build_render_units(&clips, 4.0, 0.75);
+
+        assert!((total_unit_duration(&units) - 4.0).abs() < 0.001);
+        assert!(matches!(
+            units[1],
+            RenderUnit::Transition { start, .. } if (start - 1.25).abs() < 0.001
+        ));
+    }
+
+    #[test]
+    fn render_units_keep_timeline_duration_for_multiple_transitions() {
+        let a = clip("a", "v1", 0.0, 2.0);
+        let mut b = clip("b", "v1", 2.0, 2.0);
+        let mut c = clip("c", "v1", 4.0, 2.0);
+        b.transition_in = Some(ClipTransition::Config(TransitionConfig {
+            name: "fade".to_string(),
+            duration: 0.5,
+        }));
+        c.transition_in = Some(ClipTransition::Config(TransitionConfig {
+            name: "wipeleft".to_string(),
+            duration: 0.5,
+        }));
+        let clips = vec![&a, &b, &c];
+
+        let units = build_render_units(&clips, 6.0, 0.5);
+
+        assert_eq!(units.len(), 5);
+        assert!((total_unit_duration(&units) - 6.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn single_pass_planner_accepts_simple_overlay_track() {
+        let base_a = clip("a", "v1", 0.0, 2.0);
+        let base_b = clip("b", "v1", 2.0, 2.0);
+        let mut overlay = clip("overlay", "v2", 1.0, 1.0);
+        overlay.transform = Some(ClipTransform {
+            x: 25.0,
+            y: 25.0,
+            scale: 40.0,
+            opacity: 80.0,
+            corner_radius: 0,
+            mix: "normal".to_string(),
+            rotation: 0.0,
+        });
+        let project = project_for(vec![base_a, base_b, overlay]);
+        let clips: Vec<&Clip> = project.clips.iter().collect();
+        let track_ids = vec!["v1".to_string(), "v2".to_string()];
+
+        let graph = plan_single_pass_video_graph(&project, &clips, &track_ids, 4.0)
+            .expect("simple overlay timeline should use single-pass graph");
+
+        assert_eq!(graph.base_clips.len(), 2);
+        assert_eq!(graph.overlay_clips.len(), 1);
+    }
+
+    #[test]
+    fn single_pass_planner_rejects_complex_overlay_transform() {
+        let base = clip("a", "v1", 0.0, 4.0);
+        let mut overlay = clip("overlay", "v2", 1.0, 1.0);
+        overlay.transform = Some(ClipTransform {
+            x: 50.0,
+            y: 50.0,
+            scale: 50.0,
+            opacity: 100.0,
+            corner_radius: 12,
+            mix: "normal".to_string(),
+            rotation: 0.0,
+        });
+        let project = project_for(vec![base, overlay]);
+        let clips: Vec<&Clip> = project.clips.iter().collect();
+        let track_ids = vec!["v1".to_string(), "v2".to_string()];
+
+        assert!(plan_single_pass_video_graph(&project, &clips, &track_ids, 4.0).is_none());
+    }
 }

@@ -226,6 +226,16 @@ pub struct MediaSource {
     /// 本地缓存路径（asset 协议播放用，落在 app 数据目录内）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_path: Option<String>,
+    /// 低清代理文件路径（预览优先使用，导出仍使用 local_path/url 原片）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_path: Option<String>,
+    /// 代理生成状态："none" | "ready" | "failed"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_height: Option<u32>,
     /// 缩略图（Pexels 封面 / ffmpeg 抽帧 / 本地导入的占位）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumbnail_url: Option<String>,
@@ -257,8 +267,12 @@ pub struct ClipCrop {
     pub ratio: String,
 }
 
-fn default_crop_wh() -> f64 { 100.0 }
-fn default_crop_ratio() -> String { "free".to_string() }
+fn default_crop_wh() -> f64 {
+    100.0
+}
+fn default_crop_ratio() -> String {
+    "free".to_string()
+}
 
 /// 字幕样式（仅字幕 clip 使用）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -438,8 +452,47 @@ pub struct ClipMask {
     pub invert: bool,
 }
 
-fn default_mask_center() -> f64 { 0.5 }
-fn default_mask_size() -> f64 { 0.8 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransitionConfig {
+    pub name: String,
+    #[serde(default = "default_clip_transition_duration")]
+    pub duration: f64,
+}
+
+fn default_clip_transition_duration() -> f64 {
+    0.5
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ClipTransition {
+    Legacy(String),
+    Config(TransitionConfig),
+}
+
+impl ClipTransition {
+    pub fn name(&self) -> &str {
+        match self {
+            ClipTransition::Legacy(name) => name.as_str(),
+            ClipTransition::Config(config) => config.name.as_str(),
+        }
+    }
+
+    pub fn duration(&self, fallback: f64) -> f64 {
+        match self {
+            ClipTransition::Legacy(_) => fallback,
+            ClipTransition::Config(config) => config.duration,
+        }
+    }
+}
+
+fn default_mask_center() -> f64 {
+    0.5
+}
+fn default_mask_size() -> f64 {
+    0.8
+}
 
 /// T4.2: clip 的关键帧集合
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -487,6 +540,21 @@ fn default_transform_mix() -> String {
 }
 
 /// 片段 —— 时间线上的一个可编辑单元。
+/// 视觉特效项（剪映式"特效"面板）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipVisualEffect {
+    /// 特效类型：vignette | flicker | shake | glow | mirror | invert | grayscale
+    pub kind: String,
+    /// 强度 0-100，默认 50
+    #[serde(default = "default_effect_intensity")]
+    pub intensity: f64,
+}
+
+fn default_effect_intensity() -> f64 {
+    50.0
+}
+
 /// 视频/配音/字幕都统一为 clip，区别在于 track_id 指向的轨道类型。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -519,6 +587,10 @@ pub struct Clip {
     /// 音频淡出时长（秒，0=无淡出）
     #[serde(default)]
     pub fade_out: f64,
+    /// 音频降噪强度（0-100，0=关闭；剪映"降噪"开关，这里升级为强度滑块）
+    /// afftdn 滤镜 nr 参数（噪声降低分贝，0-97，0=关闭）
+    #[serde(default)]
+    pub noise_reduction: f64,
     /// 滤镜名称（None=无滤镜）。如 "vintage"/"warm"/"cool"/"bw" 等
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
@@ -531,7 +603,13 @@ pub struct Clip {
     /// 色彩调节：饱和度（-100..100）
     #[serde(default)]
     pub saturation: f64,
-    /// 画面变换 —— 视频 clip 用（画中画）
+    /// 色温（-100..100，负=冷蓝，正=暖红，0=默认）
+    #[serde(default)]
+    pub temperature: f64,
+    /// 色调（-100..100，负=绿，正=品红，0=默认）
+    #[serde(default)]
+    pub tint: f64,
+    /// 画面变换 -- 视频 clip 用（画中画）
     #[serde(default)]
     pub transform: Option<ClipTransform>,
     /// T4.2: 关键帧动画（位置/缩放/不透明度/旋转/音量）
@@ -543,6 +621,13 @@ pub struct Clip {
     /// 画面搜索词 —— 视频 clip 用（AI 生成的英文 Pexels 关键词）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visual_query: Option<String>,
+    /// 视觉特效列表（剪映式特效面板）：每项 { kind, intensity }
+    /// kind: "vignette"(暗角) | "flicker"(闪烁) | "shake"(抖动) | "glow"(边缘发光) | "mirror"(镜像)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visual_effects: Option<Vec<ClipVisualEffect>>,
+    /// 是否倒放（剪映式"倒放"开关；导出时用 reverse 滤镜）
+    #[serde(default)]
+    pub reverse: bool,
     /// 画面裁剪（源帧百分比），None=不裁剪
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crop: Option<ClipCrop>,
@@ -555,12 +640,12 @@ pub struct Clip {
     /// 字幕逐词时间戳 —— 字幕 clip 用（用于逐字高亮；None 表示无词级数据）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub words: Option<Vec<WordCue>>,
-    /// 入场转场：None | "fade" | "slide" 等
+    /// 入场转场：兼容旧 string，也支持 { name, duration }
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transition_in: Option<String>,
+    pub transition_in: Option<ClipTransition>,
     /// 出场转场
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transition_out: Option<String>,
+    pub transition_out: Option<ClipTransition>,
 }
 
 impl Clip {
@@ -590,6 +675,12 @@ pub struct Track {
     pub muted: bool,
     #[serde(default)]
     pub locked: bool,
+    /// 轨道是否隐藏（不参与预览/导出，剪映式隐藏轨道开关）
+    #[serde(default)]
+    pub hidden: bool,
+    /// 轨道高度（像素，0=默认；用户可拖拽调整）
+    #[serde(default)]
+    pub height: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -615,6 +706,20 @@ pub struct RenderConfig {
     /// T4.5: 默认转场时长（秒）
     #[serde(default = "default_transition_duration")]
     pub transition_duration: f64,
+    /// 字幕处理："burn"（默认，烧录到画面）| "none"（不包含）| "srt"（导出 .srt 文件）
+    #[serde(default = "default_subtitle_mode")]
+    pub subtitle_mode: String,
+    /// 导出容器格式："mp4"（默认）| "gif" | "webm" | "mov"
+    #[serde(default = "default_container")]
+    pub container: String,
+}
+
+fn default_container() -> String {
+    "mp4".to_string()
+}
+
+fn default_subtitle_mode() -> String {
+    "burn".to_string()
 }
 
 fn default_transition_duration() -> f64 {
@@ -638,6 +743,8 @@ impl Default for RenderConfig {
             codec: default_codec(),
             export_mode: default_export_mode(),
             transition_duration: default_transition_duration(),
+            subtitle_mode: default_subtitle_mode(),
+            container: default_container(),
         }
     }
 }
@@ -674,10 +781,26 @@ pub struct Project {
     pub clips: Vec<Clip>,
     #[serde(default)]
     pub render_config: RenderConfig,
+    /// 章节标记（剪映式"添加章节"，时间轴上的导航锚点）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chapters: Vec<Chapter>,
+    /// 封面时间点（秒，0=未设置；导出时用作 -frames 1 抽帧或 embed 为 metadata）
+    #[serde(default)]
+    pub cover_time: Option<f64>,
     pub preview_path: Option<String>,
     pub final_path: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// 章节标记（剪映式）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Chapter {
+    pub id: String,
+    /// 章节起点（秒）
+    pub time: f64,
+    pub title: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
