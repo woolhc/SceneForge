@@ -526,9 +526,8 @@ export class WebCodecsRenderer implements PreviewRenderer {
     this.onTick({
       currentTime: this.currentTime,
       playing: this.playing,
-      activeSubtitle: null,
-      activeSubtitleStyle: null,
-      activeSubtitleClip: null,
+      // WebCodecs 路径不渲染字幕（字幕由 DOM 叠层 StageSubtitleLayer 处理）
+      activeSubtitleClips: [],
       activeVideoClip,
       activeOverlayClips,
     });

@@ -568,11 +568,12 @@ pub async fn detach_audio(
         latest.media.push(audio_source.clone());
     }
 
-    // 找到或创建一个音频轨（基于最新 project，避免覆盖并发编辑）
+    // 找到或创建一个音频轨（多轨支持：取 order 最小的音频轨，找不到则创建）
     let audio_track_id = if let Some(t) = latest
         .tracks
         .iter()
-        .find(|t| t.kind == crate::models::TrackKind::Audio)
+        .filter(|t| t.kind == crate::models::TrackKind::Audio)
+        .min_by_key(|t| t.order)
     {
         t.id.clone()
     } else {
@@ -813,6 +814,30 @@ pub struct GenerateSubtitlesRequest {
     pub translate: bool,
 }
 
+/// 找或建字幕轨。优先按 name 精确匹配，找不到则创建新轨。
+/// 用于多字幕轨支持（双语模式建「中文字幕」+「英文字幕」两条轨）。
+fn find_or_create_subtitle_track(project: &mut Project, name: &str, order: u32) -> String {
+    if let Some(t) = project
+        .tracks
+        .iter()
+        .find(|t| t.kind == TrackKind::Subtitle && t.name == name)
+    {
+        return t.id.clone();
+    }
+    let tid = format!("track_subtitle_{}", uuid::Uuid::new_v4());
+    project.tracks.push(Track {
+        id: tid.clone(),
+        kind: TrackKind::Subtitle,
+        name: name.to_string(),
+        order,
+        muted: false,
+        locked: false,
+        hidden: false,
+        height: 0,
+    });
+    tid
+}
+
 /// 识别字幕：合并配音轨音频 → whisper 识别 → DeepSeek 整理（可选翻译）→ 生成字幕 clip
 #[tauri::command]
 pub async fn generate_subtitles(
@@ -827,27 +852,8 @@ pub async fn generate_subtitles(
         )
     };
 
-    // 找字幕轨，没有则自动创建
-    let subtitle_track_id = if let Some(t) = project
-        .tracks
-        .iter()
-        .find(|t| t.kind == TrackKind::Subtitle)
-    {
-        t.id.clone()
-    } else {
-        let tid = format!("track_subtitle_{}", uuid::Uuid::new_v4());
-        project.tracks.push(Track {
-            id: tid.clone(),
-            kind: TrackKind::Subtitle,
-            name: "字幕".to_string(),
-            order: project.tracks.iter().map(|t| t.order).min().unwrap_or(0),
-            muted: false,
-            locked: false,
-        hidden: false,
-        height: 0,
-        });
-        tid
-    };
+    // 字幕轨查找/创建推迟到重读 latest 之后（多字幕轨支持）
+    let _ = &mut project; // project 在 whisper 期间不使用，避免 unused 警告
 
     // 收集所有配音轨 clip 的音频路径（按时间顺序）
     let voiceover_track_ids: Vec<String> = project
@@ -871,43 +877,56 @@ pub async fn generate_subtitles(
         return Err("配音轨上没有音频，请先生成配音".to_string());
     }
 
-    // 合并所有配音音频为一个 wav（用 ffmpeg concat）
+    // 合并所有配音音频为一个 wav（按 clip 时间区间裁剪 + concat）
+    // 关键：必须按 clip.source_in/source_out 裁剪每个音频，否则 concat 读取整个文件，
+    // 导致合并音频时长 > sum(clip_audio_duration)，whisper 时间戳与 clip_mappings 偏移不匹配，
+    // 字幕时间轴错位。
     let audio_dir = state.paths.projects_dir.join(&project.id).join("audio");
     let merged_path = state.paths.cache_dir.join(format!(
         "asr-merged-{}.wav",
         chrono::Utc::now().timestamp_millis()
     ));
-    let list_path = state.paths.cache_dir.join(format!(
-        "asr-list-{}.txt",
-        chrono::Utc::now().timestamp_millis()
-    ));
-    let mut list_content = String::new();
+    // 用 filter_complex concat：每个 input 用 -ss/-t 限制读取区间
+    let mut merge_cmd = tokio::process::Command::new("ffmpeg");
+    merge_cmd.args(["-y"]);
+    let mut input_count = 0usize;
     for clip in &audio_clips {
         let source = clip
             .source_id
             .as_ref()
             .and_then(|sid| project.media.iter().find(|m| m.id == *sid));
-        if let Some(s) = source {
-            if let Some(local) = &s.local_path {
-                list_content.push_str(&format!("file '{}'\n", local.replace('\'', "'\\''")));
-            }
-        }
+        let Some(s) = source else { continue };
+        let Some(local) = &s.local_path else { continue };
+        let clip_audio_duration = (clip.source_out - clip.source_in).max(0.1);
+        merge_cmd.args([
+            "-ss",
+            &format!("{:.3}", clip.source_in),
+            "-t",
+            &format!("{:.3}", clip_audio_duration),
+            "-i",
+            local,
+        ]);
+        input_count += 1;
     }
-    if list_content.is_empty() {
+    if input_count == 0 {
         return Err("配音音频文件不存在，请先生成配音".to_string());
     }
-    tokio::fs::write(&list_path, &list_content)
-        .await
-        .map_err(map_error)?;
-    let mut merge_cmd = tokio::process::Command::new("ffmpeg");
+    // filter_complex: 每个 input 先 atrim + asetpts 重置 PTS，再 concat
+    let mut filter = String::new();
+    let concat_labels: String = (0..input_count)
+        .map(|i| format!("[a{i}]"))
+        .collect::<String>();
+    for i in 0..input_count {
+        filter.push_str(&format!("[{i}:a]asetpts=PTS-STARTPTS[a{i}];"));
+    }
+    // 去掉末尾分号
+    let filter_trim = filter.trim_end_matches(';');
+    let filter_full = format!(
+        "{filter_trim};{concat_labels}concat=n={input_count}:v=0:a=1[out]"
+    );
+    merge_cmd.args(["-filter_complex", &filter_full]);
+    merge_cmd.args(["-map", "[out]"]);
     merge_cmd.args([
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        &list_path.to_string_lossy(),
         "-ar",
         "16000",
         "-ac",
@@ -920,7 +939,6 @@ pub async fn generate_subtitles(
         .await
         .map_err(map_error)?;
     if !merge_output.status.success() {
-        let _ = tokio::fs::remove_file(&list_path).await;
         let _ = tokio::fs::remove_file(&merged_path).await;
         return Err(format!(
             "合并配音音频失败：{}",
@@ -937,31 +955,39 @@ pub async fn generate_subtitles(
     let refined = asr::refine_subtitles(&settings, &raw_cues, request.translate)
         .await
         .map_err(map_error)?;
-    let _ = tokio::fs::remove_file(&list_path).await;
     let _ = tokio::fs::remove_file(&merged_path).await;
 
     // T1.10 修复：ASR/AI 完成后重读最新 project，只定向替换字幕轨，避免覆盖用户并发编辑。
     let conn = state.db.lock().map_err(map_error)?;
     let mut latest = storage::get_project(&conn, &request.project_id).map_err(map_error)?;
-    let subtitle_track_id = if latest.tracks.iter().any(|t| t.id == subtitle_track_id) {
-        subtitle_track_id
-    } else if let Some(t) = latest.tracks.iter().find(|t| t.kind == TrackKind::Subtitle) {
-        t.id.clone()
+
+    // 多字幕轨支持：translate=true 建/找「中文字幕」+「英文字幕」两条轨，分轨输出；
+    // translate=false 维持单轨「字幕」。
+    let (zh_track_id, en_track_id): (Option<String>, Option<String>) = if request.translate {
+        let zh = find_or_create_subtitle_track(&mut latest, "中文字幕", 0);
+        let en = find_or_create_subtitle_track(&mut latest, "英文字幕", 1);
+        (Some(zh), Some(en))
     } else {
-        let tid = format!("track_subtitle_{}", uuid::Uuid::new_v4());
-        latest.tracks.push(Track {
-            id: tid.clone(),
-            kind: TrackKind::Subtitle,
-            name: "字幕".to_string(),
-            order: latest.tracks.iter().map(|t| t.order).min().unwrap_or(0),
-            muted: false,
-            locked: false,
-        hidden: false,
-        height: 0,
-        });
-        tid
+        // 单语模式：优先复用已有「英文字幕」轨（原文），否则用「字幕」轨
+        let existing = latest
+            .tracks
+            .iter()
+            .find(|t| t.kind == TrackKind::Subtitle && (t.name == "英文字幕" || t.name == "字幕"))
+            .map(|t| t.id.clone());
+        let id = existing.unwrap_or_else(|| find_or_create_subtitle_track(&mut latest, "字幕", 0));
+        (None, Some(id))
     };
-    latest.clips.retain(|c| c.track_id != subtitle_track_id);
+
+    // 清理旧字幕 clip（双轨清两条，单轨清一条）
+    match (&zh_track_id, &en_track_id) {
+        (Some(zh), Some(en)) => {
+            latest.clips.retain(|c| c.track_id != *zh && c.track_id != *en);
+        }
+        (_, Some(en)) => {
+            latest.clips.retain(|c| c.track_id != *en);
+        }
+        _ => {}
+    }
     let _ = &audio_dir; // 预留
 
     // 建立合并音频偏移到时间轴偏移的映射（修复字幕时间戳错位）
@@ -1005,39 +1031,120 @@ pub async fn generate_subtitles(
             }
             mapped
         };
-        latest.clips.push(Clip {
-            id: format!("sub-{}", uuid::Uuid::new_v4()),
-            track_id: subtitle_track_id.clone(),
-            source_id: None,
-            start_on_track: timeline_start,
-            duration,
-            source_in: 0.0,
-            source_out: duration,
-            speed: 1.0,
-            speed_curve: None,
-            volume: 1.0,
-            fade_in: 0.0,
-            fade_out: 0.0,
-            noise_reduction: 0.0,
-            filter: None,
-            brightness: 0.0,
-            contrast: 0.0,
-            saturation: 0.0,
-        temperature: 0.0,
-        tint: 0.0,
-            transform: None,
-            visual_query: None,
-            crop: None,
-            text: Some(cue.text.clone()),
-            subtitle_style: None,
-            words,
-            keyframes: None,
-            mask: None,
-        visual_effects: None,
-        reverse: false,
-            transition_in: None,
-            transition_out: None,
-        });
+
+        if request.translate {
+            // 翻译 clip -> 中文轨（无词级时间戳，中文不适用 karaoke）
+            if let Some(ref translated) = cue.translated {
+                if let Some(ref zh_id) = zh_track_id {
+                    latest.clips.push(Clip {
+                        id: format!("sub-zh-{}", uuid::Uuid::new_v4()),
+                        track_id: zh_id.clone(),
+                        source_id: None,
+                        start_on_track: timeline_start,
+                        duration,
+                        source_in: 0.0,
+                        source_out: duration,
+                        speed: 1.0,
+                        speed_curve: None,
+                        volume: 1.0,
+                        fade_in: 0.0,
+                        fade_out: 0.0,
+                        noise_reduction: 0.0,
+                        filter: None,
+                        brightness: 0.0,
+                        contrast: 0.0,
+                        saturation: 0.0,
+                    temperature: 0.0,
+                    tint: 0.0,
+                        transform: None,
+                        visual_query: None,
+                        crop: None,
+                        text: Some(translated.clone()),
+                        subtitle_style: None,
+                        words: None,
+                        keyframes: None,
+                        mask: None,
+                    visual_effects: None,
+                    reverse: false,
+                        transition_in: None,
+                        transition_out: None,
+                    });
+                }
+            }
+            // 原文 clip -> 英文轨（保留词级时间戳，支持 karaoke）
+            if let Some(ref en_id) = en_track_id {
+                latest.clips.push(Clip {
+                    id: format!("sub-en-{}", uuid::Uuid::new_v4()),
+                    track_id: en_id.clone(),
+                    source_id: None,
+                    start_on_track: timeline_start,
+                    duration,
+                    source_in: 0.0,
+                    source_out: duration,
+                    speed: 1.0,
+                    speed_curve: None,
+                    volume: 1.0,
+                    fade_in: 0.0,
+                    fade_out: 0.0,
+                    noise_reduction: 0.0,
+                    filter: None,
+                    brightness: 0.0,
+                    contrast: 0.0,
+                    saturation: 0.0,
+                    temperature: 0.0,
+                    tint: 0.0,
+                    transform: None,
+                    visual_query: None,
+                    crop: None,
+                    text: Some(cue.text.clone()),
+                    subtitle_style: None,
+                    words,
+                    keyframes: None,
+                    mask: None,
+                    visual_effects: None,
+                    reverse: false,
+                    transition_in: None,
+                    transition_out: None,
+                });
+            }
+        } else {
+            // 单语：原文 clip -> 字幕轨
+            if let Some(ref en_id) = en_track_id {
+                latest.clips.push(Clip {
+                    id: format!("sub-{}", uuid::Uuid::new_v4()),
+                    track_id: en_id.clone(),
+                    source_id: None,
+                    start_on_track: timeline_start,
+                    duration,
+                    source_in: 0.0,
+                    source_out: duration,
+                    speed: 1.0,
+                    speed_curve: None,
+                    volume: 1.0,
+                    fade_in: 0.0,
+                    fade_out: 0.0,
+                    noise_reduction: 0.0,
+                    filter: None,
+                    brightness: 0.0,
+                    contrast: 0.0,
+                    saturation: 0.0,
+                    temperature: 0.0,
+                    tint: 0.0,
+                    transform: None,
+                    visual_query: None,
+                    crop: None,
+                    text: Some(cue.text.clone()),
+                    subtitle_style: None,
+                    words,
+                    keyframes: None,
+                    mask: None,
+                    visual_effects: None,
+                    reverse: false,
+                    transition_in: None,
+                    transition_out: None,
+                });
+            }
+        }
     }
 
     storage::save_project(&conn, &latest).map_err(map_error)
@@ -1160,8 +1267,13 @@ pub async fn import_srt(
     let conn = state.db.lock().map_err(map_error)?;
     let mut latest = storage::get_project(&conn, &request.project_id).map_err(map_error)?;
 
-    // 找字幕轨，没有则创建
-    let subtitle_track_id = if let Some(t) = latest.tracks.iter().find(|t| t.kind == TrackKind::Subtitle) {
+    // 找字幕轨（多轨支持：取 order 最小的字幕轨），没有则创建
+    let subtitle_track_id = if let Some(t) = latest
+        .tracks
+        .iter()
+        .filter(|t| t.kind == TrackKind::Subtitle)
+        .min_by_key(|t| t.order)
+    {
         t.id.clone()
     } else {
         let tid = format!("track_subtitle_{}", uuid::Uuid::new_v4());

@@ -83,6 +83,10 @@ pub struct SubtitleCue {
     pub start: f64,
     pub end: f64,
     pub text: String,
+    /// 双语模式下的翻译文本（translate=true 时由 DeepSeek 返回）。
+    /// translate=false 时为 None。用于双语字幕分轨输出。
+    #[serde(default)]
+    pub translated: Option<String>,
     /// 逐词/逐字时间戳（whisper -ml 1 模式下产出，可能为空）
     #[serde(default)]
     pub words: Vec<WordCue>,

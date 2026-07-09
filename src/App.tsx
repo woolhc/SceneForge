@@ -176,22 +176,43 @@ function KeyframeLabel() {
 
 function StageSubtitleLayer({ excludeClipId }: { excludeClipId?: string } = {}) {
   const currentTime = usePlaybackStore((s) => s.currentTime);
-  const subText = usePlaybackStore((s) => s.activeSubtitle);
-  const subStyle = usePlaybackStore((s) => s.activeSubtitleStyle);
-  const subClip = usePlaybackStore((s) => s.activeSubtitleClip);
+  const subClips = usePlaybackStore((s) => s.activeSubtitleClips);
   // 选中字幕编辑时，由 SubtitleOverlay 渲染该 clip，这里跳过避免重复
-  if (subClip && subClip.id === excludeClipId) return null;
-  if (!subText || !subText.trim()) return null;
-  const s = subStyle;
+  const visible = subClips.filter((c) => c.id !== excludeClipId && c.text && c.text.trim());
+  if (visible.length === 0) return null;
+  return (
+    <>
+      {visible.map((clip, idx) => (
+        <SubtitleItem key={clip.id} clip={clip} currentTime={currentTime} stackIdx={idx} stackTotal={visible.length} />
+      ))}
+    </>
+  );
+}
+
+/** 单条字幕渲染（StageSubtitleLayer 内部使用）。
+ *  stackIdx/stackTotal 用于多条字幕时按 idx 中心对称偏移，避免重叠。 */
+function SubtitleItem({ clip, currentTime, stackIdx, stackTotal }: {
+  clip: Clip;
+  currentTime: number;
+  stackIdx: number;
+  stackTotal: number;
+}) {
+  const s = clip.subtitleStyle;
   const isCustom = s?.position === "custom";
   const posX = isCustom ? (s?.x ?? 50) : 50;
-  const posY = isCustom ? (s?.y ?? 80) : (s?.position === "top" ? 12 : s?.position === "center" ? 50 : 88);
+  // 多条字幕时按 idx 中心对称偏移，每条间隔 12% 画面高度
+  const offsetY = stackTotal > 1
+    ? (stackIdx - (stackTotal - 1) / 2) * 12
+    : 0;
+  const posY = isCustom
+    ? (s?.y ?? 80) + offsetY
+    : (s?.position === "top" ? 12 : s?.position === "center" ? 50 : 88) + offsetY;
   const baseColor = s?.color ?? "#FFFFFF";
   const highlightColor = s?.highlightColor ?? "#FFD700";
-  const karaokeOn = (s?.karaoke ?? true) && (subClip?.words?.length ?? 0) > 0;
+  const karaokeOn = (s?.karaoke ?? true) && (clip.words?.length ?? 0) > 0;
   // 出场动画窗口判断：剩余时长 <= animationDuration 时进入出场
   const animDur = s?.animationDuration ?? 0.3;
-  const clipEnd = subClip ? subClip.startOnTrack + subClip.duration : Infinity;
+  const clipEnd = clip.startOnTrack + clip.duration;
   const remaining = clipEnd - currentTime;
   const inOutro = remaining <= animDur && remaining >= 0;
   const animClass = inOutro
@@ -237,22 +258,50 @@ function StageSubtitleLayer({ excludeClipId }: { excludeClipId?: string } = {}) 
         pointerEvents: "none",
       }}
     >
-      {karaokeOn && subClip?.words
-        ? subClip.words.map((w, i, arr) => {
-            const prev = arr[i - 1];
-            const needSpace =
-              i > 0 &&
-              prev &&
-              /[A-Za-z0-9]$/.test(prev.text) &&
-              /^[A-Za-z0-9]/.test(w.text);
-            return (
-              <span key={i} style={{ color: currentTime >= w.start ? highlightColor : baseColor }}>
-                {needSpace ? " " : ""}
-                {w.text}
-              </span>
-            );
-          })
-        : subText}
+      {karaokeOn && clip.words
+        ? (() => {
+            // 兼容旧项目：text 含 \n 时拆分翻译（无高亮）+ 原文（karaoke 高亮）
+            const text = clip.text || "";
+            const newlinePos = text.indexOf("\n");
+            if (newlinePos >= 0) {
+              const translated = text.slice(0, newlinePos);
+              return (
+                <>
+                  {translated}
+                  <br />
+                  {clip.words.map((w, i, arr) => {
+                    const prev = arr[i - 1];
+                    const needSpace =
+                      i > 0 &&
+                      prev &&
+                      /[A-Za-z0-9]$/.test(prev.text) &&
+                      /^[A-Za-z0-9]/.test(w.text);
+                    return (
+                      <span key={i} style={{ color: currentTime >= w.start ? highlightColor : baseColor }}>
+                        {needSpace ? " " : ""}
+                        {w.text}
+                      </span>
+                    );
+                  })}
+                </>
+              );
+            }
+            return clip.words.map((w, i, arr) => {
+              const prev = arr[i - 1];
+              const needSpace =
+                i > 0 &&
+                prev &&
+                /[A-Za-z0-9]$/.test(prev.text) &&
+                /^[A-Za-z0-9]/.test(w.text);
+              return (
+                <span key={i} style={{ color: currentTime >= w.start ? highlightColor : baseColor }}>
+                  {needSpace ? " " : ""}
+                  {w.text}
+                </span>
+              );
+            });
+          })()
+        : clip.text || ""}
     </div>
   );
 }
@@ -284,6 +333,19 @@ function newTrackId(kind: TrackKind) {
   return `track_${kind}_${Math.random().toString(16).slice(2)}_${Date.now()}`;
 }
 
+/** 多轨道支持：取 order 最小（最上层）的指定 kind 轨道 ID。
+ *  用于 AI 编排、素材拖放等场景的默认目标轨选择。
+ *  单轨时直接返回，多轨时取最上层（用户最可能期望的目标）。 */
+function pickPrimaryTrack(
+  tracks: { id: string; kind: string; order: number }[],
+  kind: TrackKind,
+): string | undefined {
+  const candidates = tracks.filter((t) => t.kind === kind);
+  if (candidates.length === 0) return undefined;
+  if (candidates.length === 1) return candidates[0].id;
+  return [...candidates].sort((a, b) => a.order - b.order)[0].id;
+}
+
 function preferredTrackKindForAsset(asset: MediaSource): TrackKind {
   if (asset.kind === "audio") return "audio";
   if (asset.kind === "image") return "image";
@@ -302,7 +364,11 @@ function isVisualTrackKind(kind: TrackKind) {
 
 function ensureTrackForAsset(project: Project, asset: MediaSource): { project: Project; track: Track } {
   const kind = preferredTrackKindForAsset(asset);
-  const existing = project.tracks.find((track) => track.kind === kind);
+  // 多轨道支持：取 order 最小（最上层）的匹配轨
+  const candidates = project.tracks.filter((track) => track.kind === kind);
+  const existing = candidates.length > 0
+    ? [...candidates].sort((a, b) => a.order - b.order)[0]
+    : undefined;
   if (existing) return { project, track: existing };
 
   const maxOrder = project.tracks.reduce((max, track) => Math.max(max, track.order), -1);
@@ -334,10 +400,10 @@ function ensureTrackForAsset(project: Project, asset: MediaSource): { project: P
  */
 function arrangeSegmentsToClips(
   segments: { text: string; visualQuery: string; estimatedDuration: number; start?: number; end?: number }[],
-  tracks: { id: string; kind: string }[],
+  tracks: { id: string; kind: string; order: number }[],
 ): Clip[] {
-  const videoTrackId = tracks.find((t) => t.kind === "video")?.id;
-  const voiceoverTrackId = tracks.find((t) => t.kind === "voiceover")?.id;
+  const videoTrackId = pickPrimaryTrack(tracks, "video");
+  const voiceoverTrackId = pickPrimaryTrack(tracks, "voiceover");
   const clips: Clip[] = [];
   let cursor = 0;
   for (const seg of segments) {
@@ -1045,7 +1111,9 @@ export function App() {
   /** 手动添加一条空字幕到字幕轨末尾 */
   function handleAddManualSubtitle() {
     if (!project) return;
-    const subtitleTrack = project.tracks.find((t) => t.kind === "subtitle");
+    const subtitleTrack = project.tracks
+      .filter((t) => t.kind === "subtitle")
+      .sort((a, b) => a.order - b.order)[0];
     if (!subtitleTrack) {
       setStatus("没有字幕轨，请先在时间线添加字幕轨");
       return;
@@ -1292,7 +1360,9 @@ export function App() {
    * 5. 自动绑素材
    */
   async function handleAudioSegmentPipeline(audioPath: string, ratio: string) {
-    if (!project) return;
+    // 用 projectRef.current 获取最新 project（createProject 步骤的 setProject 可能还没反映到闭包）
+    const currentProject = projectRef.current;
+    if (!currentProject) return;
     setStatus("正在用 whisper 识别音频（句子级时间戳）...");
     // Step 1: whisper 句级识别
     const result = await desktopApi.transcribeToSentences(audioPath);
@@ -1306,12 +1376,12 @@ export function App() {
     });
 
     // Step 3: 编排成轨道 clip（arrangeSegmentsToClips 会用 seg.start/end 真实时间）
-    const clips = arrangeSegmentsToClips(segments, project.tracks);
+    const clips = arrangeSegmentsToClips(segments, currentProject.tracks);
 
     // Step 4: 把原始音频导入素材库 + 作为整条配音放到配音轨
     // 音频模式下配音就是这一条完整音频，不需要按句子分段（分段会重叠）
     const audioSource = await desktopApi.importMedia(audioPath);
-    const voiceoverTrackId = project.tracks.find((t) => t.kind === "voiceover")?.id;
+    const voiceoverTrackId = pickPrimaryTrack(currentProject.tracks, "voiceover");
     // 去掉 arrangeSegmentsToClips 创建的分段配音 clip
     let finalClips = voiceoverTrackId
       ? clips.filter((c) => c.trackId !== voiceoverTrackId)
@@ -1340,13 +1410,14 @@ export function App() {
     }
 
     const nextProject: Project = {
-      ...project,
+      ...currentProject,
+      ratio, // 显式用传入的 ratio，避免 createProject 闭包 project 旧值覆盖
       clips: finalClips,
-      media: project.media.some((m) => m.id === audioSource.id)
-        ? project.media
-        : [...project.media, audioSource],
+      media: currentProject.media.some((m) => m.id === audioSource.id)
+        ? currentProject.media
+        : [...currentProject.media, audioSource],
       // 音频模式：把识别出的完整文案也存到 script（供字幕识别复用）
-      script: result.fullText || project.script,
+      script: result.fullText || currentProject.script,
     };
     const saved = await desktopApi.saveProject(nextProject);
     setProject(saved);
@@ -1364,7 +1435,8 @@ export function App() {
         segPeer?.visualQuery ||
         segPeer?.text?.slice(0, 24) ||
         "nature landscape";
-      const ok = await searchAndBindAsset(saved.id, clip.id, query);
+      // 用 saved.ratio（最新值），不用闭包 project?.ratio
+      const ok = await searchAndBindAsset(saved.id, clip.id, query, saved.ratio);
       if (ok) boundCount += 1;
       setStatus(`正在匹配素材：${boundCount}/${videoClips.length}`);
     }
@@ -1403,7 +1475,7 @@ export function App() {
           segPeer?.visualQuery ||
           segPeer?.text?.slice(0, 24) ||
           "nature landscape";
-        const ok = await searchAndBindAsset(saved.id, clip.id, query);
+        const ok = await searchAndBindAsset(saved.id, clip.id, query, saved.ratio);
         if (ok) boundCount += 1;
         setStatus(`正在匹配素材：${boundCount}/${videoClips.length}`);
       }
@@ -1417,9 +1489,16 @@ export function App() {
   }
 
   /** 为指定视频 clip 搜素材并绑定第一个结果。返回是否绑定成功。 */
-  async function searchAndBindAsset(projectId: string, clipId: string, query: string): Promise<boolean> {
+  async function searchAndBindAsset(
+    projectId: string,
+    clipId: string,
+    query: string,
+    ratio?: string,
+  ): Promise<boolean> {
     try {
-      const assets = await desktopApi.searchPexelsVideos({ query, ratio: project?.ratio || "9:16", perPage: 6 });
+      // 优先用传入的 ratio（最新值），否则用 projectRef.current?.ratio
+      const effectiveRatio = ratio || projectRef.current?.ratio || "9:16";
+      const assets = await desktopApi.searchPexelsVideos({ query, ratio: effectiveRatio, perPage: 6 });
       setAssetCandidates((previous) => ({ ...previous, [clipId]: assets }));
       if (assets[0]) {
         await bindAssetToClip(projectId, clipId, assets[0]);

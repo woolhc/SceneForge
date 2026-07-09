@@ -2389,12 +2389,45 @@ async fn burn_subtitle_and_mix_audio(
     let srt_mode = project.render_config.subtitle_mode == "srt";
     let burn_subtitles = project.render_config.subtitle_mode != "none" && !srt_mode;
 
-    // SRT 模式：生成 .srt 文件到 render_dir（与 final.mp4 同目录同名）
+    // SRT 模式：按轨分组生成 .srt 文件到 render_dir
+    // 多轨时每轨一个文件（final-中文字幕.srt / final-英文字幕.srt），单轨保持 final.srt
     if has_subtitles && srt_mode {
-        let srt = generate_srt_subtitles(&subtitle_clips, transition_shrink_points);
-        let srt_path = render_dir.join(if preview { "preview.srt" } else { "final.srt" });
         tokio::fs::create_dir_all(&render_dir).await?;
-        tokio::fs::write(&srt_path, &srt).await?;
+        // 按 track_id 分组 clips，保持时间顺序
+        let mut track_groups: Vec<(String, String, Vec<&Clip>)> = Vec::new();
+        for clip in &subtitle_clips {
+            let track = project.tracks.iter().find(|t| t.id == clip.track_id);
+            let track_name = track.map(|t| t.name.clone()).unwrap_or_else(|| "unknown".to_string());
+            if let Some(group) = track_groups.iter_mut().find(|(id, _, _)| *id == clip.track_id) {
+                group.2.push(*clip);
+            } else {
+                track_groups.push((clip.track_id.clone(), track_name, vec![*clip]));
+            }
+        }
+        let multi_track = track_groups.len() > 1;
+        for (_, name, clips) in &track_groups {
+            let srt = generate_srt_subtitles(clips, transition_shrink_points);
+            let suffix = if multi_track {
+                // 清理文件名非法字符
+                let safe: String = name
+                    .chars()
+                    .map(|c| match c {
+                        '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+                        _ => c,
+                    })
+                    .collect();
+                format!("-{}", safe)
+            } else {
+                String::new()
+            };
+            let filename = if preview {
+                format!("preview{}.srt", suffix)
+            } else {
+                format!("final{}.srt", suffix)
+            };
+            let srt_path = render_dir.join(filename);
+            tokio::fs::write(&srt_path, &srt).await?;
+        }
     }
 
     let ass_path = if has_subtitles && burn_subtitles {
@@ -2567,6 +2600,20 @@ fn generate_ass_subtitles(
     let (width, height) = export_dimensions_for_project(project);
     let default_style = crate::models::SubtitleStyle::default();
 
+    // 多字幕轨 Layer 映射：order 大=底层=Layer 0，order 小=上层=Layer 大
+    // libass 中 Layer 数值大的后绘制 = 覆盖在上层。order 小的轨道在画面上层。
+    let mut subtitle_tracks_sorted: Vec<&crate::models::Track> = project
+        .tracks
+        .iter()
+        .filter(|t| t.kind == TrackKind::Subtitle && !t.hidden)
+        .collect();
+    subtitle_tracks_sorted.sort_by(|a, b| b.order.cmp(&a.order));
+    let track_layer: Vec<(String, i32)> = subtitle_tracks_sorted
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.id.clone(), i as i32))
+        .collect();
+
     // margin: 帧宽的 7%（剪映式像素宽度换行，不贴边）
     let margin_lr = (width as f64 * 0.07).round() as i32;
 
@@ -2694,7 +2741,18 @@ fn generate_ass_subtitles(
         let escaped = if karaoke_enabled {
             if let Some(words) = clip.words.as_ref() {
                 if !words.is_empty() {
-                    build_karaoke_text(words, clip.start_on_track, clip.duration)
+                    let karaoke_text = build_karaoke_text(words, clip.start_on_track, clip.duration);
+                    // 双语模式：text = "翻译\n原文"
+                    // 第一行显示翻译（无高亮），第二行显示原文（karaoke 高亮）
+                    if let Some(newline_pos) = text.find('\n') {
+                        let translated = &text[..newline_pos];
+                        let escaped_translated = translated
+                            .replace('{', "\\{")
+                            .replace('}', "\\}");
+                        format!("{}\\N{}", escaped_translated, karaoke_text)
+                    } else {
+                        karaoke_text
+                    }
                 } else {
                     text.replace('{', "\\{")
                         .replace('}', "\\}")
@@ -2733,8 +2791,13 @@ fn generate_ass_subtitles(
             String::new()
         };
 
+        let layer = track_layer
+            .iter()
+            .find(|(id, _)| id == &clip.track_id)
+            .map(|(_, l)| *l)
+            .unwrap_or(0);
         ass.push_str(&format!(
-            "Dialogue: 0,{start},{end},{style_name},,0,0,0,,{fade_tag}{escaped}\n"
+            "Dialogue: {layer},{start},{end},{style_name},,0,0,0,,{fade_tag}{escaped}\n"
         ));
     }
     ass

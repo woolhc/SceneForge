@@ -409,6 +409,7 @@ fn words_to_cue(words: &[WordCue]) -> Option<SubtitleCue> {
         start,
         end,
         text,
+        translated: None,
         words: words.to_vec(),
     })
 }
@@ -599,6 +600,7 @@ pub fn segment_subtitles_rules(cues: &[SubtitleCue]) -> Vec<SubtitleCue> {
                 start: t,
                 end,
                 text: part.clone(),
+                translated: cue.translated.clone(),
                 words: vec![],
             });
             t = end + MIN_GAP; // 段间留间隔
@@ -635,6 +637,7 @@ pub fn segment_subtitles_rules(cues: &[SubtitleCue]) -> Vec<SubtitleCue> {
             start,
             end,
             text: cue.text.clone(),
+            translated: cue.translated.clone(),
             words: vec![],
         });
     }
@@ -731,17 +734,33 @@ fn extract_subtitle_array(content: &str) -> anyhow::Result<Vec<SubtitleCue>> {
     let cues = arr
         .into_iter()
         .map(|item| {
-            let text = item
+            // 双语模式：LLM 返回 {text: "原文", translated: "中文翻译"}
+            // 不再拼接 "翻译\n原文"，保留 translated 独立字段，由 generate_subtitles 分轨输出
+            let (text, translated) = if let Some(t) = item
                 .get("translated")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
-                .or_else(|| item.get("text").and_then(|v| v.as_str()))
-                .unwrap_or("")
-                .to_string();
+            {
+                let original = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                if !original.is_empty() && original != t {
+                    (original.to_string(), Some(t.to_string()))
+                } else {
+                    (t.to_string(), None)
+                }
+            } else {
+                (
+                    item.get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    None,
+                )
+            };
             SubtitleCue {
                 start: item.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0),
                 end: item.get("end").and_then(|v| v.as_f64()).unwrap_or(0.0),
                 text,
+                translated,
                 words: vec![],
             }
         })

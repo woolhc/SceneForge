@@ -137,7 +137,8 @@ export class PreviewEngine implements PreviewRenderer {
   private lastPublishedVideoClip: Clip | null = null;
   private lastPublishedOverlayIds = "";
   private lastPublishedOverlayClips: Clip[] = [];
-  private lastPublishedSubtitleClip: Clip | null = null;
+  private lastPublishedSubIds = "";
+  private lastPublishedSubs: Clip[] = [];
   /** 活跃缓冲区变化时通知外部（FilterRenderer 需要更新读取的 video） */
   onActiveVideoChange: ((el: HTMLVideoElement | HTMLImageElement) => void) | null = null;
 
@@ -179,7 +180,8 @@ export class PreviewEngine implements PreviewRenderer {
     this.lastPublishedVideoClip = null;
     this.lastPublishedOverlayIds = "";
     this.lastPublishedOverlayClips = [];
-    this.lastPublishedSubtitleClip = null;
+    this.lastPublishedSubIds = "";
+    this.lastPublishedSubs = [];
     this.currentVideoClipId = null;
     this.applyVideoAlignment(true);
     void this.preloadLookahead();
@@ -827,14 +829,25 @@ export class PreviewEngine implements PreviewRenderer {
       this.onTick({
         currentTime: this.currentTime,
         playing: this.playing,
-        activeSubtitle: null,
-        activeSubtitleClip: null,
+        activeSubtitleClips: [],
         activeVideoClip: null,
         activeOverlayClips: [],
       });
       return;
     }
-    const subtitleClip = this.findClipAt(this.currentTime, "subtitle");
+    // 多字幕轨：用 findAllClipsAt 收集所有活跃字幕 clip（按 track order 降序：底层在前）
+    const allSubs = this.findAllClipsAt(this.currentTime, ["subtitle"]);
+    // 字幕需要 order 小=画面上层=数组前，反转
+    const sortedSubs = allSubs.slice().reverse();
+    // 引用比较：clip id 集合不变则复用旧数组，避免每帧触发 React 重渲染
+    const subIds = sortedSubs.map((c) => c.id).join("|");
+    const activeSubtitleClips = subIds === this.lastPublishedSubIds
+      ? this.lastPublishedSubs
+      : sortedSubs;
+    if (subIds !== this.lastPublishedSubIds) {
+      this.lastPublishedSubIds = subIds;
+      this.lastPublishedSubs = sortedSubs;
+    }
     // 所有活跃画面 clip（视频轨 + 图片轨，按 order 降序：底层在前）
     const allVideoClips = this.findAllClipsAt(this.currentTime, ["video", "image"]);
     const baseClip = allVideoClips[0] || null;
@@ -849,14 +862,10 @@ export class PreviewEngine implements PreviewRenderer {
     }
     const activeVideoClip = baseClip?.id === this.lastPublishedVideoClip?.id ? this.lastPublishedVideoClip : baseClip;
     this.lastPublishedVideoClip = activeVideoClip;
-    const activeSubtitleClip = subtitleClip?.id === this.lastPublishedSubtitleClip?.id ? this.lastPublishedSubtitleClip : subtitleClip;
-    this.lastPublishedSubtitleClip = activeSubtitleClip;
     this.onTick({
       currentTime: this.currentTime,
       playing: this.playing,
-      activeSubtitle: activeSubtitleClip?.text || null,
-      activeSubtitleStyle: activeSubtitleClip?.subtitleStyle || null,
-      activeSubtitleClip: activeSubtitleClip || null,
+      activeSubtitleClips,
       activeVideoClip,
       activeOverlayClips: overlayClips,
     });
@@ -889,20 +898,6 @@ export class PreviewEngine implements PreviewRenderer {
     return this.project?.tracks.find((t) => t.id === trackId);
   }
 
-  private findClipAt(time: number, kind: TrackKind): Clip | null {
-    if (!this.project) return null;
-    const trackIds = new Set(
-      this.project.tracks.filter((t) => t.kind === kind).map((t) => t.id),
-    );
-    return (
-      this.project.clips.find(
-        (clip) =>
-          trackIds.has(clip.trackId) &&
-          time >= clip.startOnTrack - 1e-3 &&
-          time < clip.startOnTrack + clip.duration - 1e-3,
-      ) || null
-    );
-  }
 
   private findMedia(sourceId?: string | null): MediaSource | null {
     if (!this.project || !sourceId) return null;

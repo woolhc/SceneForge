@@ -24,9 +24,7 @@ export function usePreviewEngine(
       playing: state.playing,
       activeVideoClip: state.activeVideoClip,
       activeOverlayClips: state.activeOverlayClips,
-      activeSubtitle: state.activeSubtitle,
-      activeSubtitleStyle: state.activeSubtitleStyle,
-      activeSubtitleClip: state.activeSubtitleClip,
+      activeSubtitleClips: state.activeSubtitleClips,
     });
   }, []);
 
@@ -44,9 +42,7 @@ export function usePreviewEngine(
         playing: false,
         activeVideoClip: null,
         activeOverlayClips: [],
-        activeSubtitle: null,
-        activeSubtitleStyle: null,
-        activeSubtitleClip: null,
+        activeSubtitleClips: [],
       });
       return;
     }

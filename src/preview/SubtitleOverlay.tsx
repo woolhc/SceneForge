@@ -167,7 +167,23 @@ export function SubtitleOverlay({
         }}
       >
         {karaokeEnabled && clip.words
-          ? renderWords(clip.words)
+          ? (() => {
+              // 双语模式：text = "翻译\n原文"
+              // 第一行显示翻译（无高亮），第二行显示原文（karaoke 高亮）
+              const text = clip.text || "";
+              const newlinePos = text.indexOf("\n");
+              if (newlinePos >= 0) {
+                const translated = text.slice(0, newlinePos);
+                return (
+                  <>
+                    {translated}
+                    <br />
+                    {renderWords(clip.words)}
+                  </>
+                );
+              }
+              return renderWords(clip.words);
+            })()
           : clip.text || ""}
       </div>
 
