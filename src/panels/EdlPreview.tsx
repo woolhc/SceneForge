@@ -1,6 +1,7 @@
 import { Check, ChevronDown, ChevronUp, Clock, Image as ImageIcon, Sparkles, Trash2, X } from "lucide-react";
-import { useState } from "react";
-import type { AiSegment } from "../types";
+import { useEffect, useRef, useState } from "react";
+import { desktopApi } from "../tauri";
+import type { AiSegment, MediaSource } from "../types";
 
 /**
  * EDL（编辑决策列表）预览面板 —— 借鉴 video-use 的 EDL 中间层。
@@ -11,18 +12,75 @@ import type { AiSegment } from "../types";
  * - 支持调序（上移/下移）、删除
  * - 确认后才执行后续编排 + 素材绑定
  */
+/**
+ * 单个 EDL 卡片的素材缩略图区：搜索 visualQuery 显示前 3 个候选。
+ * 用 IntersectionObserver 懒加载，避免卡片多时请求洪泛。
+ */
+function EdlCardThumbnails({ query, ratio }: { query: string; ratio: string }) {
+  const [assets, setAssets] = useState<MediaSource[]>([]);
+  const [loaded, setLoaded] = useState(false);
+  const ref = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!query.trim() || loaded) return;
+    const el = ref.current;
+    if (!el) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            setLoaded(true);
+            void desktopApi
+              .searchPexelsVideos({ query, ratio, perPage: 3 })
+              .then(setAssets)
+              .catch(() => setAssets([]));
+            observer.disconnect();
+            break;
+          }
+        }
+      },
+      { rootMargin: "100px" },
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [query, ratio, loaded]);
+
+  return (
+    <div className="edl-card-thumbs" ref={ref}>
+      {loaded && assets.length === 0 && <span className="edl-thumb-empty">无匹配素材</span>}
+      {assets.map((a) => {
+        const src = a.thumbnailUrl ?? null;
+        return src ? (
+          <img
+            key={a.id}
+            src={src}
+            alt={a.title}
+            className="edl-thumb"
+            loading="lazy"
+            onError={(e) => {
+              (e.currentTarget as HTMLImageElement).style.display = "none";
+            }}
+          />
+        ) : null;
+      })}
+    </div>
+  );
+}
+
 export function EdlPreview({
   segments,
   totalDuration,
   onConfirm,
   onCancel,
   busy,
+  ratio,
 }: {
   segments: AiSegment[];
   totalDuration: number;
   onConfirm: (segments: AiSegment[]) => void;
   onCancel: () => void;
   busy?: boolean;
+  ratio?: string;
 }) {
   // 本地可编辑副本
   const [items, setItems] = useState<AiSegment[]>(segments);
@@ -142,6 +200,11 @@ export function EdlPreview({
                     </select>
                   </div>
                 </div>
+
+                {/* 素材预览缩略图（懒加载） */}
+                {seg.materialStrategy !== "color_card" && (
+                  <EdlCardThumbnails query={seg.visualQuery} ratio={ratio || "9:16"} />
+                )}
               </div>
 
               {/* 卡片操作 */}

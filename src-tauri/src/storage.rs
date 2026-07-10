@@ -89,6 +89,17 @@ fn initialize_schema(conn: &Connection) -> anyhow::Result<()> {
             payload_json TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS task_checkpoints (
+            id TEXT PRIMARY KEY,
+            task_type TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            step TEXT NOT NULL,
+            context TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_task_checkpoints_lookup
+            ON task_checkpoints(task_type, project_id);
         "#,
     )?;
     // T3.5: 冗余列迁移（兼容旧库，SQLite 没有 ADD COLUMN IF NOT EXISTS，用 try 忽略重复列错误）
@@ -425,5 +436,60 @@ pub fn delete_voice_profile(conn: &Connection, id: &str) -> anyhow::Result<()> {
         }
     }
     conn.execute("DELETE FROM voice_profiles WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// 任务 checkpoint：记录 pipeline 某步骤的状态，失败后可恢复
+pub fn save_checkpoint(
+    conn: &Connection,
+    task_type: &str,
+    project_id: &str,
+    step: &str,
+    context: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let id = format!("{task_type}:{project_id}");
+    let raw = serde_json::to_string(context)?;
+    let now = Utc::now().timestamp();
+    conn.execute(
+        "INSERT INTO task_checkpoints (id, task_type, project_id, step, context, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+         ON CONFLICT(id) DO UPDATE SET step = excluded.step, context = excluded.context, updated_at = excluded.updated_at",
+        params![id, task_type, project_id, step, raw, now],
+    )?;
+    Ok(())
+}
+
+pub fn load_checkpoint(
+    conn: &Connection,
+    task_type: &str,
+    project_id: &str,
+) -> anyhow::Result<Option<(String, serde_json::Value)>> {
+    let id = format!("{task_type}:{project_id}");
+    let row = conn.query_row(
+        "SELECT step, context FROM task_checkpoints WHERE id = ?1",
+        params![id],
+        |row| {
+            let step: String = row.get(0)?;
+            let context: String = row.get(1)?;
+            Ok((step, context))
+        },
+    );
+    match row {
+        Ok((step, raw)) => {
+            let context: serde_json::Value = serde_json::from_str(&raw)?;
+            Ok(Some((step, context)))
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub fn clear_checkpoint(
+    conn: &Connection,
+    task_type: &str,
+    project_id: &str,
+) -> anyhow::Result<()> {
+    let id = format!("{task_type}:{project_id}");
+    conn.execute("DELETE FROM task_checkpoints WHERE id = ?1", params![id])?;
     Ok(())
 }

@@ -2653,27 +2653,18 @@ fn generate_ass_subtitles(
             (c.clone(), c)
         };
         let outline = hex_to_ass_color(&style.stroke_color);
-        let alignment = match style.position.as_str() {
-            "top" => 8,
-            "center" => 5,
-            _ => 2,
-        };
-        let margin_v = if style.position == "center" {
-            height as i32 / 2
-        } else {
-            (height as f64 * 0.06).round() as i32
-        };
+        // 统一用 Alignment=5（中中锚点），位置由 Dialogue 行的 \pos 接管，与前端 SubtitleOverlay 对齐
+        // ScaleX/Y/Rotation 也移到 Dialogue 行用 \fscx/\fscy/\frz，避免 Style 级别缩放干扰布局
+        let alignment = 5;
+        let margin_v = 0;
         styles_str.push_str(&format!(
-            "Style: {name},{font},{size},{primary},{secondary},{outline},&H80000000,0,0,0,0,{sx},{sy},0,{rot},1,4,1,{align},{mlr},{mlr},{mv},1\n",
+            "Style: {name},{font},{size},{primary},{secondary},{outline},&H80000000,0,0,0,0,100,100,0,0,1,4,1,{align},{mlr},{mlr},{mv},1\n",
             name = name,
             font = style.font_family,
             size = style.font_size,
             primary = primary,
             secondary = secondary,
             outline = outline,
-            sx = style.scale_x,
-            sy = style.scale_y,
-            rot = style.rotation,
             align = alignment,
             mlr = margin_lr,
             mv = margin_v,
@@ -2796,8 +2787,29 @@ fn generate_ass_subtitles(
             .find(|(id, _)| id == &clip.track_id)
             .map(|(_, l)| *l)
             .unwrap_or(0);
+        // 与前端 StageSubtitleLayer 对齐：单字幕按 position 渲染，不做多轨错开
+        // bottom -> y=88%, center -> y=50%, top -> y=12%, custom -> (x%, y%)
+        // 多字幕轨时由用户设置不同 position 避免叠加（与前端逻辑一致）
+        let style_pos = style.map(|s| s.position.as_str()).unwrap_or("bottom");
+        let (pos_x, pos_y) = match style_pos {
+            "top" => (width as f64 / 2.0, height as f64 * 0.12),
+            "center" => (width as f64 / 2.0, height as f64 * 0.50),
+            "custom" => {
+                let cx = style.map(|s| s.x).unwrap_or(50.0);
+                let cy = style.map(|s| s.y).unwrap_or(80.0);
+                (width as f64 * cx / 100.0, height as f64 * cy / 100.0)
+            }
+            _ => (width as f64 / 2.0, height as f64 * 0.88),
+        };
+        // 缩放和旋转（对应前端 transform: scale + rotate）
+        let sx = style.map(|s| s.scale_x).unwrap_or(100.0);
+        let sy = style.map(|s| s.scale_y).unwrap_or(100.0);
+        let rot = style.map(|s| s.rotation).unwrap_or(0.0);
+        let transform_tag = format!(
+            "{{\\pos({pos_x:.1},{pos_y:.1})\\fscx{sx:.0}\\fscy{sy:.0}\\frz{rot:.0}}}",
+        );
         ass.push_str(&format!(
-            "Dialogue: {layer},{start},{end},{style_name},,0,0,0,,{fade_tag}{escaped}\n"
+            "Dialogue: {layer},{start},{end},{style_name},,0,0,0,,{fade_tag}{transform_tag}{escaped}\n"
         ));
     }
     ass
@@ -3133,8 +3145,9 @@ async fn merge_audio_clips(
     }
     let inputs_label: String = (0..n).map(|i| format!("[d{i}]")).collect();
     // normalize=0 禁止 amix 自动除以输入数（避免多轨混音变轻）
+    // alimiter=limit=0.95 限峰到 -0.45dB，防止多轨叠加削波产生的电音/爆音
     filter.push_str(&format!(
-        "{inputs_label}amix=inputs={n}:duration=longest:dropout_transition=0:normalize=0[aout]"
+        "{inputs_label}amix=inputs={n}:duration=longest:dropout_transition=0:normalize=0,alimiter=limit=0.95:attack=5:release=50[aout]"
     ));
 
     args.push("-filter_complex".to_string());

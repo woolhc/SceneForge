@@ -123,9 +123,79 @@ function writeWebState(state: WebState) {
   localStorage.setItem(storageKey, JSON.stringify(state));
 }
 
+export interface PipelineError {
+  code: string;
+  message: string;
+  retryable: boolean;
+  step?: string | null;
+  context?: unknown;
+}
+
+const RETRYABLE_CODES = new Set(["ASR_TIMEOUT", "PEXELS_429", "NETWORK", "AI_TIMEOUT", "TTS_TIMEOUT"]);
+const MAX_RETRY = 2;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** 解析后端结构化错误；非 JSON 时按纯 message 兼容旧格式，并根据消息模式推断 code/retryable */
+export function parsePipelineError(e: unknown): PipelineError {
+  const raw = typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && typeof parsed.code === "string") {
+      return {
+        code: parsed.code,
+        message: typeof parsed.message === "string" ? parsed.message : raw,
+        retryable: Boolean(parsed.retryable),
+        step: parsed.step,
+        context: parsed.context,
+      };
+    }
+  } catch {
+    // 非 JSON，按纯 message 处理
+  }
+  return inferErrorFromMessage(raw);
+}
+
+/** 根据错误消息模式推断 code/retryable（兼容未走 map_pipeline_error 的旧错误） */
+function inferErrorFromMessage(message: string): PipelineError {
+  const lower = message.toLowerCase();
+  if (lower.includes("429") || lower.includes("rate limit") || lower.includes("too many requests")) {
+    return { code: "PEXELS_429", message, retryable: true };
+  }
+  if (lower.includes("timeout") || lower.includes("timed out") || lower.includes("超时")) {
+    return { code: "NETWORK", message, retryable: true };
+  }
+  if (lower.includes("network") || lower.includes("connection") || lower.includes("econnreset") || lower.includes("enotfound")) {
+    return { code: "NETWORK", message, retryable: true };
+  }
+  if (lower.includes("deepseek") || lower.includes("api key") || lower.includes("unauthorized")) {
+    return { code: "AI_AUTH", message, retryable: false };
+  }
+  return { code: "UNKNOWN", message, retryable: false };
+}
+
+async function invokeWithRetry<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= MAX_RETRY; attempt++) {
+    try {
+      return await invoke<T>(command, args);
+    } catch (e) {
+      lastError = e;
+      const parsed = parsePipelineError(e);
+      if (!parsed.retryable || !RETRYABLE_CODES.has(parsed.code) || attempt >= MAX_RETRY) {
+        throw e;
+      }
+      await sleep(1000 * Math.pow(2, attempt));
+    }
+  }
+  throw lastError;
+}
+
 async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   if (isTauri) {
-    return invoke<T>(command, args);
+    return invokeWithRetry<T>(command, args);
   }
   return webFallback<T>(command, args);
 }

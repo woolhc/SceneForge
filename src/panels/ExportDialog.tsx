@@ -206,6 +206,14 @@ export function ExportDialog({
                     <option value="none">不包含字幕</option>
                   </select>
                 </label>
+                <label className="export-checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={config.hwaccel ?? true}
+                    onChange={(e) => onConfigChange({ ...config, hwaccel: e.target.checked })}
+                  />
+                  硬件加速编码（VideoToolbox/NVENC/QSV，关闭则强制软编）
+                </label>
               </div>
             )}
 

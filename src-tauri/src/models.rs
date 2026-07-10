@@ -74,6 +74,9 @@ pub struct WordCue {
     pub start: f64,
     pub end: f64,
     pub text: String,
+    /// whisper 词级置信度（0-1）。None 表示未提供（旧数据/不支持）
+    #[serde(default)]
+    pub confidence: Option<f64>,
 }
 
 /// ASR 识别结果（带时间戳的字幕片段，整理前/后的中间结构）
@@ -716,6 +719,20 @@ pub struct RenderConfig {
     /// 导出容器格式："mp4"（默认）| "gif" | "webm" | "mov"
     #[serde(default = "default_container")]
     pub container: String,
+    /// 是否启用硬件编码器（true 时检测并使用 videotoolbox/nvenc/qsv，false 强制软编）
+    #[serde(default = "default_hwaccel_on")]
+    pub hwaccel: bool,
+    /// CRF（质量，0-51，越小质量越高，默认 23）
+    #[serde(default)]
+    pub crf: Option<u32>,
+    /// 编码器预设："ultrafast"/"superfast"/"veryfast"/"faster"/"fast"/"medium"/"slow"/"slower"
+    /// None = 用 preview 默认（preview=ultrafast, export=veryfast/medium）
+    #[serde(default)]
+    pub encoder_preset: Option<String>,
+}
+
+fn default_hwaccel_on() -> bool {
+    true
 }
 
 fn default_container() -> String {
@@ -749,6 +766,9 @@ impl Default for RenderConfig {
             transition_duration: default_transition_duration(),
             subtitle_mode: default_subtitle_mode(),
             container: default_container(),
+            hwaccel: true,
+            crf: None,
+            encoder_preset: None,
         }
     }
 }

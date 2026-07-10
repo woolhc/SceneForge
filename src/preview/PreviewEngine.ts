@@ -209,7 +209,18 @@ export class PreviewEngine implements PreviewRenderer {
     }
     this.playing = true;
     this.lastFrameAt = performance.now();
+    // 同步创建并 resume AudioContext（用户手势上下文，避免异步链路丢失手势）
+    if (!this.audioCtx) {
+      const Ctx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      this.audioCtx = new Ctx();
+    }
+    if (this.audioCtx.state === "suspended") {
+      void this.audioCtx.resume();
+    }
     this.startAudioScheduling();
+    this.applyVideoAlignment(true);
     this.loop();
   }
 
@@ -233,6 +244,10 @@ export class PreviewEngine implements PreviewRenderer {
    }
     this.currentTime = Math.max(0, Math.min(time, this.getDuration()));
     this.currentVideoClipId = null;
+   // 同步 resume AudioContext（用户手势上下文）
+   if (this.audioCtx && this.audioCtx.state === "suspended") {
+     void this.audioCtx.resume();
+   }
    this.applyVideoAlignment(true);
     void this.preloadLookahead();
     this.syncOverlays();

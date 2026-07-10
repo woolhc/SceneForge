@@ -35,6 +35,7 @@ import {
   ZoomOut,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import pLimit from "p-limit";
 import { desktopApi } from "./tauri";
 import type {
   AppInfo,
@@ -52,7 +53,7 @@ import type {
   TrackKind,
   VoiceProfile,
 } from "./types";
-import { DEFAULT_SUBTITLE_STYLE, DEFAULT_TRANSFORM, DEFAULT_CROP } from "./types";
+import { DEFAULT_SUBTITLE_STYLE, DEFAULT_TRANSFORM, DEFAULT_CROP, videoWidthForProject } from "./types";
 import type { AiSegment } from "./types";
 import { FONT_OPTIONS } from "./fonts";
 import { SubtitleOverlay } from "./preview/SubtitleOverlay";
@@ -72,9 +73,11 @@ import { usePipelineStore } from "./store/pipelineStore";
 import { useProjectHistory } from "./store/projectHistory";
 import { useProjectStore } from "./store/projectStore";
 import { useUiStore } from "./store/uiStore";
+import { parsePipelineError } from "./tauri";
 import { SPEED_PRESETS } from "./editor/speedCurve";
 import { SpeedCurveEditor } from "./components/SpeedCurveEditor";
 import { MaskPreview } from "./components/MaskPreview";
+import { ToastContainer } from "./components/Toast";
 import {
   TRACK_KIND_LABELS,
   deleteTrack,
@@ -174,7 +177,7 @@ function KeyframeLabel() {
   return <span className="kf-label">关键帧（@ {currentTime.toFixed(1)}s）</span>;
 }
 
-function StageSubtitleLayer({ excludeClipId }: { excludeClipId?: string } = {}) {
+function StageSubtitleLayer({ excludeClipId, fontScale }: { excludeClipId?: string; fontScale: number }) {
   const currentTime = usePlaybackStore((s) => s.currentTime);
   const subClips = usePlaybackStore((s) => s.activeSubtitleClips);
   // 选中字幕编辑时，由 SubtitleOverlay 渲染该 clip，这里跳过避免重复
@@ -182,31 +185,26 @@ function StageSubtitleLayer({ excludeClipId }: { excludeClipId?: string } = {}) 
   if (visible.length === 0) return null;
   return (
     <>
-      {visible.map((clip, idx) => (
-        <SubtitleItem key={clip.id} clip={clip} currentTime={currentTime} stackIdx={idx} stackTotal={visible.length} />
+      {visible.map((clip) => (
+        <SubtitleItem key={clip.id} clip={clip} currentTime={currentTime} fontScale={fontScale} />
       ))}
     </>
   );
 }
 
-/** 单条字幕渲染（StageSubtitleLayer 内部使用）。
- *  stackIdx/stackTotal 用于多条字幕时按 idx 中心对称偏移，避免重叠。 */
-function SubtitleItem({ clip, currentTime, stackIdx, stackTotal }: {
+/** 单条字幕渲染（StageSubtitleLayer 内部使用）。 */
+function SubtitleItem({ clip, currentTime, fontScale }: {
   clip: Clip;
   currentTime: number;
-  stackIdx: number;
-  stackTotal: number;
+  fontScale: number;
 }) {
   const s = clip.subtitleStyle;
   const isCustom = s?.position === "custom";
   const posX = isCustom ? (s?.x ?? 50) : 50;
-  // 多条字幕时按 idx 中心对称偏移，每条间隔 12% 画面高度
-  const offsetY = stackTotal > 1
-    ? (stackIdx - (stackTotal - 1) / 2) * 12
-    : 0;
+  // 单字幕按 position 渲染，多字幕轨由用户设置不同 position 避免叠加（与后端 ASS 烧录一致）
   const posY = isCustom
-    ? (s?.y ?? 80) + offsetY
-    : (s?.position === "top" ? 12 : s?.position === "center" ? 50 : 88) + offsetY;
+    ? (s?.y ?? 80)
+    : (s?.position === "top" ? 12 : s?.position === "center" ? 50 : 88);
   const baseColor = s?.color ?? "#FFFFFF";
   const highlightColor = s?.highlightColor ?? "#FFD700";
   const karaokeOn = (s?.karaoke ?? true) && (clip.words?.length ?? 0) > 0;
@@ -242,18 +240,18 @@ function SubtitleItem({ clip, currentTime, stackIdx, stackTotal }: {
         transform: `translate(-50%, -50%) rotate(${s?.rotation ?? 0}deg) scale(${(s?.scaleX ?? 100) / 100}, ${(s?.scaleY ?? 100) / 100})`,
         transformOrigin: "center",
         fontFamily: s?.fontFamily,
-        fontSize: `${Math.max(12, (s?.fontSize ?? 48) * 0.35)}px`,
+        fontSize: `${Math.max(8, (s?.fontSize ?? 48) * fontScale)}px`,
         fontWeight: 700,
         lineHeight,
         color: baseColor,
         textShadow: finalTextShadow,
-        letterSpacing: `${letterSpacing}px`,
+        letterSpacing: `${letterSpacing * fontScale}px`,
         background: bgColor === "none" ? "transparent" : bgColor,
-        padding: bgColor === "none" ? "4px 10px" : `${bgPadding}px ${bgPadding * 2}px`,
+        padding: bgColor === "none" ? "4px 10px" : `${bgPadding * fontScale}px ${bgPadding * 2 * fontScale}px`,
         borderRadius: bgColor === "none" ? 0 : 4,
         textAlign: "center",
         whiteSpace: "pre-wrap",
-        maxWidth: "calc(100% - 24px)",
+        maxWidth: "86%",
         zIndex: 7,
         pointerEvents: "none",
       }}
@@ -406,21 +404,27 @@ function arrangeSegmentsToClips(
   const voiceoverTrackId = pickPrimaryTrack(tracks, "voiceover");
   const clips: Clip[] = [];
   let cursor = 0;
+  // 视频轨游标：音频模式下让视频 clip 首尾相接，填满句子间停顿（字幕仍按真实时间）
+  let videoCursor = 0;
+  const isAudioMode = segments.some((s) => (s.start ?? 0) !== 0 || (s.end ?? 0) !== 0);
   for (const seg of segments) {
     // 音频模式：用 whisper 真实时间；文案模式：累加 estimatedDuration
     const hasRealTime = (seg.start ?? 0) !== 0 || (seg.end ?? 0) !== 0;
     const start = hasRealTime ? (seg.start ?? cursor) : cursor;
     const duration = hasRealTime ? ((seg.end ?? 0) - (seg.start ?? 0)) : seg.estimatedDuration;
     // 视频轨（占位，sourceId 暂空，等用户绑定素材）
+    // 音频模式下首尾相接：startOnTrack = 前一个 clip 的 end，duration 延伸到当前句 end
     if (videoTrackId) {
+      const vStart = isAudioMode ? videoCursor : cursor;
+      const vDuration = isAudioMode ? ((seg.end ?? (videoCursor + duration)) - videoCursor) : duration;
       clips.push({
         id: newClipId(),
         trackId: videoTrackId,
         sourceId: null,
-        startOnTrack: start,
-        duration,
+        startOnTrack: vStart,
+        duration: vDuration,
         sourceIn: 0,
-        sourceOut: duration,
+        sourceOut: vDuration,
         speed: 1,
         volume: 1,
         fadeIn: 0,
@@ -432,6 +436,7 @@ function arrangeSegmentsToClips(
         transitionIn: null,
         transitionOut: null,
       });
+      videoCursor = vStart + vDuration;
     }
     // 字幕不再自动生成 —— 改由「识别字幕」按钮通过 ASR 语音识别 + AI 整理生成
     // 配音轨（sourceId 暂空，等生成配音后填充）
@@ -509,6 +514,12 @@ export function App() {
   const activeTab = useUiStore((s) => s.activeTab);
   const setActiveTab = useUiStore((s) => s.setActiveTab);
   const [subtitleStyleDraft, setSubtitleStyleDraft] = useState<SubtitleStyle>({ ...DEFAULT_SUBTITLE_STYLE });
+  // 预览舞台实际渲染宽度（CSS px），用于字号缩放：fontScale = stageWidth / videoWidth
+  // 保证预览字号视觉比例与导出视频一致，换行行为也一致
+  const [stageWidth, setStageWidth] = useState(0);
+  // 字号缩放比例：预览舞台宽度 / 视频实际宽度，保证预览字号视觉比例与导出一致
+  const videoWidth = project ? videoWidthForProject(project.ratio, project.renderConfig.resolution) : 1080;
+  const fontScale = stageWidth > 0 ? stageWidth / videoWidth : 0.35;
   const showAddTrackMenu = useUiStore((s) => s.showAddTrackMenu);
   const setShowAddTrackMenu = useUiStore((s) => s.setShowAddTrackMenu);
   // 素材库悬停预览：非 null 时中央预览区显示该素材
@@ -524,6 +535,8 @@ export function App() {
   // 右键菜单
   const contextMenu = useUiStore((s) => s.contextMenu);
   const setContextMenu = useUiStore((s) => s.setContextMenu);
+  const pushToast = useUiStore((s) => s.pushToast);
+  const dismissToast = useUiStore((s) => s.dismissToast);
   // 导出弹窗
   const showExport = useUiStore((s) => s.showExport);
   const setShowExport = useUiStore((s) => s.setShowExport);
@@ -617,6 +630,16 @@ export function App() {
   useEffect(() => {
     setOverlayContainer(overlayContainerRef.current);
   }, [setOverlayContainer, view]);
+  // 监听预览舞台宽度变化，用于字号缩放（预览字号 = 视频字号 * stageWidth / videoWidth）
+  useEffect(() => {
+    const el = stageRef.current;
+    if (!el) return;
+    const update = () => setStageWidth(el.clientWidth);
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [view]);
   // 双缓冲切换：活跃 video 变化时通知 FilterRenderer 更新读取的 video
   useEffect(() => {
     setActiveVideoChangeCallback((el) => {
@@ -1065,6 +1088,7 @@ export function App() {
     }
     setBusy("audio");
     setStatus("正在为全部片段生成配音...");
+    const snapshot = projectRef.current;
     try {
       await desktopApi.saveProject(project);
       const next = await desktopApi.generateAudio({
@@ -1074,11 +1098,17 @@ export function App() {
       // 配音时长已变成真实时长，按配音轨首尾相接重排整条时间线
       const realigned = realignTimeline(next);
       const saved = await desktopApi.saveProject(realigned);
-      setProject(saved);
+      persistWithSnapshot(saved, snapshot, "生成全部配音");
       await refreshProjects(saved.id);
       setStatus("全部片段配音已生成，时间线已按真实时长重排");
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : String(error));
+      const parsed = parsePipelineError(error);
+      setStatus(parsed.message);
+      pushToast({
+        type: "error",
+        message: `配音生成失败：${parsed.message}`,
+        action: parsed.retryable ? { label: "重试", onClick: () => void handleGenerateProjectAudio() } : undefined,
+      });
     } finally {
       setBusy(null);
     }
@@ -1089,20 +1119,27 @@ export function App() {
     if (!project) return;
     setBusy("subtitles");
     setStatus(translate ? "正在识别字幕并翻译..." : "正在识别字幕...");
+    const snapshot = projectRef.current;
     try {
       await desktopApi.saveProject(project);
       const next = await desktopApi.generateSubtitles({
         projectId: project.id,
         translate,
       });
-      setProject(next);
+      persistWithSnapshot(next, snapshot, `生成字幕（${translate ? "双语" : "单语"}）`);
       await refreshProjects(next.id);
       const subCount = next.clips.filter((c) =>
         next.tracks.some((t) => t.kind === "subtitle" && t.id === c.trackId),
       ).length;
       setStatus(`字幕识别完成，生成 ${subCount} 条字幕`);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : String(error));
+      const parsed = parsePipelineError(error);
+      setStatus(parsed.message);
+      pushToast({
+        type: "error",
+        message: `字幕识别失败：${parsed.message}`,
+        action: parsed.retryable ? { label: "重试", onClick: () => void handleRecognizeSubtitles(translate) } : undefined,
+      });
     } finally {
       setBusy(null);
     }
@@ -1147,25 +1184,31 @@ export function App() {
   /** 导入 SRT 字幕文件：解析后端 -> 生成字幕 clip 到字幕轨 */
   async function handleImportSrt() {
     if (!project) return;
+    const srtPath = await desktopApi.pickSrtFile();
+    if (!srtPath) return;
+    setBusy("subtitles");
+    setStatus("正在导入 SRT 字幕...");
+    const snapshot = projectRef.current;
     try {
-      const srtPath = await desktopApi.pickSrtFile();
-      if (!srtPath) return;
-      setBusy("subtitles");
-      setStatus("正在导入 SRT 字幕...");
       await desktopApi.saveProject(project);
       const next = await desktopApi.importSrt({
         projectId: project.id,
         srtPath,
         timeOffset: 0,
       });
-      setProject(next);
+      persistWithSnapshot(next, snapshot, "导入 SRT 字幕");
       await refreshProjects(next.id);
       const subCount = next.clips.filter((c) =>
         next.tracks.some((t) => t.kind === "subtitle" && t.id === c.trackId),
       ).length;
       setStatus(`SRT 导入完成，共 ${subCount} 条字幕`);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : String(error));
+      const parsed = parsePipelineError(error);
+      setStatus(parsed.message);
+      pushToast({
+        type: "error",
+        message: `SRT 导入失败：${parsed.message}`,
+      });
     } finally {
       setBusy(null);
     }
@@ -1253,6 +1296,7 @@ export function App() {
     }
     setBusy("clip-audio");
     setStatus(`正在生成配音...`);
+    const snapshot = projectRef.current;
     try {
       await desktopApi.saveProject(project);
       const next = await desktopApi.generateAudio({
@@ -1263,12 +1307,18 @@ export function App() {
       // 单段配音时长变化后，同样按配音轨重排整条时间线
       const realigned = realignTimeline(next);
       const saved = await desktopApi.saveProject(realigned);
-      setProject(saved);
+      persistWithSnapshot(saved, snapshot, "生成片段配音");
       setSelectedClipId(voiceClip.id);
       await refreshProjects(saved.id);
       setStatus("片段配音已生成，时间线已重排");
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : String(error));
+      const parsed = parsePipelineError(error);
+      setStatus(parsed.message);
+      pushToast({
+        type: "error",
+        message: `片段配音失败：${parsed.message}`,
+        action: parsed.retryable ? { label: "重试", onClick: () => void handleGenerateClipAudio() } : undefined,
+      });
     } finally {
       setBusy(null);
     }
@@ -1424,22 +1474,32 @@ export function App() {
     setSelectedClipId(saved.clips[0]?.id || null);
     await refreshProjects(saved.id);
 
-    // Step 5: 为视频 clip 绑素材
+    // Step 5: 为视频 clip 并发绑素材（限流 3 避免触发 Pexels API 限流）
     const videoTrackIds = saved.tracks.filter((t) => t.kind === "video").map((t) => t.id);
     const videoClips = saved.clips.filter((c) => videoTrackIds.includes(c.trackId));
+    const limit = pLimit(3);
     let boundCount = 0;
-    for (const clip of videoClips) {
-      const segPeer = segments.find((s) => Math.abs((s.start ?? -1) - clip.startOnTrack) < 0.5);
-      const query =
-        clip.visualQuery ||
-        segPeer?.visualQuery ||
-        segPeer?.text?.slice(0, 24) ||
-        "nature landscape";
-      // 用 saved.ratio（最新值），不用闭包 project?.ratio
-      const ok = await searchAndBindAsset(saved.id, clip.id, query, saved.ratio);
-      if (ok) boundCount += 1;
-      setStatus(`正在匹配素材：${boundCount}/${videoClips.length}`);
+    let doneCount = 0;
+    const tasks = videoClips.map((clip) =>
+      limit(async () => {
+        const segPeer = segments.find((s) => Math.abs((s.start ?? -1) - clip.startOnTrack) < 0.5);
+        const query =
+          clip.visualQuery ||
+          segPeer?.visualQuery ||
+          segPeer?.text?.slice(0, 24) ||
+          "nature landscape";
+        const ok = await searchAndBindAsset(saved.id, clip.id, query, saved.ratio, clip.duration);
+        doneCount += 1;
+        if (ok) boundCount += 1;
+        setStatus(`正在匹配素材：${doneCount}/${videoClips.length}（成功 ${boundCount}）`);
+      }),
+    );
+    const results = await Promise.allSettled(tasks);
+    const failed = results.filter((r) => r.status === "rejected").length;
+    if (failed > 0) {
+      pushToast({ type: "warning", message: `${failed} 段素材匹配失败` });
     }
+    detectAssetDuplication(saved);
     setStatus(`音频分镜完成：${segments.length} 句，已匹配 ${boundCount}/${videoClips.length} 段素材`);
   }
 
@@ -1451,6 +1511,7 @@ export function App() {
     if (!project) return;
     setEdlBusy(true);
     setStatus("正在编排轨道并匹配素材...");
+    const snapshot = projectRef.current;
     try {
       // 编排成轨道 clips（按实际项目的 tracks 动态匹配轨道 ID）
       const clips = arrangeSegmentsToClips(segments, project.tracks);
@@ -1460,25 +1521,36 @@ export function App() {
         media: project.media,
       };
       const saved = await desktopApi.saveProject(nextProject);
-      setProject(saved);
+      persistWithSnapshot(saved, snapshot, `执行分镜方案（${segments.length} 段）`);
       setSelectedClipId(saved.clips[0]?.id || null);
       await refreshProjects(saved.id);
 
-      // 串行为每个视频 clip 搜素材并绑定（用 clip 自带的 visualQuery）
+      // 并发为每个视频 clip 搜素材并绑定（限流 3，用 clip 自带的 visualQuery）
       const videoTrackIds = saved.tracks.filter((t) => t.kind === "video").map((t) => t.id);
       const videoClips = saved.clips.filter((c) => videoTrackIds.includes(c.trackId));
+      const limit = pLimit(3);
       let boundCount = 0;
-      for (const clip of videoClips) {
-        const segPeer = segments.find((_, idx) => idx === videoClips.indexOf(clip));
-        const query =
-          clip.visualQuery ||
-          segPeer?.visualQuery ||
-          segPeer?.text?.slice(0, 24) ||
-          "nature landscape";
-        const ok = await searchAndBindAsset(saved.id, clip.id, query, saved.ratio);
-        if (ok) boundCount += 1;
-        setStatus(`正在匹配素材：${boundCount}/${videoClips.length}`);
+      let doneCount = 0;
+      const tasks = videoClips.map((clip, idx) =>
+        limit(async () => {
+          const segPeer = segments[idx];
+          const query =
+            clip.visualQuery ||
+            segPeer?.visualQuery ||
+            segPeer?.text?.slice(0, 24) ||
+            "nature landscape";
+          const ok = await searchAndBindAsset(saved.id, clip.id, query, saved.ratio, clip.duration);
+          doneCount += 1;
+          if (ok) boundCount += 1;
+          setStatus(`正在匹配素材：${doneCount}/${videoClips.length}（成功 ${boundCount}）`);
+        }),
+      );
+      const results = await Promise.allSettled(tasks);
+      const failed = results.filter((r) => r.status === "rejected").length;
+      if (failed > 0) {
+        pushToast({ type: "warning", message: `${failed} 段素材匹配失败` });
       }
+      detectAssetDuplication(saved);
       setStatus(`分镜方案已执行：${segments.length} 段，已匹配 ${boundCount}/${videoClips.length} 段素材`);
       setEdlSegments(null); // 关闭预览面板
     } catch (error) {
@@ -1488,20 +1560,23 @@ export function App() {
     }
   }
 
-  /** 为指定视频 clip 搜素材并绑定第一个结果。返回是否绑定成功。 */
+  /** 为指定视频 clip 搜素材并绑定。
+   *  自动编排流程用：优先选时长 >= targetDuration 的素材，都不够长时取最长的（降级）。 */
   async function searchAndBindAsset(
     projectId: string,
     clipId: string,
     query: string,
     ratio?: string,
+    targetDuration?: number,
   ): Promise<boolean> {
     try {
       // 优先用传入的 ratio（最新值），否则用 projectRef.current?.ratio
       const effectiveRatio = ratio || projectRef.current?.ratio || "9:16";
       const assets = await desktopApi.searchPexelsVideos({ query, ratio: effectiveRatio, perPage: 6 });
       setAssetCandidates((previous) => ({ ...previous, [clipId]: assets }));
-      if (assets[0]) {
-        await bindAssetToClip(projectId, clipId, assets[0]);
+      const picked = pickAssetByDuration(assets, targetDuration);
+      if (picked) {
+        await bindAssetToClip(projectId, clipId, picked);
         return true;
       }
     } catch {
@@ -1510,12 +1585,33 @@ export function App() {
     return false;
   }
 
+  /** 按 targetDuration 挑选素材：
+   *  - 无 targetDuration 或非正值：取第一个（相关度最高）
+   *  - 优先取第一个时长 >= targetDuration 的（保持 Pexels 相关度排序）
+   *  - 都不够长时降级取时长最长的视频（避免完全无素材） */
+  function pickAssetByDuration(assets: MediaSource[], targetDuration?: number): MediaSource | null {
+    if (assets.length === 0) return null;
+    if (!targetDuration || targetDuration <= 0) return assets[0];
+    const longEnough = assets.find((a) => a.kind === "image" || a.duration >= targetDuration);
+    if (longEnough) return longEnough;
+    const videos = assets.filter((a) => a.kind === "video");
+    if (videos.length === 0) return assets[0];
+    return videos.reduce((max, a) => (a.duration > max.duration ? a : max), videos[0]);
+  }
+
   async function bindAssetToClip(projectId: string, clipId: string, asset: MediaSource) {
     // 基于最新 project，避免并发绑定相互覆盖（AI 分段后会并发触发多个绑定）
     const current = projectRef.current;
     if (!current || current.id !== projectId) return;
     const target = current.clips.find((c) => c.id === clipId);
     if (!target) return;
+    // 素材时长不足段时长 80% 时警告（图片无时长不校验）
+    if (asset.kind === "video" && asset.duration > 0 && asset.duration < target.duration * 0.8) {
+      pushToast({
+        type: "warning",
+        message: `素材时长 ${asset.duration.toFixed(1)}s 不足段时长 ${target.duration.toFixed(1)}s，将循环/缩放`,
+      });
+    }
     // 图片无时长，绑定时保持原 clip duration
     const end = asset.kind === "image"
       ? target.duration
@@ -1537,6 +1633,29 @@ export function App() {
     await desktopApi.saveProject(nextProject);
     setStatus(`已绑定素材到片段`);
     void cacheAssetForProject(nextProject.id, clipId, asset);
+  }
+
+  /** 检测同一素材被多段共用，超过阈值时提示用户 */
+  function detectAssetDuplication(project: Project) {
+    const videoClips = project.clips.filter((c) =>
+      project.tracks.some((t) => t.kind === "video" && t.id === c.trackId) && c.sourceId,
+    );
+    const usage = new Map<string, number>();
+    for (const clip of videoClips) {
+      if (clip.sourceId) {
+        usage.set(clip.sourceId, (usage.get(clip.sourceId) ?? 0) + 1);
+      }
+    }
+    usage.forEach((count, sourceId) => {
+      if (count > 2) {
+        const media = project.media.find((m) => m.id === sourceId);
+        pushToast({
+          type: "info",
+          message: `素材"${media?.url ?? sourceId}"被 ${count} 段共用，建议替换部分`,
+          duration: 8000,
+        });
+      }
+    });
   }
 
   async function cacheAssetForProject(projectId: string, clipId: string, asset: MediaSource) {
@@ -2334,6 +2453,7 @@ export function App() {
 
   return (
     <div className="app-shell">
+      <ToastContainer />
       <header className="topbar">
         <button
           className="home-back-btn"
@@ -2637,7 +2757,7 @@ export function App() {
                       transform: `translate(-50%, -50%) rotate(${s.rotation ?? 0}deg) scale(${(s.scaleX ?? 100) / 100})`,
                       transformOrigin: "center",
                       fontFamily: s.fontFamily,
-                      fontSize: `${Math.max(12, (s.fontSize ?? 48) * 0.35)}px`,
+                      fontSize: `${Math.max(8, (s.fontSize ?? 48) * fontScale)}px`,
                       fontWeight: 700,
                       lineHeight: 1.4,
                       color: s.color,
@@ -2645,7 +2765,7 @@ export function App() {
                       padding: "4px 10px",
                       textAlign: "center",
                       whiteSpace: "pre-wrap",
-                      maxWidth: "calc(100% - 24px)",
+                      maxWidth: "86%",
                       zIndex: 8,
                       border: "1.5px solid var(--accent)",
                       background: "rgba(0,0,0,0.3)",
@@ -2673,11 +2793,12 @@ export function App() {
               if (isSelectedSubtitle && selectedClip) {
                 return (
                   <>
-                    <StageSubtitleLayer excludeClipId={selectedClip.id} />
+                    <StageSubtitleLayer excludeClipId={selectedClip.id} fontScale={fontScale} />
                     <SubtitleOverlay
                       clip={selectedClip}
                       targetRef={stageRef}
                       isSelected
+                      fontScale={fontScale}
                       onMove={(x, y) => {
                         const cur = selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE };
                         updateSelectedClip({ subtitleStyle: { ...cur, position: "custom", x, y } }, false);
@@ -2698,7 +2819,7 @@ export function App() {
                   </>
                 );
               }
-              return <StageSubtitleLayer />;
+              return <StageSubtitleLayer fontScale={fontScale} />;
             })()}
           </div>
           </div>
@@ -2936,6 +3057,30 @@ export function App() {
                       <option value="custom">自定义（拖动）</option>
                     </select>
                   </label>
+                  {/* 整轨位置快捷按钮：一键把整条轨所有字幕设为同一位置，避免逐条调整 */}
+                  <div className="style-field" style={{ flexDirection: "row", gap: 6, flexWrap: "wrap" }}>
+                    <span style={{ width: "100%", opacity: 0.7, fontSize: 12 }}>整轨位置：</span>
+                    {(["bottom", "center", "top"] as const).map((pos) => (
+                      <button
+                        key={pos}
+                        className="panel-secondary-action"
+                        style={{ flex: 1, minWidth: 0, padding: "4px 6px", fontSize: 12 }}
+                        onClick={() => {
+                          if (!project) return;
+                          const trackId = selectedClip.trackId;
+                          const next = project.clips.map((c) =>
+                            c.trackId === trackId
+                              ? { ...c, subtitleStyle: { ...(c.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE }), position: pos } }
+                              : c,
+                          );
+                          const count = project.clips.filter((c) => c.trackId === trackId).length;
+                          void persist({ ...project, clips: next }, `整轨设为${pos === "bottom" ? "底部" : pos === "center" ? "居中" : "顶部"}（${count} 条）`);
+                        }}
+                      >
+                        {pos === "bottom" ? "底部" : pos === "center" ? "居中" : "顶部"}
+                      </button>
+                    ))}
+                  </div>
                   {/* 逐字高亮（卡拉OK）：仅当字幕有词级时间戳时生效 */}
                   <label className="style-field" style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
                     <input
@@ -3003,6 +3148,24 @@ export function App() {
                       onPointerUp={() => commitInteractiveEdit()}
                     />
                   </label>
+                  {/* 批量：把当前 clip 的字幕样式（位置/字号/颜色/描边/动画等）应用到整条轨所有字幕 */}
+                  <button
+                    className="panel-secondary-action"
+                    onClick={() => {
+                      if (!project) return;
+                      const trackId = selectedClip.trackId;
+                      const srcStyle = selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE };
+                      const next = project.clips.map((c) =>
+                        c.trackId === trackId
+                          ? { ...c, subtitleStyle: { ...srcStyle } }
+                          : c,
+                      );
+                      const count = project.clips.filter((c) => c.trackId === trackId).length;
+                      void persist({ ...project, clips: next }, `已应用样式到整条轨（${count} 条字幕）`);
+                    }}
+                  >
+                    应用到整条轨
+                  </button>
                 </div>
               )}
 
@@ -4017,6 +4180,12 @@ export function App() {
               setSelectedClipId(contextMenu.clip.id);
               setSubtitleEditing(true);
             },
+            onRegenerateAsset: contextMenu.trackKind === "video" ? () => {
+              const clip = contextMenu.clip;
+              if (!project) return;
+              const query = clip.visualQuery || clip.text?.slice(0, 24) || "nature landscape";
+              void searchAndBindAsset(project.id, clip.id, query, project.ratio);
+            } : undefined,
           }}
         />
       )}
@@ -4040,6 +4209,7 @@ export function App() {
           segments={edlSegments}
           totalDuration={edlSegments.reduce((s, x) => s + x.estimatedDuration, 0)}
           busy={edlBusy}
+          ratio={project?.ratio}
           onConfirm={(segs) => applyEdlSegments(segs)}
           onCancel={() => { if (!edlBusy) setEdlSegments(null); }}
         />

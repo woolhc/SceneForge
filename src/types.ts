@@ -122,6 +122,8 @@ export type WordCue = {
   start: number;
   end: number;
   text: string;
+  /** whisper 词级置信度（0-1）。未提供时为 undefined */
+  confidence?: number;
 };
 
 export type ClipCrop = {
@@ -298,6 +300,12 @@ export type RenderConfig = {
   transitionDuration?: number;
   /** 字幕处理：burn 烧录到画面（默认）| none 不包含 */
   subtitleMode?: "burn" | "srt" | "none";
+  /** 阶段 E: 是否启用硬件编码器（videotoolbox/nvenc/qsv），默认 true */
+  hwaccel?: boolean;
+  /** 阶段 E: 自定义 CRF（0-51，越小质量越高），undefined = 用 preview 默认 */
+  crf?: number;
+  /** 阶段 E: 自定义编码器预设（ultrafast/superfast/veryfast/fast/medium/slow），undefined = 用 preview 默认 */
+  encoderPreset?: string;
 };
 
 export type Project = {
@@ -407,6 +415,17 @@ export const DEFAULT_SUBTITLE_STYLE: SubtitleStyle = {
   animationDuration: 0.3,
 };
 
+/** 根据项目比例和导出分辨率计算视频实际宽度（像素）。
+ *  前端预览用此值与 stage 宽度计算字号缩放比例，保证预览字号视觉与导出一致。 */
+export function videoWidthForProject(ratio: string, resolution: string): number {
+  const shortEdge =
+    resolution === "4k" || resolution === "2160p" ? 2160
+    : resolution === "720p" ? 720
+    : resolution === "480p" ? 480
+    : 1080;
+  return ratio === "16:9" ? Math.round((shortEdge * 16) / 9) : shortEdge;
+}
+
 export const DEFAULT_TRANSFORM: ClipTransform = {
   x: 50,
   y: 50,
@@ -425,4 +444,5 @@ export const DEFAULT_RENDER_CONFIG: RenderConfig = {
   codec: "h264",
   exportMode: "video",
   transitionDuration: 0.5,
+  hwaccel: true,
 };

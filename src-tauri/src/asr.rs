@@ -1,10 +1,87 @@
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde::Deserialize;
 use serde_json::json;
 use tokio::process::Command;
 
 use crate::models::{AppSettings, SubtitleCue, WordCue};
+
+/// 字幕可读性配置（行业标准：Netflix/BBC 规范）
+/// 中文 CPS≤12、单行≤18 字；英文 CPS≤20、单行≤42 字符
+#[derive(Clone, Copy)]
+struct SubtitleProfile {
+    max_chars: usize,
+    max_cps: f64,
+    min_duration: f64,
+    max_duration: f64,
+}
+
+const ZH_PROFILE: SubtitleProfile = SubtitleProfile {
+    max_chars: 18,
+    max_cps: 12.0,
+    min_duration: 1.2,
+    max_duration: 7.0,
+};
+
+const EN_PROFILE: SubtitleProfile = SubtitleProfile {
+    max_chars: 42,
+    max_cps: 20.0,
+    min_duration: 1.5,
+    max_duration: 7.0,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Language {
+    Chinese,
+    English,
+    Mixed,
+}
+
+fn is_chinese_char(c: char) -> bool {
+    matches!(c as u32,
+        0x4E00..=0x9FFF |   // CJK 统一汉字
+        0x3400..=0x4DBF |   // CJK 扩展 A
+        0x20000..=0x2A6DF   // CJK 扩展 B
+    )
+}
+
+fn is_chinese(text: &str) -> bool {
+    let chinese = text.chars().filter(|c| is_chinese_char(*c)).count();
+    let total = text.chars().filter(|c| !c.is_whitespace()).count();
+    total > 0 && chinese * 2 >= total // 中文字符占比 ≥ 50%
+}
+
+/// 按中文字符占比检测语言，混合用中文 profile（更保守）
+fn detect_language(text: &str) -> Language {
+    let chinese = text.chars().filter(|c| is_chinese_char(*c)).count();
+    let alpha = text.chars().filter(|c| c.is_ascii_alphanumeric()).count();
+    let total = chinese + alpha;
+    if total == 0 {
+        return Language::English;
+    }
+    let zh_ratio = chinese as f64 / total as f64;
+    if zh_ratio > 0.7 {
+        Language::Chinese
+    } else if zh_ratio < 0.3 {
+        Language::English
+    } else {
+        Language::Mixed
+    }
+}
+
+fn profile_for(text: &str) -> SubtitleProfile {
+    match detect_language(text) {
+        Language::English => EN_PROFILE,
+        Language::Chinese | Language::Mixed => ZH_PROFILE,
+    }
+}
+
+/// jieba 分词器全局缓存（避免重复初始化字典）
+fn jieba() -> &'static jieba_rs::Jieba {
+    static JIEBA: OnceLock<jieba_rs::Jieba> = OnceLock::new();
+    JIEBA.get_or_init(jieba_rs::Jieba::new)
+}
 
 /// whisper-cli 输出的 JSON 结构（-oj）
 #[derive(Debug, Deserialize)]
@@ -341,6 +418,7 @@ fn words_to_cues(segments: Vec<WhisperSegment>) -> Vec<SubtitleCue> {
             start,
             end,
             text: trimmed.to_string(),
+            confidence: None,
         });
     }
 
@@ -348,10 +426,10 @@ fn words_to_cues(segments: Vec<WhisperSegment>) -> Vec<SubtitleCue> {
         return vec![];
     }
 
-    // 2. 分组成 SubtitleCue
-    // 每段最多 30 字符，最长 6 秒；遇到句末标点强制断句
-    const MAX_CHARS: usize = 30;
-    const MAX_DURATION: f64 = 6.0;
+    // 2. 检测整体语言，选 profile（行业标准 Netflix/BBC：中文单行≤18 字 CPS≤12，英文≤42 字符 CPS≤20）
+    let full_text: String = all_words.iter().map(|w| w.text.as_str()).collect();
+    let profile = profile_for(&full_text);
+    const PAUSE_GAP: f64 = 0.3; // 停顿断句阈值（行业 SubtitleEdit 标准 0.25-0.4s）
     let sentence_enders = ['。', '！', '？', '!', '?', '.'];
 
     let mut cues: Vec<SubtitleCue> = Vec::new();
@@ -377,9 +455,9 @@ fn words_to_cues(segments: Vec<WhisperSegment>) -> Vec<SubtitleCue> {
 
         let should_break = !current_words.is_empty()
             && (prev_ends_sentence           // 前一词是句末 → 断
-                || new_char_count > MAX_CHARS // 超字数 → 断
-                || duration > MAX_DURATION   // 超时长 → 断
-                || word.start - last_end > 0.8); // 语音停顿 > 0.8s → 断
+                || new_char_count > profile.max_chars // 超字数 → 断
+                || duration > profile.max_duration   // 超时长 → 断
+                || word.start - last_end > PAUSE_GAP); // 语音停顿 > 0.3s → 断
 
         if should_break {
             if let Some(cue) = words_to_cue(&current_words) {
@@ -433,69 +511,36 @@ fn join_words_with_smart_separator(words: &[WordCue]) -> String {
     out
 }
 
-/// 用 DeepSeek 重新分段 + 整理字幕（AI 语义断句 + 可读性控制）。
-/// translate=true 时把原文翻译成中文（双语保留原文）。
-pub async fn refine_subtitles(
+/// 批量翻译字幕：输入带 text 的 cues，输出填充 translated 的 cues。
+/// 不改 start/end/words，避免 AI 幻觉时间戳。
+/// 复用 crate::ffmpeg::http_client() 和 DeepSeek 调用模式。
+pub async fn translate_subtitles(
     settings: &AppSettings,
     cues: &[SubtitleCue],
-    translate: bool,
 ) -> anyhow::Result<Vec<SubtitleCue>> {
     let api_key = settings.deepseek_api_key.trim();
-    if api_key.is_empty() {
-        // 没有 key → 用纯规则分段（不返回 raw whisper）
-        return Ok(segment_subtitles_rules(cues));
+    if api_key.is_empty() || cues.is_empty() {
+        return Ok(cues.to_vec());
     }
 
-    // 如果原始 cues 已带词级时间戳，跳过 AI 重排。
-    // 原因：AI 重排会重组字幕边界，丢失 word↔cue 对应关系，破坏逐字高亮。
-    // words_to_cues 已经按可读性分组，质量足够；翻译走单独的流程。
-    if cues.iter().any(|c| !c.words.is_empty()) && !translate {
-        return Ok(segment_subtitles_rules(cues));
-    }
-
+    // 只发 index + text，不发时间戳（避免 AI 改时间戳）
     let input: Vec<serde_json::Value> = cues
         .iter()
-        .map(|c| json!({ "start": c.start, "end": c.end, "text": c.text }))
+        .enumerate()
+        .map(|(i, c)| json!({ "index": i, "text": c.text }))
         .collect();
 
-    let system_prompt = "你是专业字幕编导。你的任务是把语音识别的原始分段重新编排成适合短视频观看的字幕块。你必须严格按可读性规则分段，并估算每段的显示时长。只返回 JSON。";
+    let system_prompt = "你是专业字幕翻译。把每条原文翻译成中文，保留原文含义，适合短视频观看。只返回 JSON。";
+    let user_prompt = format!(
+        r#"请翻译以下字幕数组，每条 text 翻译成中文填入 translated 字段。
+严格按 index 顺序返回，不改原文，不改时间戳。
 
-    let rules = r#"可读性规则（必须严格遵守）：
-- 每段最多 30 个中文字（或 42 个英文字符），超过必须在语义自然处拆分
-- 优先在句号、感叹号、问号处拆分；其次逗号、分号；最后按从句/意群边界
-- 不要在一个词中间拆分
-- 合并间隔小于 0.5 秒的相邻段（如果合并后不超字数上限）
-- 每段最短 0.8 秒，最长 6 秒
-- start/end 必须在原始时间范围内合理分配（按字数比例分配时长）
-- 段与段之间留 0.1-0.3 秒间隔（前段 end 略提前）
-- 修正明显的语音识别错误和标点
-- 保持原文核心意思，不要改写或删减内容"#;
+只返回 JSON 对象：{{"translations":[{{"index":0,"translated":"中文翻译"}}]}}
 
-    let user_prompt = if translate {
-        format!(
-            r#"{rules}
-
-下面是带时间戳的原始字幕片段（JSON 数组）。请重新分段编排，并把每条翻译成中文。
-
-只返回 JSON 对象：{{"subtitles": [{{"start": 0.0, "end": 2.5, "text": "原文", "translated": "中文翻译"}}]}}
-
-原始字幕：
+原文：
 {}"#,
-            serde_json::to_string_pretty(&input).unwrap_or_default()
-        )
-    } else {
-        format!(
-            r#"{rules}
-
-下面是带时间戳的原始字幕片段（JSON 数组）。请重新分段编排。
-
-只返回 JSON 对象：{{"subtitles": [{{"start": 0.0, "end": 2.5, "text": "整理后文字"}}]}}
-
-原始字幕：
-{}"#,
-            serde_json::to_string_pretty(&input).unwrap_or_default()
-        )
-    };
+        serde_json::to_string_pretty(&input).unwrap_or_default()
+    );
 
     let client = crate::ffmpeg::http_client();
     let response = client
@@ -508,7 +553,7 @@ pub async fn refine_subtitles(
                 { "role": "user", "content": user_prompt }
             ],
             "response_format": { "type": "json_object" },
-            "temperature": 0.3
+            "temperature": 0.0
         }))
         .send()
         .await?;
@@ -516,18 +561,126 @@ pub async fn refine_subtitles(
     let status = response.status();
     let body = response.text().await?;
     if !status.is_success() {
-        // AI 失败 → 回退到规则分段
-        return Ok(segment_subtitles_rules(cues));
+        anyhow::bail!("DeepSeek 翻译失败：{}", body);
     }
 
-    let parsed: serde_json::Value =
-        serde_json::from_str(&body).map_err(|e| anyhow::anyhow!("DeepSeek 返回解析失败：{e}"))?;
+    let parsed: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| anyhow::anyhow!("DeepSeek 返回解析失败：{e}"))?;
     let content = parsed["choices"][0]["message"]["content"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("DeepSeek 返回为空"))?;
-    let refined = extract_subtitle_array(content)?;
-    // AI 输出后再跑一次规则补丁（CPS/时长/间隔边界检查）
-    Ok(segment_subtitles_rules(&refined))
+
+    let translations = parse_translations(content)?;
+    let mut result = cues.to_vec();
+    for (i, cue) in result.iter_mut().enumerate() {
+        if let Some(t) = translations.get(&i) {
+            cue.translated = Some(t.clone());
+        }
+    }
+    Ok(result)
+}
+
+fn parse_translations(
+    content: &str,
+) -> anyhow::Result<std::collections::HashMap<usize, String>> {
+    let text = content.trim();
+    let text = text
+        .strip_prefix("```json")
+        .or_else(|| text.strip_prefix("```"))
+        .unwrap_or(text)
+        .trim_end_matches('`')
+        .trim();
+    let parsed: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| anyhow::anyhow!("翻译结果解析失败：{e}"))?;
+    let arr = parsed["translations"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("翻译结果缺少 translations 数组"))?;
+    let mut map = std::collections::HashMap::new();
+    for item in arr {
+        let index = item["index"].as_u64().unwrap_or(0) as usize;
+        let translated = item["translated"].as_str().unwrap_or("").to_string();
+        if !translated.is_empty() {
+            map.insert(index, translated);
+        }
+    }
+    Ok(map)
+}
+
+/// 生成中文 translated 的 jieba 分词 word 时间戳（均匀分配）。
+/// 用于双语模式中文轨的 karaoke 高亮（非精确，但比无 words 好）。
+/// 返回 None 表示 translated 非中文或为空。
+pub fn generate_chinese_words(cue: &SubtitleCue) -> Option<Vec<WordCue>> {
+    let translated = cue.translated.as_ref()?;
+    if !is_chinese(translated) {
+        return None;
+    }
+    let trimmed = translated.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let words = jieba().cut(trimmed, true);
+    let words: Vec<&str> = words.into_iter().filter(|w| !w.trim().is_empty()).collect();
+    if words.is_empty() {
+        return None;
+    }
+    let duration = (cue.end - cue.start).max(0.1);
+    let per_word = duration / words.len() as f64;
+    Some(
+        words
+            .iter()
+            .enumerate()
+            .map(|(i, w)| WordCue {
+                start: cue.start + i as f64 * per_word,
+                end: cue.start + (i + 1) as f64 * per_word,
+                text: w.to_string(),
+                confidence: Some(0.5),
+            })
+            .collect(),
+    )
+}
+
+/// 用 DeepSeek 重新分段 + 整理字幕（AI 语义断句 + 可读性控制）。
+/// translate=true 时把原文翻译成中文（双语保留原文）。
+pub async fn refine_subtitles(
+    settings: &AppSettings,
+    cues: &[SubtitleCue],
+    translate: bool,
+) -> anyhow::Result<Vec<SubtitleCue>> {
+    // 第一步：规则分段（保留 whisper words，双语也走规则，不走 AI 重排）
+    // segment_subtitles_rules 内部"有 words 直接返回"分支会保留 words 不破坏对应关系
+    let mut result = segment_subtitles_rules(cues);
+
+    // 第二步：翻译（单独流程，不改 start/end/words，避免 AI 幻觉时间戳）
+    if translate && !settings.deepseek_api_key.trim().is_empty() {
+        result = match translate_subtitles(settings, &result).await {
+            Ok(translated) => translated,
+            Err(_) => result, // 翻译失败回退到不翻译，原文仍可用
+        };
+
+        // 注：中文轨的 jieba words 在 commands.rs 单独生成（双语模式 cue.words 是英文，不能在此覆盖）
+    }
+
+    Ok(result)
+}
+
+/// 规范化相邻 cue 间隔：如果 cue[i+1].start - cue[i].end < min_gap，
+/// 则截断 cue[i].end = cue[i+1].start - min_gap（保证 cue[i].end > cue[i].start）。
+/// 用于修复 CPS 延长侵入间隔、AI 重排返回连续 cue 等问题，保证字幕不连续排列。
+fn ensure_min_gap(cues: &mut [SubtitleCue], min_gap: f64) {
+    if cues.len() < 2 {
+        return;
+    }
+    for i in 0..cues.len() - 1 {
+        let next_start = cues[i + 1].start;
+        let gap = next_start - cues[i].end;
+        if gap < min_gap {
+            let new_end = next_start - min_gap;
+            // 确保不倒置，且保留至少 0.1 秒时长（避免截断后 cue 时长过短）
+            if new_end > cues[i].start + 0.1 {
+                cues[i].end = new_end;
+            }
+        }
+    }
 }
 
 /// 纯规则字幕分段（无 AI 依赖，可独立运行）。
@@ -537,19 +690,20 @@ pub fn segment_subtitles_rules(cues: &[SubtitleCue]) -> Vec<SubtitleCue> {
         return vec![];
     }
 
-    // 如果原始 cues 已带词级时间戳（whisper -ml 1 模式），直接透传。
-    // 词级 cues 已经在 words_to_cues 里按可读性分组过，再过一遍规则会破坏 word↔cue 对应关系。
-    if cues.iter().any(|c| !c.words.is_empty()) {
-        return cues.to_vec();
-    }
-
-    // 阈值
-    const MAX_CHARS: usize = 30; // 每段最大字符数
-    const MAX_DURATION: f64 = 6.0; // 每段最大时长（秒）
-    const MIN_DURATION: f64 = 0.8; // 每段最小时长（秒）
+    // 阈值（中英文按行业标准区分，profile_for 自动检测语言选配置）
     const MERGE_GAP: f64 = 0.5; // 合并间隔阈值（秒）
     const MIN_GAP: f64 = 0.1; // 段间最小间隔（秒）
-    const MAX_CPS: f64 = 14.0; // 最大字符/秒（中文）
+    let full_text: String = cues.iter().map(|c| c.text.as_str()).collect();
+    let profile = profile_for(&full_text);
+
+    // 如果原始 cues 已带词级时间戳（whisper -ml 1 模式），直接透传。
+    // 词级 cues 已经在 words_to_cues 里按可读性分组过，再过一遍规则会破坏 word↔cue 对应关系。
+    // 但仍需规范化间隔，避免连续排列导致字幕与音频不对齐。
+    if cues.iter().any(|c| !c.words.is_empty()) {
+        let mut result = cues.to_vec();
+        ensure_min_gap(&mut result, MIN_GAP);
+        return result;
+    }
 
     // Pass 1: 合并太短的段（间隔 < MERGE_GAP 且合并后不超限）
     let mut merged: Vec<SubtitleCue> = Vec::new();
@@ -559,8 +713,8 @@ pub fn segment_subtitles_rules(cues: &[SubtitleCue]) -> Vec<SubtitleCue> {
             let combined_text = format!("{}{}", last.text, cue.text);
             let combined_dur = cue.end - last.start;
             if gap < MERGE_GAP
-                && combined_text.chars().count() <= MAX_CHARS
-                && combined_dur <= MAX_DURATION
+                && combined_text.chars().count() <= profile.max_chars
+                && combined_dur <= profile.max_duration
             {
                 last.end = cue.end;
                 last.text = combined_text;
@@ -575,12 +729,12 @@ pub fn segment_subtitles_rules(cues: &[SubtitleCue]) -> Vec<SubtitleCue> {
     for cue in &merged {
         let char_count = cue.text.chars().count();
         let dur = cue.end - cue.start;
-        if char_count <= MAX_CHARS && dur <= MAX_DURATION {
+        if char_count <= profile.max_chars && dur <= profile.max_duration {
             split.push(cue.clone());
             continue;
         }
         // 需要拆分：按标点优先级找断点
-        let parts = split_text_by_punctuation(&cue.text, MAX_CHARS);
+        let parts = split_text_by_punctuation(&cue.text, profile.max_chars);
         let total_chars: usize = parts.iter().map(|p| p.chars().count()).sum();
         let segment_dur = dur / parts.len() as f64;
         let mut t = cue.start;
@@ -616,14 +770,14 @@ pub fn segment_subtitles_rules(cues: &[SubtitleCue]) -> Vec<SubtitleCue> {
         let dur = end - start;
 
         // 最短时长
-        if dur < MIN_DURATION {
-            end = start + MIN_DURATION;
+        if dur < profile.min_duration {
+            end = start + profile.min_duration;
         }
 
         // CPS 检查：如果字数/时长 > MAX_CPS，延长时长
         let actual_dur = end - start;
-        if actual_dur > 0.0 && (char_count as f64 / actual_dur) > MAX_CPS {
-            end = start + (char_count as f64 / MAX_CPS).max(MIN_DURATION);
+        if actual_dur > 0.0 && (char_count as f64 / actual_dur) > profile.max_cps {
+            end = start + (char_count as f64 / profile.max_cps).max(profile.min_duration);
         }
 
         // 不超过下一段的 start
@@ -641,6 +795,9 @@ pub fn segment_subtitles_rules(cues: &[SubtitleCue]) -> Vec<SubtitleCue> {
             words: vec![],
         });
     }
+
+    // 最终规范化：修复 Pass 3 CPS 延长侵入间隔的问题，保证字幕不连续排列
+    ensure_min_gap(&mut result, MIN_GAP);
 
     result
 }
@@ -708,62 +865,3 @@ fn split_text_by_punctuation(text: &str, max_chars: usize) -> Vec<String> {
     }
 }
 
-/// 从 LLM 返回内容中提取字幕数组（兼容 {"subtitles":[...]} 和 [...] 两种）
-fn extract_subtitle_array(content: &str) -> anyhow::Result<Vec<SubtitleCue>> {
-    let text = content.trim();
-    // 去除可能的 ```json 包裹
-    let text = text
-        .strip_prefix("```json")
-        .or_else(|| text.strip_prefix("```"))
-        .unwrap_or(text)
-        .trim_end_matches('`')
-        .trim();
-
-    // 找到第一个 [ 和最后一个 ]
-    let start = text
-        .find('[')
-        .ok_or_else(|| anyhow::anyhow!("未找到字幕数组"))?;
-    let end = text
-        .rfind(']')
-        .ok_or_else(|| anyhow::anyhow!("未找到字幕数组结尾"))?;
-    let array_str = &text[start..=end];
-
-    let arr: Vec<serde_json::Value> =
-        serde_json::from_str(array_str).map_err(|e| anyhow::anyhow!("字幕数组解析失败：{e}"))?;
-
-    let cues = arr
-        .into_iter()
-        .map(|item| {
-            // 双语模式：LLM 返回 {text: "原文", translated: "中文翻译"}
-            // 不再拼接 "翻译\n原文"，保留 translated 独立字段，由 generate_subtitles 分轨输出
-            let (text, translated) = if let Some(t) = item
-                .get("translated")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                let original = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                if !original.is_empty() && original != t {
-                    (original.to_string(), Some(t.to_string()))
-                } else {
-                    (t.to_string(), None)
-                }
-            } else {
-                (
-                    item.get("text")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    None,
-                )
-            };
-            SubtitleCue {
-                start: item.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                end: item.get("end").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                text,
-                translated,
-                words: vec![],
-            }
-        })
-        .collect();
-    Ok(cues)
-}

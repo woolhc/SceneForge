@@ -789,6 +789,15 @@ textarea {
   color: var(--text-dim);
   font-size: 12px;
 }
+.settings-grid label.export-checkbox-row {
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 8px;
+}
+.settings-grid label.export-checkbox-row input[type="checkbox"] {
+  margin: 0;
+  cursor: pointer;
+}
 
 .inspector textarea {
   height: 92px;
@@ -3720,4 +3729,110 @@ textarea {
   gap: 8px;
   padding: 10px 14px;
   border-top: 1px solid var(--line);
+}
+
+/* ===== Toast 通知组件 ===== */
+.toast-container {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 10000;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+  max-width: min(420px, calc(100vw - 32px));
+}
+.toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--bg-elevated, #1f2937);
+  border: 1px solid var(--line, #374151);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+  pointer-events: auto;
+  animation: toast-slide-in 0.2s ease-out;
+}
+@keyframes toast-slide-in {
+  from { transform: translateX(100%); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+.toast-icon {
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.toast-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.toast-message {
+  font-size: 13px;
+  color: var(--text, #e5e7eb);
+  line-height: 1.4;
+  word-break: break-word;
+}
+.toast-action {
+  align-self: flex-start;
+  background: transparent;
+  border: 1px solid var(--accent, #3b82f6);
+  color: var(--accent, #3b82f6);
+  padding: 3px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.toast-action:hover {
+  background: var(--accent, #3b82f6);
+  color: #fff;
+}
+.toast-close {
+  flex-shrink: 0;
+  background: transparent;
+  border: none;
+  color: var(--text-muted, #9ca3af);
+  cursor: pointer;
+  padding: 2px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+}
+.toast-close:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text, #e5e7eb);
+}
+.toast-error { border-left: 3px solid #ef4444; }
+.toast-error .toast-icon { color: #ef4444; }
+.toast-warning { border-left: 3px solid #f59e0b; }
+.toast-warning .toast-icon { color: #f59e0b; }
+.toast-info { border-left: 3px solid #3b82f6; }
+.toast-info .toast-icon { color: #3b82f6; }
+.toast-success { border-left: 3px solid #10b981; }
+.toast-success .toast-icon { color: #10b981; }
+
+/* ===== EDL 预览素材缩略图 ===== */
+.edl-card-thumbs {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+  min-height: 48px;
+  align-items: center;
+}
+.edl-thumb {
+  width: 64px;
+  height: 36px;
+  object-fit: cover;
+  border-radius: 4px;
+  border: 1px solid var(--line, #374151);
+  background: rgba(0, 0, 0, 0.3);
+}
+.edl-thumb-empty {
+  font-size: 11px;
+  color: var(--text-muted, #6b7280);
+  font-style: italic;
 }

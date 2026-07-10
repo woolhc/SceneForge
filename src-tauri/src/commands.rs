@@ -11,7 +11,7 @@ use crate::models::{
     ImportVoiceProfileRequest, MediaSource, PexelsSearchRequest, Project, ProjectSummary,
     RenderProjectRequest, RenderResult, ReplaceVoiceSampleRequest, SegmentScriptRequest,
     SegmentScriptResult, ThumbnailRequest, Track, TrackKind, UpdateVoiceProfileRequest,
-    VoicePreviewRequest, VoicePreviewResult, VoiceProfile,
+    VoicePreviewRequest, VoicePreviewResult, VoiceProfile, WordCue,
 };
 use crate::pexels;
 use crate::storage;
@@ -20,6 +20,66 @@ use crate::tts;
 
 fn map_error(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+/// 结构化错误：前端可解析 code/retryable 决定是否提示重试
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PipelineError {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    pub step: Option<String>,
+    pub context: Option<serde_json::Value>,
+}
+
+/// 生成结构化错误 JSON 字符串（前端 parsePipelineError 解析）
+pub fn map_pipeline_error<E: std::fmt::Display>(
+    err: E,
+    code: &str,
+    retryable: bool,
+) -> String {
+    let message = err.to_string();
+    let pipeline_err = PipelineError {
+        code: code.to_string(),
+        message: message.clone(),
+        retryable,
+        step: None,
+        context: None,
+    };
+    serde_json::to_string(&pipeline_err).unwrap_or_else(|_| {
+        format!(
+            "{{\"code\":\"{}\",\"message\":\"{}\",\"retryable\":{}}}",
+            code,
+            message.replace('"', "\\\""),
+            retryable
+        )
+    })
+}
+
+/// 带步骤标识的结构化错误
+pub fn map_pipeline_error_step<E: std::fmt::Display>(
+    err: E,
+    code: &str,
+    retryable: bool,
+    step: &str,
+) -> String {
+    let message = err.to_string();
+    let pipeline_err = PipelineError {
+        code: code.to_string(),
+        message: message.clone(),
+        retryable,
+        step: Some(step.to_string()),
+        context: None,
+    };
+    serde_json::to_string(&pipeline_err).unwrap_or_else(|_| {
+        format!(
+            "{{\"code\":\"{}\",\"message\":\"{}\",\"retryable\":{},\"step\":\"{}\"}}",
+            code,
+            message.replace('"', "\\\""),
+            retryable,
+            step
+        )
+    })
 }
 
 /// 生成音频波形数据（min/max 峰值对数组）
@@ -1006,12 +1066,6 @@ pub async fn generate_subtitles(
 
     for cue in &refined {
         let duration = (cue.end - cue.start).max(0.3);
-        // 透传词级时间戳（非空时才存，避免空数组占用空间）
-        let words = if cue.words.is_empty() {
-            None
-        } else {
-            Some(cue.words.clone())
-        };
         // 把合并音频偏移映射回时间轴偏移
         let timeline_start = if single_clip_aligned {
             cue.start
@@ -1031,9 +1085,38 @@ pub async fn generate_subtitles(
             }
             mapped
         };
+        // words 时间戳是相对合并音频的，需要和 cue.start 一样映射到时间轴
+        // 否则多 clip 场景下 karaoke 高亮与音频错位
+        let delta = timeline_start - cue.start;
+        let words = if cue.words.is_empty() {
+            None
+        } else {
+            Some(
+                cue.words
+                    .iter()
+                    .map(|w| WordCue {
+                        start: w.start + delta,
+                        end: w.end + delta,
+                        text: w.text.clone(),
+                        confidence: w.confidence.clone(),
+                    })
+                    .collect(),
+            )
+        };
+        // 中文轨 words：用 jieba 对 translated 分词均匀分配，同样映射到时间轴
+        let zh_words = asr::generate_chinese_words(cue).map(|zh| {
+            zh.iter()
+                .map(|w| WordCue {
+                    start: w.start + delta,
+                    end: w.end + delta,
+                    text: w.text.clone(),
+                    confidence: w.confidence.clone(),
+                })
+                .collect()
+        });
 
         if request.translate {
-            // 翻译 clip -> 中文轨（无词级时间戳，中文不适用 karaoke）
+            // 翻译 clip -> 中文轨（jieba 分词生成词级时间戳，支持 karaoke 高亮）
             if let Some(ref translated) = cue.translated {
                 if let Some(ref zh_id) = zh_track_id {
                     latest.clips.push(Clip {
@@ -1060,8 +1143,12 @@ pub async fn generate_subtitles(
                         visual_query: None,
                         crop: None,
                         text: Some(translated.clone()),
-                        subtitle_style: None,
-                        words: None,
+                        subtitle_style: {
+                            let mut s = crate::models::SubtitleStyle::default();
+                            s.position = "bottom".to_string();
+                            Some(s)
+                        },
+                        words: zh_words,
                         keyframes: None,
                         mask: None,
                     visual_effects: None,
@@ -1097,7 +1184,11 @@ pub async fn generate_subtitles(
                     visual_query: None,
                     crop: None,
                     text: Some(cue.text.clone()),
-                    subtitle_style: None,
+                    subtitle_style: {
+                        let mut s = crate::models::SubtitleStyle::default();
+                        s.position = "top".to_string();
+                        Some(s)
+                    },
                     words,
                     keyframes: None,
                     mask: None,

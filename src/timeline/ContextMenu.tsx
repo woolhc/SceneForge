@@ -27,6 +27,7 @@ export function ContextMenu({
     onReverse: () => void;
     onAddSubtitle: () => void;
     onEditText?: () => void;
+    onRegenerateAsset?: () => void;
   };
 }) {
   const ref = useRef<HTMLDivElement | null>(null);
@@ -86,6 +87,11 @@ export function ContextMenu({
           <button onClick={() => { actions.onReverse(); onClose(); }}>
             <ReverseIcon /> 倒放
           </button>
+          {actions.onRegenerateAsset && (
+            <button onClick={() => { actions.onRegenerateAsset?.(); onClose(); }}>
+              <RefreshIcon /> 重新匹配素材
+            </button>
+          )}
         </>
       )}
 
@@ -123,3 +129,4 @@ function WaveIcon() { return <span>🎵</span>; }
 function ReverseIcon() { return <span>⏪</span>; }
 function CaptionIcon() { return <span>💬</span>; }
 function EditIcon() { return <span>✏️</span>; }
+function RefreshIcon() { return <span>🔄</span>; }

@@ -149,7 +149,9 @@ export class MediaElementPool {
     try {
       const ctx = await this.getAudioContext();
       gain = ctx.createGain();
-      gain.gain.value = 0;
+      // 初始 gain=1：让 video 默认有声音，避免 applyVideoAlignmentAsync 更新前的静音窗口。
+      // 非活跃/预加载的 video 由调用方立即设为 0（preloadLookahead / applyVideoAlignmentAsync）。
+      gain.gain.value = 1;
       sourceNode = ctx.createMediaElementSource(video);
       sourceNode.connect(gain).connect(ctx.destination);
     } catch {

@@ -20,6 +20,7 @@ export function SubtitleOverlay({
   targetRef,
   isSelected,
   currentTime,
+  fontScale,
   onMove,
   onScale,
   onRotate,
@@ -34,6 +35,8 @@ export function SubtitleOverlay({
   isSelected: boolean;
   /** 当前播放头时间（秒，时间线坐标）—— 用于逐字高亮判断 */
   currentTime?: number;
+  /** 字号缩放比例：预览舞台宽度 / 视频实际宽度，保证预览与导出视觉一致 */
+  fontScale: number;
   onMove: (x: number, y: number) => void;
   onScale: (scaleX: number, scaleY: number) => void;
   onRotate: (rotation: number) => void;
@@ -51,7 +54,7 @@ export function SubtitleOverlay({
   const scaleX = (style.scaleX ?? 100) / 100;
   const scaleY = (style.scaleY ?? 100) / 100;
   const rotation = style.rotation ?? 0;
-  const fontSize = `${Math.max(12, (style.fontSize ?? 48) * 0.35)}px`;
+  const fontSize = `${Math.max(8, (style.fontSize ?? 48) * fontScale)}px`;
   const strokeColor = style.strokeColor ?? "#000";
   const strokeWidth = style.strokeWidth ?? 2;
   const baseColor = style.color ?? "#FFFFFF";
@@ -147,14 +150,14 @@ export function SubtitleOverlay({
           lineHeight,
           color: style.color,
           textShadow: finalTextShadow,
-          letterSpacing: `${letterSpacing}px`,
+          letterSpacing: `${letterSpacing * fontScale}px`,
           background: bgColor === "none" ? "transparent" : bgColor,
-          padding: bgColor === "none" ? "4px 10px" : `${bgPadding}px ${bgPadding * 2}px`,
+          padding: bgColor === "none" ? "4px 10px" : `${bgPadding * fontScale}px ${bgPadding * 2 * fontScale}px`,
           borderRadius: bgColor === "none" ? 0 : 4,
           textAlign: "center",
           whiteSpace: "pre-wrap",
           wordBreak: "break-word",
-          maxWidth: "calc(100% - 24px)",
+          maxWidth: "86%",
           zIndex: 7,
           cursor: isSelected ? "move" : "default",
           userSelect: "none",
