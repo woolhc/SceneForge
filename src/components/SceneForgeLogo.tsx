@@ -1,0 +1,42 @@
+type SceneForgeLogoProps = {
+  size?: number;
+  className?: string;
+  title?: string;
+};
+
+export function SceneForgeLogo({
+  size = 24,
+  className,
+  title,
+}: SceneForgeLogoProps) {
+  const labelled = Boolean(title);
+
+  return (
+    <svg
+      className={className}
+      width={size}
+      height={size}
+      viewBox="0 0 1024 1024"
+      role={labelled ? "img" : undefined}
+      aria-label={title}
+      aria-hidden={labelled ? undefined : true}
+      focusable="false"
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      {title ? <title>{title}</title> : null}
+      <rect width="1024" height="1024" rx="224" fill="#111416" />
+      <path
+        d="M267 301C324 221 415 176 523 176H717L626 318H501C450 318 410 335 381 369L267 301Z"
+        fill="#F2F0EA"
+      />
+      <path
+        d="M324 381H592C694 381 762 438 762 523C762 608 694 665 592 665H432L324 546H597C625 546 642 535 642 518C642 501 625 489 597 489H432L324 381Z"
+        fill="#F3C969"
+      />
+      <path
+        d="M757 711C700 791 609 836 501 836H307L398 694H523C574 694 614 677 643 643L757 711Z"
+        fill="#22D3A6"
+      />
+    </svg>
+  );
+}

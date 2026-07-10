@@ -1,24 +1,16 @@
 import {
   CheckCircle2,
-  Clapperboard,
   ChevronLeft,
   ChevronRight,
-  ClipboardPaste,
   Copy,
-  CopyPlus,
   Crop as CropIcon,
-  Download,
   Bookmark,
   ImagePlay,
-  Layers,
   Loader2,
   Mic2,
-  Music,
   Pause,
   Play,
   Plus,
-  Redo2,
-  Undo2,
   Save,
   Scissors,
   Search,
@@ -26,9 +18,6 @@ import {
   SkipForward,
   Settings as SettingsIcon,
   SlidersHorizontal,
-  Trash2,
-  Type,
-  Video,
   Volume2,
   XCircle,
   ZoomIn,
@@ -57,14 +46,13 @@ import { DEFAULT_SUBTITLE_STYLE, DEFAULT_TRANSFORM, DEFAULT_CROP, videoWidthForP
 import type { AiSegment } from "./types";
 import { FONT_OPTIONS } from "./fonts";
 import { SubtitleOverlay } from "./preview/SubtitleOverlay";
-import { Panel, Group as PanelGroup, Separator as PanelResizeHandle } from "react-resizable-panels";
 import { ContextMenu } from "./timeline/ContextMenu";
 import { ExportDialog } from "./panels/ExportDialog";
 import { HomeScreen } from "./panels/HomeScreen";
 import { GenerateWizard } from "./panels/GenerateWizard";
 import { EdlPreview } from "./panels/EdlPreview";
 import { FilterRenderer } from "./preview/FilterRenderer";
-import { LUT_FILTERS, getLutData } from "./luts";
+import { getLutData } from "./luts";
 import { usePreviewEngine } from "./preview/usePreviewEngine";
 import { useProxyBackfill } from "./preview/useProxyBackfill";
 import { usePlaybackStore } from "./store/playbackStore";
@@ -76,7 +64,6 @@ import { useUiStore } from "./store/uiStore";
 import { parsePipelineError } from "./tauri";
 import { SPEED_PRESETS } from "./editor/speedCurve";
 import { SpeedCurveEditor } from "./components/SpeedCurveEditor";
-import { MaskPreview } from "./components/MaskPreview";
 import { ToastContainer } from "./components/Toast";
 import {
   TRACK_KIND_LABELS,
@@ -89,6 +76,7 @@ import {
 } from "./editor/timelineActions";
 import { runGeneratePipeline, type GeneratePipelineInput } from "./editor/pipeline";
 import { makeTransition, transitionDuration, transitionName } from "./editor/transitions";
+import { projectOutputDuration } from "./editor/projectDuration";
 import {
   applySpeedCurvePreset as buildSpeedCurvePresetChange,
   changeClipSpeed as buildClipSpeedChange,
@@ -115,9 +103,31 @@ import { TextPanel } from "./panels/TextPanel";
 import { AudioPanel } from "./panels/AudioPanel";
 import { TransitionPanel } from "./panels/TransitionPanel";
 import { ProjectMenu } from "./panels/ProjectMenu";
+import { SubtitlePanel } from "./panels/SubtitlePanel";
+import { EffectsPanel } from "./panels/EffectsPanel";
+import { ToolRail } from "./editor/ToolRail";
+import { ToolPanel } from "./editor/ToolPanel";
+import {
+  TOOL_TABS,
+  inspectorTabForInteraction,
+  inspectorTabsForSelection,
+  resolveInspectorTab,
+} from "./editor/editorLayout";
+import { EditorTopbar } from "./editor/EditorTopbar";
+import { InspectorPanel } from "./editor/InspectorPanel";
+import { TimelineToolbar } from "./editor/TimelineToolbar";
+import { PreviewWorkspace } from "./editor/PreviewWorkspace";
+import { EditorWorkspace } from "./editor/EditorWorkspace";
+import { AudioInspector } from "./editor/inspector/AudioInspector";
+import { KeyframeInspector } from "./editor/inspector/KeyframeInspector";
+import { VisualEffectsInspector } from "./editor/inspector/VisualEffectsInspector";
+import { ColorInspector } from "./editor/inspector/ColorInspector";
+import { VisualTransformInspector } from "./editor/inspector/VisualTransformInspector";
+import { SubtitleInspector } from "./editor/inspector/SubtitleInspector";
 // PanelTitle 已不再直接使用（各 Tab 自带标题）；TimelineTrack/Track 类型保留供时间线渲染
 
 const ratios = ["9:16", "16:9", "1:1"];
+const isDevelopmentPreview = (import.meta as ImportMeta & { env?: { DEV?: boolean } }).env?.DEV === true;
 
 /** 时间码格式化：秒 → MM:SS.frame（剪映式） */
 function formatTC(seconds: number, fps = 30): string {
@@ -170,11 +180,6 @@ function PlayheadLine({ totalDuration }: { totalDuration: number }) {
       style={{ left: `calc(44px + (100% - 58px) * ${percent / 100})` }}
     />
   );
-}
-
-function KeyframeLabel() {
-  const currentTime = usePlaybackStore((s) => s.currentTime);
-  return <span className="kf-label">关键帧（@ {currentTime.toFixed(1)}s）</span>;
 }
 
 function StageSubtitleLayer({ excludeClipId, fontScale }: { excludeClipId?: string; fontScale: number }) {
@@ -510,9 +515,14 @@ export function App() {
   const [assetCandidates, setAssetCandidates] = useState<Record<string, MediaSource[]>>({});
   const [assetQueryDraft, setAssetQueryDraft] = useState("");
   const [assetCachingIds, setAssetCachingIds] = useState<Set<string>>(new Set());
-  // 剪映式 Tab 切换 + 新建字幕的默认样式草稿
-  const activeTab = useUiStore((s) => s.activeTab);
-  const setActiveTab = useUiStore((s) => s.setActiveTab);
+  const activeToolTab = useUiStore((s) => s.activeToolTab);
+  const setActiveToolTab = useUiStore((s) => s.setActiveToolTab);
+  const setInspectorTabForTrack = useUiStore((s) => s.setInspectorTabForTrack);
+  const activateInspectorForTrack = useUiStore((s) => s.activateInspectorForTrack);
+  const activeInspectorTab = useUiStore((s) => s.activeInspectorTab);
+  const editorMode = useUiStore((s) => s.editorMode);
+  const setEditorMode = useUiStore((s) => s.setEditorMode);
+  const resetEditorMode = useUiStore((s) => s.resetEditorMode);
   const [subtitleStyleDraft, setSubtitleStyleDraft] = useState<SubtitleStyle>({ ...DEFAULT_SUBTITLE_STYLE });
   // 预览舞台实际渲染宽度（CSS px），用于字号缩放：fontScale = stageWidth / videoWidth
   // 保证预览字号视觉比例与导出视频一致，换行行为也一致
@@ -609,6 +619,7 @@ export function App() {
     persist,
     persistWithSnapshot,
   } = useProjectHistory({
+    projectId: project?.id ?? null,
     getCurrentProject: () => projectRef.current,
     setProject,
     setStatus,
@@ -665,6 +676,11 @@ export function App() {
     if (!project || !selectedClip) return null;
     return project.tracks.find((t) => t.id === selectedClip.trackId) || null;
   }, [project, selectedClip]);
+
+  useEffect(() => {
+    if (!selectedClipTrack) return;
+    activateInspectorForTrack(selectedClipTrack.kind);
+  }, [activateInspectorForTrack, selectedClipTrack?.kind]);
 
   // 判断选中 clip 是否是"画中画层"（视觉轨但非底层）。
   // 底层视觉轨 = order 最大的那条；其他视觉轨都是叠加层。
@@ -761,10 +777,9 @@ export function App() {
     return null;
   }
 
-  // 项目总时长 = 所有 clip 的最大结束位置
+  // 时间线总时长由所有可见轨道共同决定（包括音频、配音和字幕）。
   const totalDuration = useMemo(() => {
-    if (!project || project.clips.length === 0) return 1;
-    return Math.max(1, ...project.clips.map((clip) => clip.startOnTrack + clip.duration));
+    return Math.max(1, projectOutputDuration(project));
   }, [project]);
 
   // playhead 已从 usePlaybackStore 订阅（T2.1）
@@ -1340,6 +1355,7 @@ export function App() {
         await desktopApi.saveProject(withScript);
         setProject(withScript);
         setSelectedClipId(null);
+        resetEditorMode();
         setView("editor");
       },
       segmentAndBindAssets: async () => {
@@ -1977,6 +1993,7 @@ export function App() {
     const next = await desktopApi.getProject(id);
     setProject(next);
     setSelectedClipId(next.clips[0]?.id || null);
+    resetEditorMode();
     setStatus(`已切换到项目：${next.title}`);
   }
 
@@ -2011,6 +2028,9 @@ export function App() {
   /** 时间线拖拽回写：拖动中只更新本地 state（不保存），释放时提交。 */
   // 交互式编辑（拖拽/滑块）开始时记录快照，commit 时用它压入撤销栈（避免中间态污染）
   const interactiveEditSnapshotRef = useRef<Project | null>(null);
+  useEffect(() => {
+    interactiveEditSnapshotRef.current = null;
+  }, [project?.id]);
   function handleClipDrag(clipId: string, patch: Partial<Clip>, commit: boolean) {
     if (!project) return;
     // 拖拽开始（首次非 commit 调用，且还没记录快照）→ 记录操作前快照
@@ -2397,9 +2417,13 @@ export function App() {
   const handleKeyframeClick = useCallback((clipId: string, _prop: keyof ClipKeyframes, time: number) => {
     const clip = project?.clips.find((c) => c.id === clipId);
     if (!clip) return;
+    const track = project?.tracks.find((candidate) => candidate.id === clip.trackId);
     selectClip(clipId, false, false);
+    if (track) {
+      setInspectorTabForTrack(track.kind, inspectorTabForInteraction("keyframe", track.kind));
+    }
     seek(Math.max(0, clip.startOnTrack + time));
-  }, [project, seek]);
+  }, [project, seek, setInspectorTabForTrack]);
   const selectedSource = selectedClip?.sourceId
     ? project?.media.find((m) => m.id === selectedClip.sourceId)
     : null;
@@ -2408,6 +2432,14 @@ export function App() {
   const previewingSrc = previewingAsset
     ? desktopApi.mediaSrc(previewingAsset.thumbnailUrl || previewingAsset.localPath || null)
     : null;
+  const availableInspectorTabs = selectedClipTrack
+    ? inspectorTabsForSelection(selectedClipTrack.kind, selectedClipIds.length)
+    : [];
+  const resolvedInspectorTab = selectedClipTrack
+    ? selectedClipIds.length > 1
+      ? availableInspectorTabs[0] ?? "basic"
+      : resolveInspectorTab(selectedClipTrack.kind, activeInspectorTab)
+    : "basic";
 
   // 诊断：错误日志已改为 main.tsx 自动写文件，不再在 UI 显示
   // 首页 vs 编辑器
@@ -2419,10 +2451,12 @@ export function App() {
           const p = await desktopApi.getProject(id);
           setProject(p);
           setSelectedClipId(p.clips[0]?.id || null);
+          resetEditorMode();
           setView("editor");
         }}
         onCreate={async () => {
           await handleCreateProject();
+          resetEditorMode();
           setView("editor");
         }}
         onGenerate={() => setShowGenerate(true)}
@@ -2452,123 +2486,45 @@ export function App() {
   }
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell editor-mode-${editorMode}`}>
       <ToastContainer />
-      <header className="topbar">
-        <button
-          className="home-back-btn"
-          onClick={() => { void refreshProjects(); setView("home"); }}
-          title="返回首页"
-        >
-          <ChevronLeft size={16} />
-          <span>首页</span>
-        </button>
-        <div className="brand" onClick={() => { void refreshProjects(); setView("home"); }} style={{ cursor: "pointer" }} title="返回首页">
-          <div className="brand-mark">
-            <Clapperboard size={18} />
-          </div>
-          <strong>SceneScript</strong>
-        </div>
-        <ProjectMenu
-          projects={projects}
-          activeProjectId={project?.id}
-          onSelect={handleSelectProject}
-          onCreate={handleCreateProject}
-          onDelete={handleDeleteProject}
-        />
-        <input
-          className="project-title-input"
-          value={project?.title || ""}
-          placeholder="项目名称"
-          onChange={(event) => updateProjectPatch({ title: event.target.value })}
-        />
-        <select
-          className="ratio-select"
-          value={project?.ratio || settings.defaultRatio}
-          onChange={(event) => updateProjectPatch({ ratio: event.target.value })}
-        >
-          {ratios.map((ratio) => (
-            <option key={ratio}>{ratio}</option>
-          ))}
-        </select>
-        <div className="top-actions">
-          <StatusPill ffmpeg={ffmpeg} />
-          <button className="icon-button" title="撤销 (Ctrl+Z)" disabled={!canUndo} onClick={undo}>
-            <Undo2 size={18} />
-          </button>
-          <button className="icon-button" title="重做 (Ctrl+Shift+Z)" disabled={!canRedo} onClick={redo}>
-            <Redo2 size={18} />
-          </button>
-          <button className="icon-button" title="复制片段 (Ctrl+D)" disabled={!selectedClip} onClick={duplicateSelectedClip}>
-            <Copy size={18} />
-          </button>
-          <button
-            className="icon-button"
-            title="保存项目"
-            disabled={!project}
-            onClick={() => project && persist(project)}
-          >
-            <Save size={18} />
-          </button>
-          <button className="icon-button" title="设置" onClick={() => setShowSettings(true)}>
-            <SettingsIcon size={18} />
-          </button>
-          <button
-            className="primary-button"
-            disabled={!project}
-            onClick={() => { setShowExport(true); setExportState("idle"); }}
-          >
-            <Download size={16} />
-            导出
-          </button>
-        </div>
-      </header>
+      <EditorTopbar
+        mode={editorMode}
+        projectTitle={project?.title || ""}
+        ratio={project?.ratio || settings.defaultRatio}
+        ratios={ratios}
+        canUndo={canUndo}
+        canRedo={canRedo}
+        canSave={!!project}
+        projectMenu={(
+          <ProjectMenu
+            projects={projects}
+            activeProjectId={project?.id}
+            onSelect={handleSelectProject}
+            onCreate={handleCreateProject}
+            onDelete={handleDeleteProject}
+          />
+        )}
+        saveStatus={ffmpeg?.available ? null : <StatusPill ffmpeg={ffmpeg} />}
+        onBack={() => { void refreshProjects(); setView("home"); }}
+        onGenerate={() => setShowGenerate(true)}
+        onProjectTitleChange={(title) => updateProjectPatch({ title })}
+        onRatioChange={(ratio) => updateProjectPatch({ ratio })}
+        onUndo={undo}
+        onRedo={redo}
+        onSave={() => project && persist(project)}
+        onModeChange={setEditorMode}
+        onSettings={() => setShowSettings(true)}
+        onExport={() => { setShowExport(true); setExportState("idle"); }}
+      />
 
-      {/* 垂直 PanelGroup：工作区(上) + 时间线(下)，可拖拽调高度 */}
-      <PanelGroup orientation="vertical" style={{ flex: 1, minHeight: 0 }}>
-        <Panel defaultSize="62%" minSize="20%">
-      <main className="workspace">
-        {/* 水平 PanelGroup：左栏/预览/右栏，可拖拽调宽度 */}
-        <PanelGroup orientation="horizontal" style={{ flex: 1, minHeight: 0 }}>
-        <Panel defaultSize="20%" minSize="10%" maxSize="40%">
+      <EditorWorkspace
+        mode={editorMode}
+        tools={(
         <aside className="left-panel">
-          <nav className="tab-bar">
-            <button
-              className={`tab ${activeTab === "media" ? "active" : ""}`}
-              onClick={() => setActiveTab("media")}
-              title="媒体"
-            >
-              <Video size={18} />
-              <span>媒体</span>
-            </button>
-            <button
-              className={`tab ${activeTab === "text" ? "active" : ""}`}
-              onClick={() => setActiveTab("text")}
-              title="文本"
-            >
-              <Type size={18} />
-              <span>文本</span>
-            </button>
-            <button
-              className={`tab ${activeTab === "audio" ? "active" : ""}`}
-              onClick={() => setActiveTab("audio")}
-              title="音频"
-            >
-              <Music size={18} />
-              <span>音频</span>
-            </button>
-            <button
-              className={`tab ${activeTab === "transition" ? "active" : ""}`}
-              onClick={() => setActiveTab("transition")}
-              title="转场"
-            >
-              <SlidersHorizontal size={18} />
-              <span>转场</span>
-            </button>
-          </nav>
-
-          <div className="tab-body">
-            {activeTab === "media" && (
+          <ToolRail activeTab={activeToolTab} onTabChange={setActiveToolTab} />
+          <ToolPanel title={TOOL_TABS.find((tab) => tab.id === activeToolTab)?.label ?? "工具"}>
+            {activeToolTab === "media" && (
               <MediaPanel
                 media={project?.media || []}
                 busy={busy}
@@ -2580,12 +2536,17 @@ export function App() {
                 onAddToTimeline={handleAddToTimeline}
               />
             )}
-            {activeTab === "text" && (
+            {activeToolTab === "text" && (
               <TextPanel
                 script={project?.script || ""}
                 busy={busy}
                 onScriptChange={(script) => updateProjectPatch({ script })}
                 onAiSegment={handleSegmentScript}
+              />
+            )}
+            {activeToolTab === "subtitle" && (
+              <SubtitlePanel
+                busy={busy}
                 onRecognizeSubtitles={handleRecognizeSubtitles}
                 onAddManualSubtitle={handleAddManualSubtitle}
                 onImportSrt={handleImportSrt}
@@ -2593,7 +2554,7 @@ export function App() {
                 onSubtitleStyleChange={setSubtitleStyleDraft}
               />
             )}
-            {activeTab === "audio" && (
+            {activeToolTab === "audio" && (
               <AudioPanel
                 voiceProfiles={voiceProfiles}
                 defaultVoiceId={settings.defaultVoiceId ?? null}
@@ -2626,7 +2587,7 @@ export function App() {
                 onNewVoiceReferenceTextChange={setNewVoiceReferenceText}
               />
             )}
-            {activeTab === "transition" && (
+            {activeToolTab === "transition" && (
               <TransitionPanel
                 selectedClipId={selectedClipId}
                 currentTransitionIn={transitionName(selectedClip?.transitionIn)}
@@ -2651,18 +2612,51 @@ export function App() {
                 onDurationCommitOut={() => commitInteractiveEdit("已更新转场时长")}
               />
             )}
-          </div>
+            {activeToolTab === "effects" && (
+              <EffectsPanel
+                hasVisualSelection={!!selectedClipTrack && isVisualTrackKind(selectedClipTrack.kind)}
+                onOpenFilters={() => {
+                  if (!selectedClipTrack) return;
+                  setInspectorTabForTrack(selectedClipTrack.kind, "visual");
+                  requestAnimationFrame(() => document.querySelector('[data-inspector-section="filters"]')?.scrollIntoView({ block: "start" }));
+                }}
+                onOpenMasks={() => {
+                  if (!selectedClipTrack) return;
+                  setInspectorTabForTrack(selectedClipTrack.kind, "visual");
+                  requestAnimationFrame(() => document.querySelector('[data-inspector-section="mask"]')?.scrollIntoView({ block: "start" }));
+                }}
+                onOpenVisualEffects={() => {
+                  if (!selectedClipTrack) return;
+                  setInspectorTabForTrack(selectedClipTrack.kind, "animation");
+                  requestAnimationFrame(() => document.querySelector('[data-inspector-section="visual-effects"]')?.scrollIntoView({ block: "start" }));
+                }}
+              />
+            )}
+          </ToolPanel>
         </aside>
-        </Panel>
-        <PanelResizeHandle />
-        <Panel defaultSize="55%" minSize="20%">
-        <section className="preview-column">
+        )}
+        preview={(
+        <PreviewWorkspace
+          toolbar={(
           <div className="preview-toolbar">
             <div>
               <strong>画面预览</strong>
               <span>{selectedClip?.text || selectedSource?.title || "未选择片段"}</span>
             </div>
             <div className="preview-zoom-controls">
+              <button
+                className="zoom-btn preview-cover-button"
+                title="将当前画面设为封面"
+                disabled={!project}
+                onClick={() => {
+                  if (!project) return;
+                  const coverTime = usePlaybackStore.getState().currentTime;
+                  void persist({ ...project, coverTime }, `已设置封面（${coverTime.toFixed(1)}s）`);
+                }}
+              >
+                <ImagePlay size={14} />
+                <span>设为封面</span>
+              </button>
               <button className="zoom-btn" title="缩小" onClick={() => setPreviewZoom((z) => Math.max(25, z - 25))}>
                 <ZoomOut size={14} />
               </button>
@@ -2681,16 +2675,20 @@ export function App() {
               <button className="zoom-btn" title="放大" onClick={() => setPreviewZoom((z) => Math.min(200, z + 25))}>
                 <ZoomIn size={14} />
               </button>
-              <button
-                className={`zoom-btn ${showPreviewDebug ? "active" : ""}`}
-                title="预览诊断"
-                onClick={() => setShowPreviewDebug((current) => !current)}
-              >
-                <SlidersHorizontal size={14} />
-              </button>
+              {isDevelopmentPreview && (
+                <button
+                  className={`zoom-btn ${showPreviewDebug ? "active" : ""}`}
+                  title="预览诊断"
+                  aria-label="预览诊断"
+                  onClick={() => setShowPreviewDebug((current) => !current)}
+                >
+                  <SlidersHorizontal size={14} />
+                </button>
+              )}
             </div>
           </div>
-
+          )}
+          viewport={(
           <div
             ref={previewViewportRef}
             className="preview-viewport"
@@ -2823,7 +2821,8 @@ export function App() {
             })()}
           </div>
           </div>
-
+          )}
+          transport={(
           <div className="transport">
             <button className="round-button sm" title="跳到开头 (Home)" onClick={() => seek(0)}>
               <SkipBack size={14} />
@@ -2888,23 +2887,24 @@ export function App() {
             <PreviewProgress totalDuration={totalDuration} onSeek={seek} />
             <TimecodeDisplay totalDuration={totalDuration} fps={project?.renderConfig?.fps ?? 30} />
           </div>
-        </section>
-        </Panel>
-        <PanelResizeHandle />
-        <Panel defaultSize="25%" minSize="12%" maxSize="45%">
-        <aside className="right-panel">
-          <div className="panel-title">
-            <div>
-              <SlidersHorizontal size={16} />
-              <span>属性</span>
-            </div>
-          </div>
-          {selectedClip && selectedClipTrack ? (
-            <div className="inspector">
+          )}
+        />
+        )}
+        inspector={(
+        <InspectorPanel
+          title={selectedClip && selectedClipTrack ? selectedClip.text || selectedSource?.title || "未命名片段" : null}
+          meta={selectedClipTrack ? `${selectedClipTrack.name} · ${selectedClipTrack.kind}` : null}
+          selectedCount={selectedClipIds.length}
+          tabs={availableInspectorTabs}
+          activeTab={resolvedInspectorTab}
+          onTabChange={(tab) => selectedClipTrack && setInspectorTabForTrack(selectedClipTrack.kind, tab)}
+        >
+          {selectedClip && selectedClipTrack && (
+            <>
               {/* 批量字幕编辑：选中多个字幕 clip 时显示 */}
               {selectedClipIds.length > 1 &&
                 selectedClipTrack.kind === "subtitle" && (
-                  <div className="batch-edit-section">
+                  <div className="batch-edit-section inspector-category inspector-category-subtitle">
                     <div className="batch-edit-title">
                       批量编辑（{selectedClipIds.length} 条字幕）
                     </div>
@@ -2977,199 +2977,45 @@ export function App() {
                     </button>
                   </div>
                 )}
+              {selectedClipIds.length > 1 && selectedClipTrack.kind !== "subtitle" && (
+                <div className="batch-edit-section">
+                  <div className="batch-edit-title">已选择 {selectedClipIds.length} 个片段</div>
+                  <p className="style-hint">当前类型暂不支持共同属性编辑。请保留单个选中项后调整详细参数。</p>
+                </div>
+              )}
+              {selectedClipIds.length === 1 && (
+                <>
               <div className="track-badge" data-kind={selectedClipTrack.kind}>
                 {selectedClipTrack.name}轨
               </div>
 
-              {(selectedClipTrack.kind === "subtitle" || selectedClipTrack.kind === "voiceover") && (
-                <label>
-                  {selectedClipTrack.kind === "voiceover" ? "配音文案" : "字幕文案"}
-                  <textarea
-                    value={selectedClip.text || ""}
-                    onChange={(event) => updateSelectedClip({ text: event.target.value }, false)}
-                    onBlur={() => commitInteractiveEdit()}
-                  />
+              {selectedClipTrack.kind === "voiceover" && (
+                <label className="inspector-category inspector-category-basic">
+                  配音文案
+                  <textarea value={selectedClip.text || ""} onChange={(event) => updateSelectedClip({ text: event.target.value }, false)} onBlur={() => commitInteractiveEdit()} />
                 </label>
               )}
-
-              {/* 字幕 clip 的样式编辑（颜色/字体/字号/描边/位置） */}
               {selectedClipTrack.kind === "subtitle" && (
-                <div className="subtitle-style-editor">
-                  <label className="style-field">
-                    字体
-                    <select
-                      value={selectedClip.subtitleStyle?.fontFamily || "Noto Sans SC"}
-                      style={{ fontFamily: selectedClip.subtitleStyle?.fontFamily }}
-                      onChange={(event) => updateSelectedClip({
-                        subtitleStyle: { ...selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE }, fontFamily: event.target.value },
-                      })}
-                    >
-                      {FONT_OPTIONS.map((font) => (
-                        <option key={font.family} value={font.family} style={{ fontFamily: font.family }}>
-                          {font.label}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="style-field">
-                    字号
-                    <input
-                      type="number"
-                      min={16}
-                      max={120}
-                      value={selectedClip.subtitleStyle?.fontSize ?? 48}
-                      onChange={(event) => updateSelectedClip({
-                        subtitleStyle: { ...selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE }, fontSize: Number(event.target.value) },
-                      })}
-                    />
-                  </label>
-                  <label className="style-field">
-                    颜色
-                    <input
-                      type="color"
-                      value={selectedClip.subtitleStyle?.color || "#FFFFFF"}
-                      onChange={(event) => updateSelectedClip({
-                        subtitleStyle: { ...selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE }, color: event.target.value },
-                      })}
-                    />
-                  </label>
-                  <label className="style-field">
-                    描边
-                    <input
-                      type="color"
-                      value={selectedClip.subtitleStyle?.strokeColor || "#000000"}
-                      onChange={(event) => updateSelectedClip({
-                        subtitleStyle: { ...selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE }, strokeColor: event.target.value },
-                      })}
-                    />
-                  </label>
-                  <label className="style-field">
-                    位置
-                    <select
-                      value={selectedClip.subtitleStyle?.position || "bottom"}
-                     onChange={(event) => updateSelectedClip({
-                        subtitleStyle: { ...selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE }, position: event.target.value as "bottom" | "center" | "top" | "custom" },
-                     })}
-                    >
-                      <option value="bottom">底部</option>
-                      <option value="center">居中</option>
-                      <option value="top">顶部</option>
-                      <option value="custom">自定义（拖动）</option>
-                    </select>
-                  </label>
-                  {/* 整轨位置快捷按钮：一键把整条轨所有字幕设为同一位置，避免逐条调整 */}
-                  <div className="style-field" style={{ flexDirection: "row", gap: 6, flexWrap: "wrap" }}>
-                    <span style={{ width: "100%", opacity: 0.7, fontSize: 12 }}>整轨位置：</span>
-                    {(["bottom", "center", "top"] as const).map((pos) => (
-                      <button
-                        key={pos}
-                        className="panel-secondary-action"
-                        style={{ flex: 1, minWidth: 0, padding: "4px 6px", fontSize: 12 }}
-                        onClick={() => {
-                          if (!project) return;
-                          const trackId = selectedClip.trackId;
-                          const next = project.clips.map((c) =>
-                            c.trackId === trackId
-                              ? { ...c, subtitleStyle: { ...(c.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE }), position: pos } }
-                              : c,
-                          );
-                          const count = project.clips.filter((c) => c.trackId === trackId).length;
-                          void persist({ ...project, clips: next }, `整轨设为${pos === "bottom" ? "底部" : pos === "center" ? "居中" : "顶部"}（${count} 条）`);
-                        }}
-                      >
-                        {pos === "bottom" ? "底部" : pos === "center" ? "居中" : "顶部"}
-                      </button>
-                    ))}
-                  </div>
-                  {/* 逐字高亮（卡拉OK）：仅当字幕有词级时间戳时生效 */}
-                  <label className="style-field" style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-                    <input
-                      type="checkbox"
-                      checked={(selectedClip.subtitleStyle?.karaoke ?? true) && !!(selectedClip.words?.length)}
-                      disabled={!selectedClip.words?.length}
-                      onChange={(event) => updateSelectedClip({
-                        subtitleStyle: { ...selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE }, karaoke: event.target.checked },
-                      })}
-                    />
-                    <span>逐字高亮{selectedClip.words?.length ? "" : "（需先识别字幕）"}</span>
-                  </label>
-                  {(selectedClip.subtitleStyle?.karaoke ?? true) && selectedClip.words?.length ? (
-                    <label className="style-field">
-                      高亮色
-                      <input
-                        type="color"
-                        value={selectedClip.subtitleStyle?.highlightColor || "#FFD700"}
-                        onChange={(event) => updateSelectedClip({
-                          subtitleStyle: { ...selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE }, highlightColor: event.target.value },
-                        })}
-                      />
-                    </label>
-                  ) : null}
-                  {/* T4.8: 入场/出场动画 */}
-                  <label className="style-field">
-                    入场动画
-                    <select
-                      value={selectedClip.subtitleStyle?.animationIn ?? "none"}
-                      onChange={(event) => updateSelectedClip({
-                        subtitleStyle: { ...selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE }, animationIn: event.target.value },
-                      })}
-                    >
-                      <option value="none">无</option>
-                      <option value="fadeIn">淡入</option>
-                      <option value="slideUp">上滑</option>
-                      <option value="scaleIn">缩放</option>
-                    </select>
-                  </label>
-                  <label className="style-field">
-                    出场动画
-                    <select
-                      value={selectedClip.subtitleStyle?.animationOut ?? "none"}
-                      onChange={(event) => updateSelectedClip({
-                        subtitleStyle: { ...selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE }, animationOut: event.target.value },
-                      })}
-                    >
-                      <option value="none">无</option>
-                      <option value="fadeOut">淡出</option>
-                      <option value="slideDown">下滑</option>
-                      <option value="scaleOut">缩放</option>
-                    </select>
-                  </label>
-                  <label className="style-field">
-                    动画时长（{(selectedClip.subtitleStyle?.animationDuration ?? 0.3).toFixed(1)}s）
-                    <input
-                      type="range"
-                      min={0.1}
-                      max={2.0}
-                      step={0.1}
-                      value={selectedClip.subtitleStyle?.animationDuration ?? 0.3}
-                      onChange={(event) => updateSelectedClip({
-                        subtitleStyle: { ...selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE }, animationDuration: Number(event.target.value) },
-                      }, false)}
-                      onPointerUp={() => commitInteractiveEdit()}
-                    />
-                  </label>
-                  {/* 批量：把当前 clip 的字幕样式（位置/字号/颜色/描边/动画等）应用到整条轨所有字幕 */}
-                  <button
-                    className="panel-secondary-action"
-                    onClick={() => {
-                      if (!project) return;
-                      const trackId = selectedClip.trackId;
-                      const srcStyle = selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE };
-                      const next = project.clips.map((c) =>
-                        c.trackId === trackId
-                          ? { ...c, subtitleStyle: { ...srcStyle } }
-                          : c,
-                      );
-                      const count = project.clips.filter((c) => c.trackId === trackId).length;
-                      void persist({ ...project, clips: next }, `已应用样式到整条轨（${count} 条字幕）`);
-                    }}
-                  >
-                    应用到整条轨
-                  </button>
-                </div>
+                <SubtitleInspector
+                  clip={selectedClip}
+                  onClipChange={updateSelectedClip}
+                  onCommit={() => commitInteractiveEdit()}
+                  onTrackPosition={(position) => {
+                    if (!project) return;
+                    const trackId = selectedClip.trackId;
+                    const clips = project.clips.map((clip) => clip.trackId === trackId ? { ...clip, subtitleStyle: { ...(clip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE }), position } } : clip);
+                    void persist({ ...project, clips }, `整轨设为${position === "bottom" ? "底部" : position === "center" ? "居中" : "顶部"}`);
+                  }}
+                  onApplyTrackStyle={() => {
+                    if (!project) return;
+                    const trackId = selectedClip.trackId;
+                    const subtitleStyle = selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE };
+                    const clips = project.clips.map((clip) => clip.trackId === trackId ? { ...clip, subtitleStyle: { ...subtitleStyle } } : clip);
+                    void persist({ ...project, clips }, `已应用样式到整条轨（${clips.filter((clip) => clip.trackId === trackId).length} 条字幕）`);
+                  }}
+                />
               )}
-
-              <label>
+              <label className="inspector-category inspector-category-basic">
                 时长（秒）
                 <input
                   type="number"
@@ -3182,92 +3028,22 @@ export function App() {
                 />
               </label>
 
-              {selectedClipTrack.kind === "voiceover" && (
-                <button className="wide-action" disabled={busy === "clip-audio"} onClick={handleGenerateClipAudio}>
-                  {busy === "clip-audio" ? <Loader2 className="spin" size={15} /> : <Mic2 size={15} />}
-                  生成当前片段配音
-                </button>
-              )}
-
-              {/* 音量调节（所有有声音的轨道） */}
-              <label className="style-field" style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span>音量</span>
-                <input
-                  type="range"
-                  min={0}
-                  max={200}
-                  step={1}
-                  value={Math.round((selectedClip.volume ?? 1) * 100)}
-                  onChange={(e) => {
-                    const volume = Number(e.target.value) / 100;
-                    updateSelectedClip({ volume }, false);
-                    setClipVolume(selectedClip.id, volume);
-                  }}
-                  onPointerUp={() => commitInteractiveEdit()}
-                  style={{ flex: 1 }}
-                />
-                <small style={{ minWidth: 50 }}>
-                  {Math.round((selectedClip.volume ?? 1) * 100)}%
-                  {(selectedClip.volume ?? 1) > 0
-                    ? ` (${(20 * Math.log10(selectedClip.volume ?? 1)).toFixed(1)}dB)`
-                    : " (静音)"}
-                </small>
-              </label>
-
-              {/* 音频淡入淡出（配音/音频轨） */}
-              {(selectedClipTrack.kind === "voiceover" || selectedClipTrack.kind === "audio") && (
-                <div className="fade-control">
-                  <label className="style-field">
-                    淡入（秒）
-                    <input
-                      type="number"
-                      min={0}
-                      max={5}
-                      step={0.1}
-                      value={selectedClip.fadeIn ?? 0}
-                      onChange={(event) => updateSelectedClip({ fadeIn: Number(event.target.value) })}
-                    />
-                  </label>
-                  <label className="style-field">
-                    淡出（秒）
-                    <input
-                      type="number"
-                      min={0}
-                      max={5}
-                      step={0.1}
-                      value={selectedClip.fadeOut ?? 0}
-                      onChange={(event) => updateSelectedClip({ fadeOut: Number(event.target.value) })}
-                    />
-                  </label>
-                </div>
-              )}
-
-              {/* 音频降噪（剪映式"降噪"开关升级为强度滑块）。视频/配音/音频轨都支持 */}
-              {(selectedClipTrack.kind === "voiceover" ||
-                selectedClipTrack.kind === "audio" ||
-                selectedClipTrack.kind === "video") && (
-                <div className="style-field-column">
-                  <label className="style-field">
-                    降噪（{(selectedClip.noiseReduction ?? 0).toFixed(0)}）
-                    <input
-                      type="range"
-                      min={0}
-                      max={100}
-                      step={5}
-                      value={selectedClip.noiseReduction ?? 0}
-                      onChange={(event) =>
-                        updateSelectedClip({ noiseReduction: Number(event.target.value) }, false)
-                      }
-                      onPointerUp={() => commitInteractiveEdit()}
-                    />
-                  </label>
-                  <small className="style-hint">降低背景噪声（导出时生效）</small>
-                </div>
-              )}
+              <AudioInspector
+                clip={selectedClip}
+                trackKind={selectedClipTrack.kind}
+                busy={busy}
+                onGenerateVoice={handleGenerateClipAudio}
+                onVolumeChange={(volume) => {
+                  updateSelectedClip({ volume }, false);
+                  setClipVolume(selectedClip.id, volume);
+                }}
+                onClipChange={updateSelectedClip}
+                onCommit={() => commitInteractiveEdit()}
+              />
 
               {isVisualTrackKind(selectedClipTrack.kind) && (
                 <>
-                  <div className="bound-asset-info">
+                  <div className="bound-asset-info inspector-category inspector-category-basic">
                     <strong>当前素材</strong>
                     <span>{selectedSource?.title || "未绑定（去媒体 Tab 选择）"}</span>
                     {selectedSource && (
@@ -3284,7 +3060,7 @@ export function App() {
                     )}
                   </div>
                   {/* 画面关键词（可编辑，用于 AI 搜索替换素材） */}
-                  <label className="style-field">
+                  <label className="style-field inspector-category inspector-category-basic">
                     画面关键词
                     <div style={{ display: "flex", gap: 4 }}>
                       <input
@@ -3306,7 +3082,7 @@ export function App() {
                   </label>
                   {/* 搜索结果候选区 */}
                   {assetCandidates[selectedClip.id]?.length ? (
-                    <div className="asset-candidates">
+                    <div className="asset-candidates inspector-category inspector-category-basic">
                       {assetCandidates[selectedClip.id].slice(0, 8).map((asset, idx) => (
                         <button
                           key={asset.id}
@@ -3325,7 +3101,7 @@ export function App() {
                   ) : null}
                   {/* 分离音频 / 分离人声 */}
                   {selectedSource && selectedSource.kind === "video" && (
-                    <div className="audio-actions">
+                    <div className="audio-actions inspector-category inspector-category-audio">
                       <button
                         className="wide-action"
                         disabled={busy === "detach"}
@@ -3377,7 +3153,7 @@ export function App() {
                   {selectedSource && (
                     <>
                     {/* 画面裁剪（空间裁剪，剪映式） */}
-                    <div className="trim-box">
+                    <div className="trim-box inspector-category inspector-category-basic">
                       <div className="trim-title">
                         <CropIcon size={15} />
                         画面裁剪
@@ -3471,7 +3247,7 @@ export function App() {
                     </div>
 
                     {/* 素材裁剪（仅视频/音频有时长素材；图片无时长跳过） */}
-                    <div className="trim-box">
+                    <div className="trim-box inspector-category inspector-category-basic">
                     {selectedSource && selectedSource.kind !== "image" && (
                       <>
                       <div className="trim-title">
@@ -3585,396 +3361,86 @@ export function App() {
                     </>
                   )}
 
-                    {/* 滤镜预设 */}
-                    <div className="filter-control">
-                      <div className="speed-label">滤镜</div>
-                      <div className="filter-presets">
-                        {LUT_FILTERS.map((f) => (
-                          <button
-                            key={f.id}
-                            className={`speed-preset ${(!selectedClip.filter && f.id === "none") || selectedClip.filter === f.id ? "active" : ""}`}
-                            onClick={() => {
-                              updateSelectedClip({ filter: f.id === "none" ? null : f.id });
-                              // 加载/清除 LUT
-                              if (filterRendererRef.current) {
-                                if (f.id === "none") {
-                                  filterRendererRef.current.clearLut();
-                                } else {
-                                  void getLutData(f.id).then((data) => {
-                                    if (data) filterRendererRef.current?.loadLut(f.id, data);
-                                  });
-                                }
-                              }
-                            }}
-                          >
-                            {f.label}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-
-                    {/* 色彩调节 */}
-                    <div className="fade-control">
-                      <label className="style-field">
-                        亮度
-                        <input type="range" min={-100} max={100} step={1} value={selectedClip.brightness ?? 0}
-                          onChange={(e) => updateSelectedClip({ brightness: Number(e.target.value) }, false)}
-                          onPointerUp={() => commitInteractiveEdit()} />
-                      </label>
-                      <label className="style-field">
-                        对比度
-                        <input type="range" min={-100} max={100} step={1} value={selectedClip.contrast ?? 0}
-                          onChange={(e) => updateSelectedClip({ contrast: Number(e.target.value) }, false)}
-                          onPointerUp={() => commitInteractiveEdit()} />
-                      </label>
-                      <label className="style-field">
-                        饱和度
-                        <input type="range" min={-100} max={100} step={1} value={selectedClip.saturation ?? 0}
-                          onChange={(e) => updateSelectedClip({ saturation: Number(e.target.value) }, false)}
-                          onPointerUp={() => commitInteractiveEdit()} />
-                      </label>
-                      <label className="style-field">
-                        色温
-                        <input type="range" min={-100} max={100} step={1} value={selectedClip.temperature ?? 0}
-                          onChange={(e) => updateSelectedClip({ temperature: Number(e.target.value) }, false)}
-                          onPointerUp={() => commitInteractiveEdit()} />
-                      </label>
-                      <label className="style-field">
-                        色调
-                        <input type="range" min={-100} max={100} step={1} value={selectedClip.tint ?? 0}
-                          onChange={(e) => updateSelectedClip({ tint: Number(e.target.value) }, false)}
-                          onPointerUp={() => commitInteractiveEdit()} />
-                      </label>
-                    </div>
+                    <ColorInspector
+                      clip={selectedClip}
+                      onFilterChange={(filterId) => {
+                        updateSelectedClip({ filter: filterId === "none" ? null : filterId });
+                        if (!filterRendererRef.current) return;
+                        if (filterId === "none") {
+                          filterRendererRef.current.clearLut();
+                        } else {
+                          void getLutData(filterId).then((data) => {
+                            if (data) filterRendererRef.current?.loadLut(filterId, data);
+                          });
+                        }
+                      }}
+                      onClipChange={updateSelectedClip}
+                      onCommit={() => commitInteractiveEdit()}
+                    />
 
                   {isVisualTrackKind(selectedClipTrack.kind) && (
-                    <div className="transform-box">
-                      <div className="trim-title">
-                        <Layers size={15} />
-                        画面变换
-                      </div>
-                      {/* T4.2: 关键帧 —— 在播放头处为属性打关键帧 */}
-                      <div className="keyframe-row">
-                        <KeyframeLabel />
-                        <div className="kf-buttons">
-                          <button title="在播放头处为水平位置打关键帧" onClick={() => addKeyframeAtPlayhead("x", overlayTransform.x)}>◆ X</button>
-                          <button title="在播放头处为垂直位置打关键帧" onClick={() => addKeyframeAtPlayhead("y", overlayTransform.y)}>◆ Y</button>
-                          <button title="在播放头处为缩放打关键帧" onClick={() => addKeyframeAtPlayhead("scale", overlayTransform.scale)}>◆ 缩放</button>
-                          <button title="在播放头处为旋转打关键帧" onClick={() => addKeyframeAtPlayhead("rotation", overlayTransform.rotation ?? 0)}>◆ 旋转</button>
-                          <button title="在播放头处为不透明度打关键帧" onClick={() => addKeyframeAtPlayhead("opacity", overlayTransform.opacity ?? 100)}>◆ 透明</button>
-                          <button title="在播放头处为音量打关键帧" onClick={() => addKeyframeAtPlayhead("volume", selectedClip?.volume ?? 1)}>◆ 音量</button>
-                          {hasKeyframeAtPlayhead() && (
-                            <button title="删除播放头处的关键帧" onClick={removeKeyframeAtPlayhead}>✕ 删帧</button>
-                          )}
-                          {selectedClip?.keyframes && (
-                            <button title="清除所有关键帧" onClick={() => updateSelectedClip({ keyframes: null })}>✕ 清除</button>
-                          )}
-                        </div>
-                        {hasKeyframeAtPlayhead() && (
-                          <label className="style-field" style={{ marginTop: 6 }}>
-                            <span className="kf-label">缓动</span>
-                            <select
-                              value={getKeyframeEasingAtPlayhead() ?? "linear"}
-                              onChange={(event) => setKeyframeEasingAtPlayhead(event.target.value as "linear" | "easeIn" | "easeOut" | "easeInOut")}
-                            >
-                              <option value="linear">线性</option>
-                              <option value="easeIn">缓入</option>
-                              <option value="easeOut">缓出</option>
-                              <option value="easeInOut">缓入缓出</option>
-                            </select>
-                          </label>
-                        )}
-                      </div>
-                      <label>
-                        水平位置（{overlayTransform.x.toFixed(0)}%）
-                        <input
-                          type="range"
-                          min={0}
-                          max={100}
-                          step={1}
-                          value={overlayTransform.x}
-                          onChange={(event) => updateOverlayTransform({ x: Number(event.target.value) }, false)}
-                          onPointerUp={() => commitInteractiveEdit()}
-                        />
-                      </label>
-                      <label>
-                        垂直位置（{overlayTransform.y.toFixed(0)}%）
-                        <input
-                          type="range"
-                          min={0}
-                          max={100}
-                          step={1}
-                          value={overlayTransform.y}
-                          onChange={(event) => updateOverlayTransform({ y: Number(event.target.value) }, false)}
-                          onPointerUp={() => commitInteractiveEdit()}
-                        />
-                      </label>
-                      <label>
-                        缩放（{overlayTransform.scale.toFixed(0)}%）
-                        <input
-                          type="range"
-                          min={5}
-                          max={100}
-                          step={1}
-                          value={overlayTransform.scale}
-                          onChange={(event) => updateOverlayTransform({ scale: Number(event.target.value) }, false)}
-                          onPointerUp={() => commitInteractiveEdit()}
-                        />
-                      </label>
-                      <label>
-                        旋转（{(overlayTransform.rotation ?? 0).toFixed(0)}°）
-                        <input
-                          type="range"
-                          min={-180}
-                          max={180}
-                          step={1}
-                          value={overlayTransform.rotation ?? 0}
-                          onChange={(event) => updateOverlayTransform({ rotation: Number(event.target.value) }, false)}
-                          onPointerUp={() => commitInteractiveEdit()}
-                        />
-                      </label>
-                      <label>
-                        不透明度（{overlayTransform.opacity.toFixed(0)}%）
-                        <input
-                          type="range"
-                          min={0}
-                          max={100}
-                          step={1}
-                          value={overlayTransform.opacity}
-                          onChange={(event) => updateOverlayTransform({ opacity: Number(event.target.value) }, false)}
-                          onPointerUp={() => commitInteractiveEdit()}
-                        />
-                      </label>
-                      <label>
-                        混合模式
-                        <select
-                          value={overlayTransform.mix}
-                          onChange={(event) => updateOverlayTransform({ mix: event.target.value })}
-                        >
-                          <option value="normal">正常</option>
-                          <option value="overlay">叠加</option>
-                          <option value="screen">滤色</option>
-                          <option value="multiply">正片叠底</option>
-                          <option value="addition">线性减淡(添加)</option>
-                          <option value="softlight">柔光</option>
-                          <option value="hardlight">强光</option>
-                          <option value="lighten">变亮</option>
-                          <option value="darken">变暗</option>
-                          <option value="difference">差值</option>
-                          <option value="exclusion">排除</option>
-                          <option value="colorburn">颜色加深</option>
-                          <option value="colordodge">颜色减淡</option>
-                        </select>
-                      </label>
-                      <label>
-                        圆角（{overlayTransform.cornerRadius}px）
-                        <input
-                          type="range"
-                          min={0}
-                          max={200}
-                          step={1}
-                          value={overlayTransform.cornerRadius}
-                          onChange={(event) => updateOverlayTransform({ cornerRadius: Number(event.target.value) })}
-                        />
-                      </label>
-                      {/* T4.4: 蒙版 */}
-                      <div className="mask-section">
-                        <span className="kf-label">蒙版</span>
-                        <div className="kf-buttons">
-                          {(["none", "circle", "rect", "linear", "mirror"] as const).map((k) => (
-                            <button
-                              key={k}
-                              className="speed-preset"
-                              onClick={() => {
-                                if (k === "none") {
-                                  updateSelectedClip({ mask: null });
-                                } else {
-                                  const cur = selectedClip.mask ?? { kind: k, cx: 0.5, cy: 0.5, width: 0.8, height: 0.8, rotation: 0, feather: 0.2, invert: false };
-                                  updateSelectedClip({ mask: { ...cur, kind: k } });
-                                }
-                              }}
-                            >
-                              {k === "none" ? "无" : k === "circle" ? "圆形" : k === "rect" ? "矩形" : k === "linear" ? "线性" : "镜面"}
-                            </button>
-                          ))}
-                        </div>
-                        <MaskPreview mask={selectedClip.mask} />
-                        {selectedClip.mask && (
-                          <>
-                            <label className="style-field">
-                              中心 X（{Math.round((selectedClip.mask.cx ?? 0.5) * 100)}%）
-                              <input
-                                type="range" min={0} max={1} step={0.01}
-                                value={selectedClip.mask.cx ?? 0.5}
-                                onChange={(e) => updateSelectedClip({ mask: { ...selectedClip.mask!, cx: Number(e.target.value) } }, false)}
-                                onPointerUp={() => commitInteractiveEdit()}
-                              />
-                            </label>
-                            <label className="style-field">
-                              中心 Y（{Math.round((selectedClip.mask.cy ?? 0.5) * 100)}%）
-                              <input
-                                type="range" min={0} max={1} step={0.01}
-                                value={selectedClip.mask.cy ?? 0.5}
-                                onChange={(e) => updateSelectedClip({ mask: { ...selectedClip.mask!, cy: Number(e.target.value) } }, false)}
-                                onPointerUp={() => commitInteractiveEdit()}
-                              />
-                            </label>
-                            <label className="style-field">
-                              宽度（{Math.round((selectedClip.mask.width ?? 0.8) * 100)}%）
-                              <input
-                                type="range" min={0.05} max={1} step={0.01}
-                                value={selectedClip.mask.width ?? 0.8}
-                                onChange={(e) => updateSelectedClip({ mask: { ...selectedClip.mask!, width: Number(e.target.value) } }, false)}
-                                onPointerUp={() => commitInteractiveEdit()}
-                              />
-                            </label>
-                            <label className="style-field">
-                              高度（{Math.round((selectedClip.mask.height ?? 0.8) * 100)}%）
-                              <input
-                                type="range" min={0.05} max={1} step={0.01}
-                                value={selectedClip.mask.height ?? 0.8}
-                                onChange={(e) => updateSelectedClip({ mask: { ...selectedClip.mask!, height: Number(e.target.value) } }, false)}
-                                onPointerUp={() => commitInteractiveEdit()}
-                              />
-                            </label>
-                            <label className="style-field">
-                              旋转（{Math.round(selectedClip.mask.rotation ?? 0)}°）
-                              <input
-                                type="range" min={-180} max={180} step={1}
-                                value={selectedClip.mask.rotation ?? 0}
-                                onChange={(e) => updateSelectedClip({ mask: { ...selectedClip.mask!, rotation: Number(e.target.value) } }, false)}
-                                onPointerUp={() => commitInteractiveEdit()}
-                              />
-                            </label>
-                            <label className="style-field">
-                              羽化（{Math.round((selectedClip.mask.feather ?? 0.2) * 100)}%）
-                              <input
-                                type="range" min={0} max={1} step={0.05}
-                                value={selectedClip.mask.feather ?? 0.2}
-                                onChange={(e) => updateSelectedClip({ mask: { ...selectedClip.mask!, feather: Number(e.target.value) } }, false)}
-                                onPointerUp={() => commitInteractiveEdit()}
-                              />
-                            </label>
-                            <label className="style-field" style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-                              <input
-                                type="checkbox"
-                                checked={selectedClip.mask.invert ?? false}
-                                onChange={(e) => updateSelectedClip({ mask: { ...selectedClip.mask!, invert: e.target.checked } })}
-                              />
-                              <span>反转</span>
-                            </label>
-                          </>
-                        )}
-                      </div>
-                    </div>
+                    <KeyframeInspector
+                      clip={selectedClip}
+                      transform={overlayTransform}
+                      hasKeyframe={hasKeyframeAtPlayhead()}
+                      easing={getKeyframeEasingAtPlayhead()}
+                      onAdd={addKeyframeAtPlayhead}
+                      onRemove={removeKeyframeAtPlayhead}
+                      onClear={() => updateSelectedClip({ keyframes: null })}
+                      onEasingChange={setKeyframeEasingAtPlayhead}
+                    />
                   )}
-
+                  {isVisualTrackKind(selectedClipTrack.kind) && (
+                    <VisualTransformInspector
+                      transform={overlayTransform}
+                      mask={selectedClip.mask}
+                      onTransformChange={updateOverlayTransform}
+                      onMaskChange={(mask, commit = true) => updateSelectedClip({ mask }, commit)}
+                      onCommit={() => commitInteractiveEdit()}
+                    />
+                  )}
                   {/* 视觉特效（剪映式"特效"面板） */}
                   {isVisualTrackKind(selectedClipTrack.kind) && (
-                    <div className="mask-section">
-                      <span className="kf-label">视觉特效</span>
-                      <div className="kf-buttons">
-                        {([
-                          { id: "vignette", label: "暗角" },
-                          { id: "glow", label: "发光" },
-                          { id: "mirror", label: "镜像" },
-                          { id: "invert", label: "反色" },
-                          { id: "grayscale", label: "灰度" },
-                          { id: "flicker", label: "闪烁" },
-                          { id: "shake", label: "抖动" },
-                        ] as const).map((eff) => {
-                          const active = (selectedClip.visualEffects ?? []).some((e) => e.kind === eff.id);
-                          return (
-                            <button
-                              key={eff.id}
-                              className={`speed-preset ${active ? "active" : ""}`}
-                              onClick={() => {
-                                const cur = selectedClip.visualEffects ?? [];
-                                const next = active
-                                  ? cur.filter((e) => e.kind !== eff.id)
-                                  : [...cur, { kind: eff.id, intensity: 50 }];
-                                updateSelectedClip({ visualEffects: next.length > 0 ? next : null });
-                              }}
-                            >
-                              {eff.label}
-                            </button>
-                          );
-                        })}
-                      </div>
-                      {(selectedClip.visualEffects ?? []).map((eff, idx) => (
-                        <label key={eff.kind} className="style-field">
-                          {eff.kind === "vignette" ? "暗角" :
-                           eff.kind === "glow" ? "发光" :
-                           eff.kind === "mirror" ? "镜像" :
-                           eff.kind === "invert" ? "反色" :
-                           eff.kind === "grayscale" ? "灰度" :
-                           eff.kind === "flicker" ? "闪烁" :
-                           eff.kind === "shake" ? "抖动" : eff.kind}
-                          （{eff.intensity.toFixed(0)}）
-                          <input
-                            type="range" min={0} max={100} step={5}
-                            value={eff.intensity}
-                            onChange={(e) => {
-                              const next = [...(selectedClip.visualEffects ?? [])];
-                              next[idx] = { ...next[idx], intensity: Number(e.target.value) };
-                              updateSelectedClip({ visualEffects: next }, false);
-                            }}
-                            onPointerUp={() => commitInteractiveEdit()}
-                          />
-                        </label>
-                      ))}
-                      <small className="style-hint">视觉特效在导出时生效</small>
-                    </div>
+                    <VisualEffectsInspector
+                      effects={selectedClip.visualEffects}
+                      onChange={(visualEffects, commit = true) => updateSelectedClip({ visualEffects }, commit)}
+                      onCommit={() => commitInteractiveEdit()}
+                    />
                   )}
                 </>
               )}
 
               {selectedClip.transitionIn && (
-                <div className="transition-info">
+                <div className="transition-info inspector-category inspector-category-animation">
                   <SlidersHorizontal size={14} />
                   入场转场：{transitionName(selectedClip.transitionIn)}
                 </div>
               )}
               {selectedClip.transitionOut && (
-                <div className="transition-info">
+                <div className="transition-info inspector-category inspector-category-animation">
                   <SlidersHorizontal size={14} />
                   出场转场：{transitionName(selectedClip.transitionOut)}
                 </div>
               )}
-            </div>
-          ) : (
-            <div className="empty-state">选中时间线片段后在这里调整属性</div>
+                </>
+              )}
+            </>
           )}
-        </aside>
-        </Panel>
-        </PanelGroup>
-      </main>
-        </Panel>
-        <PanelResizeHandle />
-        <Panel defaultSize="38%" minSize="12%">
+        </InspectorPanel>
+        )}
+        timeline={(
       <section className="timeline-panel">
-        <div className="timeline-head">
-          <div className="timeline-tools">
-            <button onClick={splitAtPlayhead} disabled={!project} title="分割 (Ctrl+B)">
-              <Scissors size={15} />
-              分割
-            </button>
-            <button onClick={() => deleteSelectedClip()} disabled={!selectedClip} title="删除片段 (Del)">
-              <Trash2 size={15} />
-              删除片段
-            </button>
-            <button onClick={copySelectedClip} disabled={!selectedClip} title="复制 (Ctrl+C)">
-              <Copy size={15} />
-              复制
-            </button>
-            <button onClick={pasteClip} disabled={!clipboardRef.current} title="粘贴 (Ctrl+V)">
-              <ClipboardPaste size={15} />
-              粘贴
-            </button>
-            <button onClick={duplicateSelectedClip} disabled={!selectedClip} title="复制片段 (Ctrl+D)">
-              <CopyPlus size={15} />
-              复制片段
-            </button>
+        <TimelineToolbar
+          canEditProject={!!project}
+          canEditSelection={!!selectedClip}
+          canPaste={!!clipboardRef.current}
+          onSplit={splitAtPlayhead}
+          onDelete={() => deleteSelectedClip()}
+          onCopy={copySelectedClip}
+          onPaste={pasteClip}
+          onDuplicate={duplicateSelectedClip}
+          onAddChapter={handleAddChapter}
+          addTrackMenu={(
             <div className="add-track-menu">
               <button onClick={() => setShowAddTrackMenu((v) => !v)} disabled={!project} title="添加轨道">
                 <Plus size={15} />
@@ -3990,28 +3456,9 @@ export function App() {
                 </div>
               )}
             </div>
-            <button onClick={handleAddChapter} disabled={!project} title="在播放头处添加章节标记">
-              <Bookmark size={15} />
-              章节
-            </button>
-            <button
-              onClick={() => {
-                if (!project) return;
-                const t = usePlaybackStore.getState().currentTime;
-                void persist({ ...project, coverTime: t }, `已设置封面（${t.toFixed(1)}s）`);
-              }}
-              disabled={!project}
-              title="将播放头位置设为封面"
-            >
-              <ImagePlay size={15} />
-              设为封面
-            </button>
-            <button onClick={() => { setShowExport(true); setExportState("idle"); }} disabled={!project}>
-              <Download size={15} />
-              导出
-            </button>
-          </div>
-          <div className="timeline-zoom">
+          )}
+          zoomControls={(
+            <div className="timeline-zoom">
             <button title="缩小 (-)" onClick={() => setPxPerSecond((p) => Math.max(4, p / 1.3))}>
               <ZoomOut size={15} />
             </button>
@@ -4031,8 +3478,9 @@ export function App() {
               <ZoomIn size={15} />
             </button>
             <span className="zoom-label">{pxPerSecond}px/s</span>
-          </div>
-        </div>
+            </div>
+          )}
+        />
         <div
           ref={timelineScrollRef}
           className="timeline-scroll"
@@ -4115,12 +3563,12 @@ export function App() {
           </div>
         </div>
       </section>
-        </Panel>
-      </PanelGroup>
+        )}
+      />
 
       <footer className="statusbar">
         <span>{status}</span>
-        <span>{appInfo?.appDataDir || "加载中"}</span>
+        <span>{ffmpeg?.available ? "FFmpeg 可用" : "FFmpeg 不可用"} · {appInfo?.appDataDir || "加载中"}</span>
       </footer>
 
       {/* 右键菜单 */}

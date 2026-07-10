@@ -1,5 +1,6 @@
 import { Clock, Film, MoreVertical, Plus, Search, Sparkles, Trash2, Copy, Edit3 } from "lucide-react";
 import { useMemo, useState } from "react";
+import { SceneForgeLogo } from "../components/SceneForgeLogo";
 import type { ProjectSummary } from "../types";
 
 export function HomeScreen({
@@ -33,8 +34,8 @@ export function HomeScreen({
     <div className="home-screen">
       <header className="home-header">
         <div className="home-brand">
-          <Film size={24} />
-          <strong>SceneScript</strong>
+          <SceneForgeLogo size={26} />
+          <strong>SceneForge</strong>
           <span>AI 脚本到视频</span>
         </div>
         <div className="home-search">

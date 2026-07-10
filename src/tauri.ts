@@ -63,6 +63,8 @@ function defaultTracks() {
       order: 0,
       muted: false,
       locked: false,
+      hidden: false,
+      height: 0,
     },
     {
       id: "track_voiceover",
@@ -71,6 +73,8 @@ function defaultTracks() {
       order: 1,
       muted: false,
       locked: false,
+      hidden: false,
+      height: 0,
     },
     {
       id: "track_video",
@@ -79,6 +83,8 @@ function defaultTracks() {
       order: 2,
       muted: false,
       locked: false,
+      hidden: false,
+      height: 0,
     },
   ];
 }
@@ -95,10 +101,36 @@ function newProject(title: string, ratio: string): Project {
     tracks: defaultTracks(),
     clips: [],
     renderConfig: { ...DEFAULT_RENDER_CONFIG },
+    chapters: [],
+    coverTime: null,
     previewPath: null,
     finalPath: null,
     createdAt: timestamp,
     updatedAt: timestamp,
+  };
+}
+
+function normalizeWebProject(input: Partial<Project> | null | undefined): Project {
+  const value = input && typeof input === "object" ? input : {};
+  const fallback = newProject(value.title || "未命名项目", value.ratio || "9:16");
+  return {
+    ...fallback,
+    ...value,
+    id: value.id || fallback.id,
+    title: value.title || fallback.title,
+    script: value.script || "",
+    ratio: value.ratio || fallback.ratio,
+    fps: Number.isFinite(value.fps) ? value.fps as number : fallback.fps,
+    media: Array.isArray(value.media) ? value.media : [],
+    tracks: Array.isArray(value.tracks) && value.tracks.length > 0 ? value.tracks : defaultTracks(),
+    clips: Array.isArray(value.clips) ? value.clips : [],
+    renderConfig: { ...DEFAULT_RENDER_CONFIG, ...(value.renderConfig || {}) },
+    chapters: Array.isArray(value.chapters) ? value.chapters : [],
+    coverTime: value.coverTime ?? null,
+    previewPath: value.previewPath ?? null,
+    finalPath: value.finalPath ?? null,
+    createdAt: value.createdAt || fallback.createdAt,
+    updatedAt: value.updatedAt || value.createdAt || fallback.updatedAt,
   };
 }
 
@@ -111,8 +143,8 @@ function readWebState(): WebState {
     const parsed = JSON.parse(raw) as Partial<WebState>;
     return {
       settings: { ...defaultSettings, ...(parsed.settings || {}) },
-      projects: parsed.projects || [],
-      voices: parsed.voices || [],
+      projects: Array.isArray(parsed.projects) ? parsed.projects.map(normalizeWebProject) : [],
+      voices: Array.isArray(parsed.voices) ? parsed.voices : [],
     };
   } catch {
     return { settings: defaultSettings, projects: [], voices: [] };
@@ -220,6 +252,10 @@ async function webFallback<T>(command: string, args?: Record<string, unknown>): 
     } as T;
   }
 
+  if (command === "write_debug_log") {
+    return "浏览器预览模式：错误日志已保存在 localStorage" as T;
+  }
+
   if (command === "load_settings") {
     return state.settings as T;
   }
@@ -259,7 +295,7 @@ async function webFallback<T>(command: string, args?: Record<string, unknown>): 
   }
 
   if (command === "save_project") {
-    const project = { ...(args?.project as Project), updatedAt: now() };
+    const project = normalizeWebProject({ ...(args?.project as Project), updatedAt: now() });
     const index = state.projects.findIndex((item) => item.id === project.id);
     if (index >= 0) state.projects[index] = project;
     else state.projects.unshift(project);
@@ -409,6 +445,28 @@ async function webFallback<T>(command: string, args?: Record<string, unknown>): 
     return assets as T;
   }
 
+  if (command === "search_pexels_photos") {
+    const request = args?.request as { query: string; ratio: string; perPage?: number };
+    const portrait = request.ratio === "9:16";
+    const assets: MediaSource[] = Array.from({ length: request.perPage || 3 }).map((_, index) => ({
+      id: uid("pexels-photo"),
+      kind: "image",
+      title: `${request.query || "Pexels"} #${index + 1}`,
+      url: null,
+      localPath: null,
+      proxyPath: null,
+      proxyStatus: "none",
+      proxyWidth: null,
+      proxyHeight: null,
+      thumbnailUrl: null,
+      width: portrait ? 1080 : 1920,
+      height: portrait ? 1920 : 1080,
+      duration: 5,
+      source: "pexels",
+    }));
+    return assets as T;
+  }
+
   if (command === "cache_asset_video") {
     // 浏览器模式不真正下载，原样返回
     return (args?.request as { asset: MediaSource }).asset as T;
@@ -439,6 +497,33 @@ async function webFallback<T>(command: string, args?: Record<string, unknown>): 
     return "" as T;
   }
 
+  if (command === "generate_filmstrip") {
+    return [] as T;
+  }
+
+  if (command === "generate_waveform") {
+    return [] as T;
+  }
+
+  if (command === "transcribe_to_text" || command === "transcribe_to_sentences") {
+    throw new Error("浏览器预览模式不能调用本机 Whisper；请在 Tauri 客户端中识别音频");
+  }
+
+  if (command === "enrich_segments") {
+    const request = args?.request as {
+      sentences: { start: number; end: number; text: string }[];
+    };
+    return request.sentences.map((sentence, index) => ({
+      title: `片段 ${index + 1}`,
+      text: sentence.text,
+      visualQuery: "calming nature landscape vertical video",
+      mood: "治愈",
+      estimatedDuration: Math.max(0, sentence.end - sentence.start),
+      start: sentence.start,
+      end: sentence.end,
+    })) as T;
+  }
+
   if (command === "generate_audio") {
     // 浏览器 fallback：模拟给配音轨 clip 绑定一个占位素材
     const request = args?.request as { projectId: string; clipId?: string | null };
@@ -460,6 +545,15 @@ async function webFallback<T>(command: string, args?: Record<string, unknown>): 
     return project as T;
   }
 
+  if (
+    command === "detach_audio" ||
+    command === "separate_vocals" ||
+    command === "generate_subtitles" ||
+    command === "import_srt"
+  ) {
+    throw new Error("浏览器预览模式不支持该媒体处理操作；请在 Tauri 客户端中执行");
+  }
+
   if (command === "render_project") {
     const request = args?.request as { projectId: string; preview: boolean };
     const project = state.projects.find((item) => item.id === request.projectId);
@@ -475,6 +569,10 @@ async function webFallback<T>(command: string, args?: Record<string, unknown>): 
       previewPath: request.preview ? project.previewPath : project.finalPath,
       command: request.preview ? "web-preview" : "web-final",
     } as T;
+  }
+
+  if (command === "cancel_render") {
+    return undefined as T;
   }
 
   throw new Error(`Unknown command: ${command}`);

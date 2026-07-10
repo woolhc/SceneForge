@@ -1,4 +1,5 @@
 import type { Clip, Project } from "../types";
+import { sliceClipByTimelineRange, splitClipByTimelineTime } from "../editor/clipTimeMap";
 
 /** 拖拽手柄类型 */
 export type DragHandle = "body" | "left" | "right";
@@ -9,13 +10,7 @@ export type DragState = {
   /** 拖拽起点 pointer x */
   startX: number;
   /** 拖拽开始时 clip 的快照 */
-  initial: {
-    startOnTrack: number;
-    duration: number;
-    sourceIn: number;
-    sourceOut: number;
-    speed: number;
-  };
+  initial: Clip;
   /** 拖拽开始时同轨道其他 clip（用于吸附参考） */
   peers: Clip[];
   /** 当前播放头位置（用于吸附） */
@@ -53,7 +48,7 @@ export function computeDraggedClip(
   deltaSeconds: number,
   sourceDuration?: number,
   pxPerSecond: number = 64,
-): Pick<Clip, "startOnTrack" | "duration" | "sourceIn" | "sourceOut"> {
+): Partial<Clip> {
   const { initial, handle, peers, playhead } = drag;
   const result = {
     startOnTrack: initial.startOnTrack,
@@ -118,15 +113,24 @@ export function computeDraggedClip(
       }
     }
 
-    // 受源媒体时长限制（源区间 = 时间线时长 × speed）
-    const speed = initial.speed || 1;
-    if (sourceDuration !== undefined) {
-      const maxBySource = (sourceDuration - initial.sourceIn) / speed;
+    const speed = Math.max(0.0001, Math.abs(initial.speed || 1));
+    const reverse = initial.reverse === true || initial.speed < 0;
+    if (initial.speedCurve?.length) {
+      newDuration = Math.min(newDuration, initial.duration);
+    } else if (sourceDuration !== undefined) {
+      const maxBySource = reverse
+        ? initial.sourceOut / speed
+        : (sourceDuration - initial.sourceIn) / speed;
       if (newDuration > maxBySource) newDuration = Math.max(0.2, maxBySource);
     }
+
+    if (newDuration <= initial.duration + 1e-9) {
+      return sliceClipByTimelineRange(initial, 0, newDuration);
+    }
+
     result.duration = newDuration;
-    // sourceOut 必须乘 speed：时间线缩短 1s → 源区间变化 speed 秒
-    result.sourceOut = initial.sourceIn + newDuration * speed;
+    if (reverse) result.sourceIn = Math.max(0, initial.sourceOut - newDuration * speed);
+    else result.sourceOut = initial.sourceIn + newDuration * speed;
   } else {
     // 左边缘
     let deltaStart = deltaSeconds;
@@ -149,12 +153,28 @@ export function computeDraggedClip(
       }
     }
 
-    // 左手柄 trim：时间线 delta → 源区间 delta × speed
-    const speed = initial.speed || 1;
-    result.sourceIn = initial.sourceIn + (newStart - initial.startOnTrack) * speed;
+    const offset = newStart - initial.startOnTrack;
+    if (initial.speedCurve?.length && offset < 0) {
+      newStart = initial.startOnTrack;
+      newDuration = initial.duration;
+    }
+
+    const finalOffset = newStart - initial.startOnTrack;
+    if (finalOffset >= -1e-9) {
+      return sliceClipByTimelineRange(initial, Math.max(0, finalOffset), initial.duration);
+    }
+
+    const speed = Math.max(0.0001, Math.abs(initial.speed || 1));
+    const reverse = initial.reverse === true || initial.speed < 0;
     result.startOnTrack = Math.max(0, newStart);
     result.duration = Math.max(0.2, newDuration);
-    result.sourceOut = result.sourceIn + result.duration * speed;
+    if (reverse) {
+      result.sourceOut = sourceDuration === undefined
+        ? initial.sourceOut - finalOffset * speed
+        : Math.min(sourceDuration, initial.sourceOut - finalOffset * speed);
+    } else {
+      result.sourceIn = Math.max(0, initial.sourceIn + finalOffset * speed);
+    }
   }
 
   return result;
@@ -164,22 +184,7 @@ export function computeDraggedClip(
  * 在 playhead 处把一个 clip 一分为二。
  */
 export function splitClipAt(clip: Clip, playheadTime: number): [Clip, Clip] | null {
-  const rel = playheadTime - clip.startOnTrack;
-  if (rel <= 0.1 || rel >= clip.duration - 0.1) return null;
-  const firstDuration = rel;
-  const secondDuration = clip.duration - rel;
-  const splitSourcePoint = clip.sourceIn + firstDuration * clip.speed;
-  const secondId = `clip_${Math.random().toString(16).slice(2)}_${Date.now()}`;
-  return [
-    { ...clip, duration: firstDuration, sourceOut: splitSourcePoint },
-    {
-      ...clip,
-      id: secondId,
-      startOnTrack: clip.startOnTrack + firstDuration,
-      duration: secondDuration,
-      sourceIn: splitSourcePoint,
-    },
-  ];
+  return splitClipByTimelineTime(clip, playheadTime);
 }
 
 /** 从项目里删除一个 clip */

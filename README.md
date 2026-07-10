@@ -1,8 +1,8 @@
-# SceneScript Desktop
+# SceneForge
 
 **本地优先的 AI 短视频生成器** - 从脚本/音频到成片，一站式自动化。粘贴文案或导入录音，AI 自动分镜、匹配素材、克隆配音、生成字幕，配合剪映式的多轨道编辑能力完成精修。全程本地运行，数据不上传。
 
-![SceneScript](smoke-ui.png)
+![SceneForge](smoke-ui.png)
 
 ## ✨ 核心特性
 

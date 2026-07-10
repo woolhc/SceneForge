@@ -1,52 +1,52 @@
 import { useEffect, useRef, useState } from "react";
 import { desktopApi } from "../tauri";
 import type { Project } from "../types";
+import { ProjectHistoryBuffer, ProjectSaveCoordinator } from "./projectSaveCoordinator";
 
 interface ProjectHistoryOptions {
+  projectId: string | null;
   getCurrentProject: () => Project | null;
   setProject: (project: Project) => void;
   setStatus: (message: string) => void;
 }
 
-export function useProjectHistory({ getCurrentProject, setProject, setStatus }: ProjectHistoryOptions) {
-  const undoStack = useRef<Project[]>([]);
-  const redoStack = useRef<Project[]>([]);
+export function useProjectHistory({ projectId, getCurrentProject, setProject, setStatus }: ProjectHistoryOptions) {
+  const historyRef = useRef(new ProjectHistoryBuffer<Project>());
+  const saveCoordinatorRef = useRef<ProjectSaveCoordinator | null>(null);
+  if (!saveCoordinatorRef.current) {
+    saveCoordinatorRef.current = new ProjectSaveCoordinator(
+      desktopApi.saveProject,
+      500,
+      (error) => setStatus(`自动保存失败：${error instanceof Error ? error.message : String(error)}`),
+    );
+  }
   const [canUndo, setCanUndo] = useState(false);
   const [canRedo, setCanRedo] = useState(false);
-  const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pendingSaveRef = useRef<Project | null>(null);
+
+  function syncHistoryState() {
+    setCanUndo(historyRef.current.canUndo);
+    setCanRedo(historyRef.current.canRedo);
+  }
+
+  useEffect(() => {
+    historyRef.current.activate(projectId);
+    syncHistoryState();
+  }, [projectId]);
 
   function pushUndo(current: Project | null) {
     if (!current) return;
-    undoStack.current.push(structuredClone(current));
-    if (undoStack.current.length > 50) undoStack.current.shift();
-    redoStack.current = [];
-    setCanUndo(undoStack.current.length > 0);
-    setCanRedo(false);
+    historyRef.current.activate(current.id);
+    historyRef.current.push(current);
+    syncHistoryState();
   }
 
   function debouncedSaveProject(project: Project) {
-    pendingSaveRef.current = project;
-    if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
-    saveDebounceRef.current = setTimeout(async () => {
-      const toSave = pendingSaveRef.current;
-      saveDebounceRef.current = null;
-      if (toSave) {
-        await desktopApi.saveProject(toSave);
-      }
-    }, 500);
+    saveCoordinatorRef.current?.schedule(project);
   }
 
   useEffect(() => {
     function flushBeforeUnload() {
-      const toSave = pendingSaveRef.current;
-      if (toSave) {
-        try {
-          void desktopApi.saveProject(toSave);
-        } catch {
-          // Best effort only; the app is closing.
-        }
-      }
+      void saveCoordinatorRef.current?.flushAll();
       // 标记正常退出（崩溃恢复检测用）
       try {
         localStorage.setItem("appExitedCleanly", "true");
@@ -55,49 +55,37 @@ export function useProjectHistory({ getCurrentProject, setProject, setStatus }: 
       }
     }
     window.addEventListener("beforeunload", flushBeforeUnload);
-    return () => window.removeEventListener("beforeunload", flushBeforeUnload);
-  }, []);
-
-  // G5: 定时 flush pendingSave -- 防止崩溃时丢失 500ms 防抖窗口内的编辑
-  useEffect(() => {
-    const interval = setInterval(async () => {
-      const toSave = pendingSaveRef.current;
-      if (toSave && saveDebounceRef.current) {
-        // 防抖还在等待中，立即 flush
-        if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
-        saveDebounceRef.current = null;
-        pendingSaveRef.current = null;
-        try {
-          await desktopApi.saveProject(toSave);
-        } catch {
-          // 忽略瞬时错误，下次再试
-        }
-      }
-    }, 5000);
-    return () => clearInterval(interval);
+    return () => {
+      window.removeEventListener("beforeunload", flushBeforeUnload);
+      saveCoordinatorRef.current?.dispose();
+    };
   }, []);
 
   function undo() {
-    const prev = undoStack.current.pop();
     const project = getCurrentProject();
-    if (!prev || !project) return;
-    redoStack.current.push(structuredClone(project));
+    if (!project) return;
+    historyRef.current.activate(project.id);
+    const prev = historyRef.current.undo(project);
+    if (!prev) return;
     setProject(prev);
-    void desktopApi.saveProject(prev);
-    setCanUndo(undoStack.current.length > 0);
-    setCanRedo(true);
+    void saveCoordinatorRef.current?.saveNow(prev).catch((error) => {
+      setStatus(`撤销保存失败：${error instanceof Error ? error.message : String(error)}`);
+    });
+    syncHistoryState();
     setStatus("已撤销");
   }
 
   function redo() {
-    const next = redoStack.current.pop();
     const project = getCurrentProject();
-    if (!next || !project) return;
-    undoStack.current.push(structuredClone(project));
+    if (!project) return;
+    historyRef.current.activate(project.id);
+    const next = historyRef.current.redo(project);
+    if (!next) return;
     setProject(next);
-    void desktopApi.saveProject(next);
-    setCanUndo(true);
-    setCanRedo(redoStack.current.length > 0);
+    void saveCoordinatorRef.current?.saveNow(next).catch((error) => {
+      setStatus(`重做保存失败：${error instanceof Error ? error.message : String(error)}`);
+    });
+    syncHistoryState();
     setStatus("已重做");
   }
 

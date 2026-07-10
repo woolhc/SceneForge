@@ -26,22 +26,23 @@ function applyEasing(t01: number, easing: string): number {
 /** 对一组关键帧在时间 t 采样。kfs 必须按 time 升序。无关键帧返回 null。 */
 export function sampleKeyframes(kfs: Keyframe[] | undefined, t: number): number | null {
   if (!kfs || kfs.length === 0) return null;
+  const sorted = [...kfs].sort((left, right) => left.time - right.time);
 
   // t 在首帧之前 → 取首帧值
-  if (t <= kfs[0].time) return kfs[0].value;
+  if (t <= sorted[0].time) return sorted[0].value;
   // t 在末帧之后 → 取末帧值
-  if (t >= kfs[kfs.length - 1].time) return kfs[kfs.length - 1].value;
+  if (t >= sorted[sorted.length - 1].time) return sorted[sorted.length - 1].value;
 
   // 二分找相邻两帧
   let lo = 0;
-  let hi = kfs.length - 1;
+  let hi = sorted.length - 1;
   while (lo < hi - 1) {
     const mid = (lo + hi) >> 1;
-    if (kfs[mid].time <= t) lo = mid;
+    if (sorted[mid].time <= t) lo = mid;
     else hi = mid;
   }
-  const a = kfs[lo];
-  const b = kfs[hi];
+  const a = sorted[lo];
+  const b = sorted[hi];
   const span = b.time - a.time;
   if (span <= 0) return b.value;
   const t01 = (t - a.time) / span;

@@ -42,3 +42,4 @@ app.db
 secrets.json
 config.local.*
 credentials.json
+.superpowers/

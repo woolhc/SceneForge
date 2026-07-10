@@ -1,7 +1,7 @@
 import type { Clip, Project } from "../types";
 import type { SpeedPoint } from "./speedCurve";
 import { curveTimelineDuration } from "./speedCurve";
-import { splitClipAt } from "../timeline/clipInteraction";
+import { splitClipByTimelineTime } from "./clipTimeMap";
 
 export type OperationResult = {
   project: Project;
@@ -67,7 +67,7 @@ export function splitVisualClipAtPlayhead(
       currentTime < clip.startOnTrack + clip.duration - 0.01,
   ) || selectedClip;
   if (!targetClip) return null;
-  const result = splitClipAt(targetClip, currentTime);
+  const result = splitClipByTimelineTime(targetClip, currentTime);
   if (!result) return null;
   const [first, second] = result;
   return {

@@ -1,0 +1,624 @@
+{
+  "project": {
+    "id": "golden",
+    "title": "RenderGraph Golden",
+    "script": "",
+    "ratio": "16:9",
+    "fps": 30,
+    "media": [
+      {
+        "id": "video",
+        "kind": "video",
+        "title": "video",
+        "width": 1920,
+        "height": 1080,
+        "duration": 20,
+        "source": "local"
+      },
+      {
+        "id": "music",
+        "kind": "audio",
+        "title": "music",
+        "width": 0,
+        "height": 0,
+        "duration": 20,
+        "source": "local"
+      },
+      {
+        "id": "voice",
+        "kind": "audio",
+        "title": "voice",
+        "width": 0,
+        "height": 0,
+        "duration": 4,
+        "source": "local"
+      }
+    ],
+    "tracks": [
+      {
+        "id": "base-track",
+        "kind": "video",
+        "name": "base",
+        "order": 10,
+        "muted": false,
+        "locked": false
+      },
+      {
+        "id": "overlay-track",
+        "kind": "image",
+        "name": "overlay",
+        "order": 5,
+        "muted": false,
+        "locked": false
+      },
+      {
+        "id": "reverse-track",
+        "kind": "video",
+        "name": "reverse",
+        "order": 4,
+        "muted": false,
+        "locked": false
+      },
+      {
+        "id": "music-track",
+        "kind": "audio",
+        "name": "music",
+        "order": 3,
+        "muted": false,
+        "locked": false
+      },
+      {
+        "id": "voice-track",
+        "kind": "voiceover",
+        "name": "voice",
+        "order": 2,
+        "muted": false,
+        "locked": false
+      },
+      {
+        "id": "subtitle-track",
+        "kind": "subtitle",
+        "name": "subtitle",
+        "order": 1,
+        "muted": false,
+        "locked": false
+      },
+      {
+        "id": "hidden-track",
+        "kind": "video",
+        "name": "hidden",
+        "order": 20,
+        "muted": false,
+        "locked": false,
+        "hidden": true
+      }
+    ],
+    "clips": [
+      {
+        "id": "base",
+        "trackId": "base-track",
+        "sourceId": "video",
+        "startOnTrack": 0,
+        "duration": 10,
+        "sourceIn": 0,
+        "sourceOut": 10,
+        "speed": 1,
+        "volume": 1,
+        "fadeIn": 0,
+        "fadeOut": 0,
+        "brightness": 0,
+        "contrast": 0,
+        "saturation": 0,
+        "transform": {
+          "x": 50,
+          "y": 50,
+          "scale": 100,
+          "opacity": 80,
+          "cornerRadius": 0,
+          "mix": "normal",
+          "rotation": 0
+        },
+        "keyframes": {
+          "x": [
+            {
+              "time": 0,
+              "value": 0,
+              "easing": "linear"
+            },
+            {
+              "time": 10,
+              "value": 100,
+              "easing": "linear"
+            }
+          ],
+          "opacity": [
+            {
+              "time": 0,
+              "value": 100,
+              "easing": "linear"
+            },
+            {
+              "time": 10,
+              "value": 50,
+              "easing": "linear"
+            }
+          ]
+        }
+      },
+      {
+        "id": "overlay",
+        "trackId": "overlay-track",
+        "sourceId": "video",
+        "startOnTrack": 1,
+        "duration": 4,
+        "sourceIn": 0,
+        "sourceOut": 4,
+        "speed": 1,
+        "volume": 1,
+        "fadeIn": 0,
+        "fadeOut": 0,
+        "brightness": 0,
+        "contrast": 0,
+        "saturation": 0,
+        "transform": {
+          "x": 25,
+          "y": 30,
+          "scale": 50,
+          "opacity": 100,
+          "cornerRadius": 0,
+          "mix": "normal",
+          "rotation": 10
+        },
+        "transitionIn": {
+          "name": "fade",
+          "duration": 2
+        },
+        "transitionOut": {
+          "name": "fade",
+          "duration": 1
+        }
+      },
+      {
+        "id": "reverse",
+        "trackId": "reverse-track",
+        "sourceId": "video",
+        "startOnTrack": 6,
+        "duration": 4,
+        "sourceIn": 0,
+        "sourceOut": 4,
+        "speed": 1,
+        "reverse": true,
+        "volume": 1,
+        "fadeIn": 0,
+        "fadeOut": 0,
+        "brightness": 0,
+        "contrast": 0,
+        "saturation": 0
+      },
+      {
+        "id": "music",
+        "trackId": "music-track",
+        "sourceId": "music",
+        "startOnTrack": 0,
+        "duration": 10,
+        "sourceIn": 0,
+        "sourceOut": 10,
+        "speed": 1,
+        "volume": 1.5,
+        "fadeIn": 2,
+        "fadeOut": 2,
+        "brightness": 0,
+        "contrast": 0,
+        "saturation": 0,
+        "keyframes": {
+          "volume": [
+            {
+              "time": 0,
+              "value": 0.5,
+              "easing": "linear"
+            },
+            {
+              "time": 10,
+              "value": 1,
+              "easing": "linear"
+            }
+          ]
+        }
+      },
+      {
+        "id": "voice",
+        "trackId": "voice-track",
+        "sourceId": "voice",
+        "startOnTrack": 0,
+        "duration": 2,
+        "sourceIn": 0,
+        "sourceOut": 4,
+        "speed": 1,
+        "speedCurve": [
+          {
+            "time": 0,
+            "speed": 2
+          },
+          {
+            "time": 1,
+            "speed": 2
+          }
+        ],
+        "volume": 1,
+        "fadeIn": 0,
+        "fadeOut": 0,
+        "brightness": 0,
+        "contrast": 0,
+        "saturation": 0
+      },
+      {
+        "id": "subtitle",
+        "trackId": "subtitle-track",
+        "sourceId": null,
+        "startOnTrack": 2,
+        "duration": 4,
+        "sourceIn": 0,
+        "sourceOut": 4,
+        "speed": 1,
+        "volume": 1,
+        "fadeIn": 0,
+        "fadeOut": 0,
+        "brightness": 0,
+        "contrast": 0,
+        "saturation": 0,
+        "text": "hello world",
+        "words": [
+          {
+            "start": 0,
+            "end": 1,
+            "text": "hello"
+          },
+          {
+            "start": 1,
+            "end": 2,
+            "text": "world"
+          }
+        ]
+      },
+      {
+        "id": "hidden",
+        "trackId": "hidden-track",
+        "sourceId": "video",
+        "startOnTrack": 0,
+        "duration": 20,
+        "sourceIn": 0,
+        "sourceOut": 20,
+        "speed": 1,
+        "volume": 1,
+        "fadeIn": 0,
+        "fadeOut": 0,
+        "brightness": 0,
+        "contrast": 0,
+        "saturation": 0
+      }
+    ],
+    "renderConfig": {
+      "fps": 30,
+      "preset": "preview-fast",
+      "resolution": "1080p",
+      "bitrateMbps": 0
+    },
+    "createdAt": "",
+    "updatedAt": ""
+  },
+  "planExpected": {
+    "duration": 10.0,
+    "visualIds": ["base", "overlay", "reverse"],
+    "units": [
+      { "kind": "normal", "start": 0.0, "end": 1.0, "layerIds": ["base"] },
+      { "kind": "normal", "start": 1.0, "end": 5.0, "layerIds": ["base", "overlay"] },
+      { "kind": "normal", "start": 5.0, "end": 6.0, "layerIds": ["base"] },
+      { "kind": "normal", "start": 6.0, "end": 10.0, "layerIds": ["base", "reverse"] }
+    ]
+  },
+  "samples": [
+    {
+      "time": 0,
+      "expected": {
+        "time": 0,
+        "visual": [
+          {
+            "id": "base",
+            "sourceTime": 0,
+            "speed": 1,
+            "x": 0,
+            "y": 50,
+            "scale": 100,
+            "opacity": 100,
+            "rotation": 0,
+            "transitionInProgress": 1,
+            "transitionOutProgress": 1,
+            "effectiveOpacity": 1
+          }
+        ],
+        "audio": [
+          {
+            "id": "base",
+            "sourceTime": 0,
+            "speed": 1,
+            "volume": 1,
+            "fadeInGain": 1,
+            "fadeOutGain": 1,
+            "gain": 1
+          },
+          {
+            "id": "music",
+            "sourceTime": 0,
+            "speed": 1,
+            "volume": 0.5,
+            "fadeInGain": 0,
+            "fadeOutGain": 1,
+            "gain": 0
+          },
+          {
+            "id": "voice",
+            "sourceTime": 0,
+            "speed": 2,
+            "volume": 1,
+            "fadeInGain": 1,
+            "fadeOutGain": 1,
+            "gain": 1
+          }
+        ],
+        "subtitle": []
+      }
+    },
+    {
+      "time": 1,
+      "expected": {
+        "time": 1,
+        "visual": [
+          {
+            "id": "base",
+            "sourceTime": 1,
+            "speed": 1,
+            "x": 10,
+            "y": 50,
+            "scale": 100,
+            "opacity": 95,
+            "rotation": 0,
+            "transitionInProgress": 1,
+            "transitionOutProgress": 1,
+            "effectiveOpacity": 0.95
+          },
+          {
+            "id": "overlay",
+            "sourceTime": 0,
+            "speed": 1,
+            "x": 25,
+            "y": 30,
+            "scale": 50,
+            "opacity": 100,
+            "rotation": 10,
+            "transitionInProgress": 0,
+            "transitionOutProgress": 1,
+            "effectiveOpacity": 0
+          }
+        ],
+        "audio": [
+          {
+            "id": "base",
+            "sourceTime": 1,
+            "speed": 1,
+            "volume": 1,
+            "fadeInGain": 1,
+            "fadeOutGain": 1,
+            "gain": 1
+          },
+          {
+            "id": "music",
+            "sourceTime": 1,
+            "speed": 1,
+            "volume": 0.55,
+            "fadeInGain": 0.5,
+            "fadeOutGain": 1,
+            "gain": 0.275
+          },
+          {
+            "id": "voice",
+            "sourceTime": 2,
+            "speed": 2,
+            "volume": 1,
+            "fadeInGain": 1,
+            "fadeOutGain": 1,
+            "gain": 1
+          }
+        ],
+        "subtitle": []
+      }
+    },
+    {
+      "time": 2.5,
+      "expected": {
+        "time": 2.5,
+        "visual": [
+          {
+            "id": "base",
+            "sourceTime": 2.5,
+            "speed": 1,
+            "x": 25,
+            "y": 50,
+            "scale": 100,
+            "opacity": 87.5,
+            "rotation": 0,
+            "transitionInProgress": 1,
+            "transitionOutProgress": 1,
+            "effectiveOpacity": 0.875
+          },
+          {
+            "id": "overlay",
+            "sourceTime": 1.5,
+            "speed": 1,
+            "x": 25,
+            "y": 30,
+            "scale": 50,
+            "opacity": 100,
+            "rotation": 10,
+            "transitionInProgress": 0.75,
+            "transitionOutProgress": 1,
+            "effectiveOpacity": 0.75
+          }
+        ],
+        "audio": [
+          {
+            "id": "base",
+            "sourceTime": 2.5,
+            "speed": 1,
+            "volume": 1,
+            "fadeInGain": 1,
+            "fadeOutGain": 1,
+            "gain": 1
+          },
+          {
+            "id": "music",
+            "sourceTime": 2.5,
+            "speed": 1,
+            "volume": 0.625,
+            "fadeInGain": 1,
+            "fadeOutGain": 1,
+            "gain": 0.625
+          }
+        ],
+        "subtitle": [
+          {
+            "id": "subtitle",
+            "activeWordIndex": 0
+          }
+        ]
+      }
+    },
+    {
+      "time": 7,
+      "expected": {
+        "time": 7,
+        "visual": [
+          {
+            "id": "base",
+            "sourceTime": 7,
+            "speed": 1,
+            "x": 70,
+            "y": 50,
+            "scale": 100,
+            "opacity": 65,
+            "rotation": 0,
+            "transitionInProgress": 1,
+            "transitionOutProgress": 1,
+            "effectiveOpacity": 0.65
+          },
+          {
+            "id": "reverse",
+            "sourceTime": 3,
+            "speed": 1,
+            "x": 50,
+            "y": 50,
+            "scale": 100,
+            "opacity": 100,
+            "rotation": 0,
+            "transitionInProgress": 1,
+            "transitionOutProgress": 1,
+            "effectiveOpacity": 1
+          }
+        ],
+        "audio": [
+          {
+            "id": "base",
+            "sourceTime": 7,
+            "speed": 1,
+            "volume": 1,
+            "fadeInGain": 1,
+            "fadeOutGain": 1,
+            "gain": 1
+          },
+          {
+            "id": "reverse",
+            "sourceTime": 3,
+            "speed": 1,
+            "volume": 1,
+            "fadeInGain": 1,
+            "fadeOutGain": 1,
+            "gain": 1
+          },
+          {
+            "id": "music",
+            "sourceTime": 7,
+            "speed": 1,
+            "volume": 0.85,
+            "fadeInGain": 1,
+            "fadeOutGain": 1,
+            "gain": 0.85
+          }
+        ],
+        "subtitle": []
+      }
+    },
+    {
+      "time": 9.5,
+      "expected": {
+        "time": 9.5,
+        "visual": [
+          {
+            "id": "base",
+            "sourceTime": 9.5,
+            "speed": 1,
+            "x": 95,
+            "y": 50,
+            "scale": 100,
+            "opacity": 52.5,
+            "rotation": 0,
+            "transitionInProgress": 1,
+            "transitionOutProgress": 1,
+            "effectiveOpacity": 0.525
+          },
+          {
+            "id": "reverse",
+            "sourceTime": 0.5,
+            "speed": 1,
+            "x": 50,
+            "y": 50,
+            "scale": 100,
+            "opacity": 100,
+            "rotation": 0,
+            "transitionInProgress": 1,
+            "transitionOutProgress": 1,
+            "effectiveOpacity": 1
+          }
+        ],
+        "audio": [
+          {
+            "id": "base",
+            "sourceTime": 9.5,
+            "speed": 1,
+            "volume": 1,
+            "fadeInGain": 1,
+            "fadeOutGain": 1,
+            "gain": 1
+          },
+          {
+            "id": "reverse",
+            "sourceTime": 0.5,
+            "speed": 1,
+            "volume": 1,
+            "fadeInGain": 1,
+            "fadeOutGain": 1,
+            "gain": 1
+          },
+          {
+            "id": "music",
+            "sourceTime": 9.5,
+            "speed": 1,
+            "volume": 0.975,
+            "fadeInGain": 1,
+            "fadeOutGain": 0.25,
+            "gain": 0.24375
+          }
+        ],
+        "subtitle": []
+      }
+    }
+  ]
+}

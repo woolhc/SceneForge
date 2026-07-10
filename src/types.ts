@@ -254,6 +254,8 @@ export type Clip = {
   keyframes?: ClipKeyframes | null;
   /** T4.4: 蒙版 */
   mask?: ClipMask | null;
+  /** 是否倒放；兼容旧项目中仅通过负 speed 表示倒放的写法 */
+  reverse?: boolean;
   /** 画面搜索词（视频 clip 用，AI 生成的英文 Pexels 关键词） */
   visualQuery?: string | null;
   /** 视觉特效列表（剪映式"特效"面板） */

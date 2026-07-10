@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "SceneScript Desktop",
+  "productName": "SceneForge",
   "version": "0.1.0",
   "identifier": "com.scenescript.desktop",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "SceneScript Desktop",
+        "title": "SceneForge",
         "width": 1440,
         "height": 940,
         "minWidth": 1024,

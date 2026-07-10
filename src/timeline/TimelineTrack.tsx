@@ -83,13 +83,7 @@ function TimelineTrackInner({
       clipId: clip.id,
       handle,
       startX: event.clientX,
-      initial: {
-        startOnTrack: clip.startOnTrack,
-        duration: clip.duration,
-        sourceIn: clip.sourceIn,
-        sourceOut: clip.sourceOut,
-        speed: clip.speed,
-      },
+      initial: structuredClone(clip),
       peers,
       // T2.2: playhead 从 store 按需读（拖拽时才用），避免每帧 prop 变化导致重渲染
       playhead: usePlaybackStore.getState().currentTime,

@@ -21,7 +21,6 @@ struct PexelsVideo {
 
 #[derive(Debug, Deserialize)]
 struct PexelsVideoFile {
-    id: u64,
     quality: Option<String>,
     file_type: Option<String>,
     width: Option<u32>,
@@ -157,10 +156,8 @@ struct PexelsPhoto {
 
 #[derive(Debug, Deserialize)]
 struct PexelsPhotoSrc {
-    original: String,
     large: String,
     medium: String,
-    small: String,
 }
 
 pub async fn search_photos(

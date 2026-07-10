@@ -1,4 +1,4 @@
-# SceneScript Desktop Implementation Plan
+# SceneForge Implementation Plan
 
 ## Goal
 

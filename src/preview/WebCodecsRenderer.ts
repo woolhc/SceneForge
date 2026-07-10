@@ -1,4 +1,8 @@
-import { sampleAllKeyframes } from "../editor/keyframes";
+import { compileRenderGraph } from "../renderGraph/compileRenderGraph";
+import { evaluateFrame } from "../renderGraph/evaluateFrame";
+import { projectFrameToEngineState } from "../renderGraph/projectFrameToEngineState";
+import type { EvaluatedFrame, EvaluatedVisualLayer, RenderGraph } from "../renderGraph/types";
+import { positionVisualLayerBox } from "../renderGraph/visualLayout";
 import { getLutData } from "../luts";
 import type { Clip, MediaSource, Project } from "../types";
 import type { EngineState, PreviewRenderer } from "./PreviewRenderer";
@@ -49,18 +53,6 @@ type DataStreamCtor = {
   };
 };
 
-function visualTrackIds(project: Project): string[] {
-  return project.tracks
-    .filter((track) => track.kind === "video" || track.kind === "image")
-    .sort((a, b) => b.order - a.order)
-    .map((track) => track.id);
-}
-
-function mediaForClip(project: Project, clip: Clip | null): MediaSource | null {
-  if (!clip?.sourceId) return null;
-  return project.media.find((media) => media.id === clip.sourceId) ?? null;
-}
-
 export function canUseWebCodecsRenderer() {
   return (
     typeof window !== "undefined" &&
@@ -74,6 +66,7 @@ export class WebCodecsRenderer implements PreviewRenderer {
   onActiveVideoChange: ((el: HTMLVideoElement | HTMLImageElement) => void) | null = null;
 
   private project: Project | null = null;
+  private renderGraph: RenderGraph | null = null;
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D | null = null;
   private video: HTMLVideoElement;
@@ -119,6 +112,7 @@ export class WebCodecsRenderer implements PreviewRenderer {
   setProject(project: Project | null) {
     const previousProjectId = this.project?.id ?? null;
     this.project = project;
+    this.renderGraph = project ? compileRenderGraph(project) : null;
     if (!project || previousProjectId !== project.id) {
       this.currentClipId = null;
       this.decodedClip = null;
@@ -174,8 +168,11 @@ export class WebCodecsRenderer implements PreviewRenderer {
   }
 
   getDuration() {
-    if (!this.project || this.project.clips.length === 0) return 0;
-    return Math.max(...this.project.clips.map((clip) => clip.startOnTrack + clip.duration));
+    return this.renderGraph?.duration ?? 0;
+  }
+
+  private evaluatedFrame(): EvaluatedFrame | null {
+    return this.renderGraph ? evaluateFrame(this.renderGraph, this.currentTime) : null;
   }
 
   setClipVolume(_clipId: string, _volume: number) {}
@@ -219,31 +216,27 @@ export class WebCodecsRenderer implements PreviewRenderer {
   };
 
   private activeBaseClip(): Clip | null {
-    return this.activeVisualClips()[0] ?? null;
+    return this.evaluatedFrame()?.visualLayers[0]?.clip ?? null;
+  }
+
+  private activeBaseLayer(): EvaluatedVisualLayer | null {
+    return this.evaluatedFrame()?.visualLayers[0] ?? null;
   }
 
   private activeOverlayClips(): Clip[] {
-    return this.activeVisualClips().slice(1);
+    return (this.evaluatedFrame()?.visualLayers ?? []).slice(1).map((layer) => layer.clip);
   }
 
-  private activeVisualClips(): Clip[] {
-    if (!this.project) return [];
-    const trackIds = visualTrackIds(this.project);
-    return this.project.clips
-      .filter(
-        (clip) =>
-          trackIds.includes(clip.trackId) &&
-          this.currentTime >= clip.startOnTrack &&
-          this.currentTime < clip.startOnTrack + clip.duration,
-      )
-      .sort((a, b) => trackIds.indexOf(a.trackId) - trackIds.indexOf(b.trackId));
+  private activeVisualLayers(): EvaluatedVisualLayer[] {
+    return this.evaluatedFrame()?.visualLayers ?? [];
   }
 
   private syncVideoElement() {
     if (!this.project) return null;
-    const clip = this.activeBaseClip();
-    const media = mediaForClip(this.project, clip);
-    if (!clip || !media) {
+    const layer = this.activeVisualLayers()[0] ?? null;
+    const clip = layer?.clip ?? null;
+    const media = layer?.media ?? null;
+    if (!clip || !media || !layer) {
       this.currentClipId = null;
       this.ctx?.clearRect(0, 0, this.canvas.width, this.canvas.height);
       return null;
@@ -262,8 +255,7 @@ export class WebCodecsRenderer implements PreviewRenderer {
       this.lastDecodedSampleNumber = null;
       this.onActiveVideoChange?.(this.video);
     }
-    const rel = Math.max(0, this.currentTime - clip.startOnTrack);
-    const sourceTime = clip.sourceIn + rel * Math.max(0.25, Math.abs(clip.speed || 1));
+    const sourceTime = layer.sourceTime;
     if (Number.isFinite(sourceTime) && Math.abs(this.video.currentTime - sourceTime) > 0.12) {
       this.video.currentTime = sourceTime;
     }
@@ -281,7 +273,7 @@ export class WebCodecsRenderer implements PreviewRenderer {
       }
       if (!this.decodedClip) return;
       await this.decodeNearestFrame(this.decodedClip, aligned.sourceTime);
-      await Promise.all(this.activeVisualClips().map((clip) => this.ensureLutForClip(clip)));
+      await Promise.all(this.activeVisualLayers().map((layer) => this.ensureLutForClip(layer.clip)));
     } catch (error) {
       console.warn("WebCodecs preview failed; falling back to HTML video canvas", error);
       this.webCodecsFailed = true;
@@ -373,7 +365,17 @@ export class WebCodecsRenderer implements PreviewRenderer {
   }
 
   private drawBaseImage(source: CanvasImageSource) {
-    const baseClip = this.activeBaseClip();
+    const baseLayer = this.activeBaseLayer();
+    const baseClip = baseLayer?.clip ?? null;
+    if (!baseLayer || !baseClip) return;
+    const scale = Math.max(0.01, baseLayer.scale / 100);
+    const layout = positionVisualLayerBox(
+      baseLayer,
+      this.canvas.width,
+      this.canvas.height,
+      this.canvas.width * scale,
+      this.canvas.height * scale,
+    );
     if (this.compositor) {
       this.compositor.resize(this.canvas.width || 1, this.canvas.height || 1);
       this.compositor.clear();
@@ -381,12 +383,12 @@ export class WebCodecsRenderer implements PreviewRenderer {
         this.webglSource(source),
         layerParamsForClip(
           baseClip,
-          this.canvas.width / 2,
-          this.canvas.height / 2,
-          this.canvas.width,
-          this.canvas.height,
-          1,
-          0,
+          layout.centerX,
+          layout.centerY,
+          layout.width,
+          layout.height,
+          layout.opacity,
+          layout.rotationRadians,
           this.lutForClip(baseClip),
         ),
       );
@@ -395,8 +397,14 @@ export class WebCodecsRenderer implements PreviewRenderer {
     const ctx = this.ctx;
     if (!ctx) return;
     ctx.save();
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+    ctx.globalAlpha = layout.opacity;
     ctx.filter = canvasFilter(baseClip);
-    ctx.drawImage(source, 0, 0, this.canvas.width, this.canvas.height);
+    ctx.translate(layout.centerX, layout.centerY);
+    ctx.rotate(layout.rotationRadians);
+    applyClipPath(ctx, baseClip, layout.width, layout.height);
+    ctx.drawImage(source, -layout.width / 2, -layout.height / 2, layout.width, layout.height);
     ctx.restore();
   }
 
@@ -418,7 +426,8 @@ export class WebCodecsRenderer implements PreviewRenderer {
 
   private syncOverlayElements() {
     if (!this.project) return;
-    const activeIds = new Set(this.activeOverlayClips().map((clip) => clip.id));
+    const overlayLayers = this.activeVisualLayers().slice(1);
+    const activeIds = new Set(overlayLayers.map((layer) => layer.id));
     for (const [clipId, element] of this.overlayElements) {
       if (activeIds.has(clipId)) continue;
       if (element instanceof HTMLVideoElement) {
@@ -429,8 +438,9 @@ export class WebCodecsRenderer implements PreviewRenderer {
       this.overlayElements.delete(clipId);
     }
 
-    for (const clip of this.activeOverlayClips()) {
-      const media = mediaForClip(this.project, clip);
+    for (const layer of overlayLayers) {
+      const clip = layer.clip;
+      const media = layer.media;
       if (!media) continue;
       const src = media.proxyPath
         ? this.resolveLocal(media.proxyPath)
@@ -456,8 +466,7 @@ export class WebCodecsRenderer implements PreviewRenderer {
         if (element.src !== src) element.src = src;
       } else {
         if (element.currentSrc !== src && element.src !== src) element.src = src;
-        const rel = Math.max(0, this.currentTime - clip.startOnTrack);
-        const sourceTime = clip.sourceIn + rel * Math.max(0.25, Math.abs(clip.speed || 1));
+        const sourceTime = layer.sourceTime;
         if (Number.isFinite(sourceTime) && Math.abs(element.currentTime - sourceTime) > 0.12) {
           element.currentTime = sourceTime;
         }
@@ -468,14 +477,12 @@ export class WebCodecsRenderer implements PreviewRenderer {
   }
 
   private drawOverlays() {
-    for (const clip of this.activeOverlayClips()) {
+    for (const layer of this.activeVisualLayers().slice(1)) {
+      const clip = layer.clip;
       const element = this.overlayElements.get(clip.id);
       if (!element || !mediaElementReady(element)) continue;
-      const transform = clip.transform;
-      const rel = Math.max(0, this.currentTime - clip.startOnTrack);
-      const sampled = sampleAllKeyframes(clip.keyframes, rel);
-      const scale = Math.max(0.01, (sampled.scale ?? transform?.scale ?? 100) / 100);
-      const opacity = Math.max(0, Math.min(1, (sampled.opacity ?? transform?.opacity ?? 100) / 100));
+      const scale = Math.max(0.01, layer.scale / 100);
+      const opacity = layer.effectiveOpacity;
       const maxWidth = this.canvas.width * scale;
       const maxHeight = this.canvas.height * scale;
       const intrinsicWidth =
@@ -486,21 +493,25 @@ export class WebCodecsRenderer implements PreviewRenderer {
       const fit = Math.min(maxWidth / intrinsicWidth, maxHeight / intrinsicHeight);
       const drawWidth = intrinsicWidth * fit;
       const drawHeight = intrinsicHeight * fit;
-      const x = (this.canvas.width - drawWidth) * Math.max(0, Math.min(1, (sampled.x ?? transform?.x ?? 50) / 100));
-      const y = (this.canvas.height - drawHeight) * Math.max(0, Math.min(1, (sampled.y ?? transform?.y ?? 50) / 100));
-      const rotation = ((sampled.rotation ?? transform?.rotation ?? 0) * Math.PI) / 180;
+      const layout = positionVisualLayerBox(
+        layer,
+        this.canvas.width,
+        this.canvas.height,
+        drawWidth,
+        drawHeight,
+      );
 
       if (this.compositor) {
         this.compositor.drawLayer(
           element,
           layerParamsForClip(
             clip,
-            x + drawWidth / 2,
-            y + drawHeight / 2,
-            drawWidth,
-            drawHeight,
-            opacity,
-            rotation,
+            layout.centerX,
+            layout.centerY,
+            layout.width,
+            layout.height,
+            layout.opacity,
+            layout.rotationRadians,
             this.lutForClip(clip),
           ),
         );
@@ -510,26 +521,31 @@ export class WebCodecsRenderer implements PreviewRenderer {
       const ctx = this.ctx;
       if (!ctx) continue;
       ctx.save();
-      ctx.globalAlpha = opacity;
+      ctx.globalAlpha = layout.opacity;
       ctx.filter = canvasFilter(clip);
-      ctx.translate(x + drawWidth / 2, y + drawHeight / 2);
-      ctx.rotate(rotation);
-      applyClipPath(ctx, clip, drawWidth, drawHeight);
-      ctx.drawImage(element, -drawWidth / 2, -drawHeight / 2, drawWidth, drawHeight);
+      ctx.translate(layout.centerX, layout.centerY);
+      ctx.rotate(layout.rotationRadians);
+      applyClipPath(ctx, clip, layout.width, layout.height);
+      ctx.drawImage(
+        element,
+        -layout.width / 2,
+        -layout.height / 2,
+        layout.width,
+        layout.height,
+      );
       ctx.restore();
     }
   }
 
   private publish() {
-    const activeVideoClip = this.activeBaseClip();
-    const activeOverlayClips = this.activeOverlayClips();
+    const frame = this.evaluatedFrame();
+    const projection = frame
+      ? projectFrameToEngineState(frame)
+      : { activeVideoClip: null, activeOverlayClips: [], activeSubtitleClips: [] };
     this.onTick({
       currentTime: this.currentTime,
       playing: this.playing,
-      // WebCodecs 路径不渲染字幕（字幕由 DOM 叠层 StageSubtitleLayer 处理）
-      activeSubtitleClips: [],
-      activeVideoClip,
-      activeOverlayClips,
+      ...projection,
     });
   }
 
@@ -578,7 +594,7 @@ function applyClipPath(
       -drawHeight / 2 + drawHeight * mask.cy,
       Math.max(1, (drawWidth * mask.width) / 2),
       Math.max(1, (drawHeight * mask.height) / 2),
-      mask.rotation,
+      (mask.rotation * Math.PI) / 180,
       0,
       Math.PI * 2,
     );

@@ -2,9 +2,13 @@ mod ai;
 mod asr;
 mod commands;
 mod ffmpeg;
+mod ffmpeg_expression;
 mod lut_data;
 mod models;
 mod pexels;
+mod render_graph;
+mod render_plan;
+mod source_window;
 mod storage;
 mod temp;
 mod tts;
@@ -68,14 +72,14 @@ pub fn run() {
             commands::cancel_render,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running SceneScript Desktop");
+        .expect("error while running SceneForge");
 }
 
 /// 用平台原生消息框显示致命错误（不依赖 Tauri runtime）
 #[cfg(target_os = "macos")]
 fn show_fatal_dialog(msg: &str) {
     let _ = std::process::Command::new("osascript")
-        .args(["-e", &format!("display dialog \"{}\" buttons {{\"退出\"}} default button 1 with title \"SceneScript Desktop\" with icon stop", msg.replace('"', "\\\""))])
+        .args(["-e", &format!("display dialog \"{}\" buttons {{\"退出\"}} default button 1 with title \"SceneForge\" with icon stop", msg.replace('"', "\\\""))])
         .status();
 }
 

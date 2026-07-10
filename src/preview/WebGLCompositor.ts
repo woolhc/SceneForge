@@ -288,7 +288,7 @@ export function layerParamsForClip(
     maskCy: mask?.cy ?? 0.5,
     maskWidth: mask?.width ?? 1,
     maskHeight: mask?.height ?? 1,
-    maskRotation: mask?.rotation ?? 0,
+    maskRotation: ((mask?.rotation ?? 0) * Math.PI) / 180,
     maskFeather: mask?.feather ?? 0,
     maskInvert: mask?.invert ?? false,
     lutData,

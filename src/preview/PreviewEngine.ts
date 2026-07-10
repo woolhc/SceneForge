@@ -1,27 +1,12 @@
-import type { Clip, MediaSource, Project, TrackKind } from "../types";
-import { sampleAllKeyframes } from "../editor/keyframes";
-import { speedAtTimelineTime, timelineToSourceTime } from "../editor/speedCurve";
-import { transitionDuration, transitionName } from "../editor/transitions";
+import type { Clip, MediaSource, Project } from "../types";
+import { projectOutputDuration } from "../editor/projectDuration";
+import { compileRenderGraph } from "../renderGraph/compileRenderGraph";
+import { evaluateFrame } from "../renderGraph/evaluateFrame";
+import { projectFrameToEngineState } from "../renderGraph/projectFrameToEngineState";
+import type { EvaluatedFrame, RenderGraph } from "../renderGraph/types";
+import { visualLayerCssStyle } from "../renderGraph/visualLayout";
 import { MediaElementPool, type PooledMedia } from "./MediaElementPool";
 import type { EngineState, PreviewRenderer } from "./PreviewRenderer";
-
-function sourceDuration(clip: Clip): number {
-  return Math.max(0, clip.sourceOut - clip.sourceIn);
-}
-
-function sourceTimeAtTimeline(clip: Clip, rel: number): number {
-  if (clip.speedCurve && clip.speedCurve.length > 0) {
-    return clip.sourceIn + timelineToSourceTime(clip.speedCurve, sourceDuration(clip), rel);
-  }
-  return clip.sourceIn + Math.max(0, rel) * Math.abs(clip.speed);
-}
-
-function effectiveSpeed(clip: Clip, rel = 0): number {
-  if (clip.speedCurve && clip.speedCurve.length > 0) {
-    return Math.min(16, Math.max(0.0625, speedAtTimelineTime(clip.speedCurve, sourceDuration(clip), rel)));
-  }
-  return Math.min(4, Math.max(0.25, Math.abs(clip.speed)));
-}
 
 function previewCssFilter(clip: Clip | null): string {
   if (!clip) return "none";
@@ -75,32 +60,6 @@ function cropToClipPath(crop: Clip["crop"] | null | undefined): string {
   return `inset(${top}% ${right}% ${bottom}% ${left}%)`;
 }
 
-/** 入场/出场转场近似：对 fade/fadeblack/fadewhite 类转场在边界时间窗口应用 opacity 渐变。
- *  其他类型（wipe/slide/circle 等）CSS 无法简单模拟，返回 1（不影响 opacity）。 */
-function transitionOpacityMultiplier(clip: Clip, rel: number): number {
-  const dur = clip.duration;
-  if (dur <= 0) return 1;
-  let mult = 1;
-  const fadeKinds = ["fade", "fadeblack", "fadewhite"];
-  // 入场转场：clip 开始时，前 N 秒 opacity 从 0 渐变到 1
-  const inName = transitionName(clip.transitionIn);
-  if (inName && inName !== "none") {
-    const t = transitionDuration(clip.transitionIn, 0.5);
-    if (t > 0.001 && rel < t && fadeKinds.includes(inName)) {
-      mult *= rel / t;
-    }
-  }
-  // 出场转场：clip 结束时，后 N 秒 opacity 从 1 渐变到 0
-  const outName = transitionName(clip.transitionOut);
-  if (outName && outName !== "none") {
-    const t = transitionDuration(clip.transitionOut, 0.5);
-    if (t > 0.001 && rel > dur - t && fadeKinds.includes(outName)) {
-      mult *= Math.max(0, (dur - rel) / t);
-    }
-  }
-  return Math.max(0, Math.min(1, mult));
-}
-
 /**
  * 实时预览引擎：按统一的 currentTime 时钟，同步调度
  *  - 视频轨：主 <video> 元素 + 一个预加载 <video>（提前加载下一个 clip）
@@ -111,6 +70,7 @@ function transitionOpacityMultiplier(clip: Clip, rel: number): number {
  */
 export class PreviewEngine implements PreviewRenderer {
   private project: Project | null = null;
+  private renderGraph: RenderGraph | null = null;
   private mediaPool: MediaElementPool;
   private videoEl: HTMLVideoElement | HTMLImageElement | null = null;
   private audioCtx: AudioContext | null = null;
@@ -173,6 +133,7 @@ export class PreviewEngine implements PreviewRenderer {
     const ratioChanged = this.project?.ratio !== project?.ratio;
     const prevId = this.project?.id;
     this.project = project;
+    this.renderGraph = project ? compileRenderGraph(project) : null;
     if (ratioChanged || prevId !== project?.id) {
       this.pause();
       this.currentTime = 0;
@@ -197,8 +158,11 @@ export class PreviewEngine implements PreviewRenderer {
   }
 
   getDuration(): number {
-    if (!this.project || this.project.clips.length === 0) return 0;
-    return Math.max(...this.project.clips.map((c) => c.startOnTrack + c.duration));
+    return this.renderGraph?.duration ?? projectOutputDuration(this.project);
+  }
+
+  private evaluatedFrame(): EvaluatedFrame | null {
+    return this.renderGraph ? evaluateFrame(this.renderGraph, this.currentTime) : null;
   }
 
   play() {
@@ -334,27 +298,14 @@ export class PreviewEngine implements PreviewRenderer {
   /** T4.9+: 播放中实时更新活跃音频 clip 的 gain（关键帧 + fadeIn/fadeOut） */
   private updateAudioGainsLive() {
     if (!this.project) return;
+    const audioLayers = new Map((this.evaluatedFrame()?.audioLayers ?? []).map((layer) => [layer.id, layer]));
     for (const [clipId, gain] of this.clipGainNodes) {
-      const clip = this.project.clips.find((c) => c.id === clipId);
-      if (!clip) continue;
-      const track = this.project.tracks.find((t) => t.id === clip.trackId);
-      if (track?.muted || track?.hidden) {
+      const layer = audioLayers.get(clipId);
+      if (!layer) {
         gain.gain.value = 0;
         continue;
       }
-      const rel = this.currentTime - clip.startOnTrack;
-      if (rel < 0 || rel > clip.duration) continue;
-      const sampled = sampleAllKeyframes(clip.keyframes, rel);
-      let volume = sampled.volume ?? clip.volume;
-      const fadeIn = Math.max(0, clip.fadeIn ?? 0);
-      const fadeOut = Math.max(0, clip.fadeOut ?? 0);
-      if (fadeIn > 0.001 && rel < fadeIn) {
-        volume = volume * (rel / fadeIn);
-      } else if (fadeOut > 0.001 && rel > clip.duration - fadeOut) {
-        const remaining = Math.max(0, clip.duration - rel);
-        volume = volume * (remaining / fadeOut);
-      }
-      gain.gain.value = Math.min(2, Math.max(0, volume));
+      gain.gain.value = layer.gain;
     }
   }
 
@@ -378,11 +329,12 @@ export class PreviewEngine implements PreviewRenderer {
 
  private async applyVideoAlignmentAsync(force: boolean) {
    if (!this.project) return;
-   const clip = this.findAllClipsAt(this.currentTime, ["video", "image"])[0] ?? null;
-   const media = clip ? this.findMedia(clip.sourceId) : null;
+   const evaluated = this.evaluatedFrame()?.visualLayers[0] ?? null;
+   const clip = evaluated?.clip ?? null;
+   const media = evaluated?.media ?? null;
    const src = media ? this.resolveSrc(media) : null;
 
-   if (!clip || !media || !src) {
+   if (!evaluated || !clip || !media || !src) {
      this.currentVideoClipId = null;
      this.activeBaseClip = null;
      for (const item of this.mediaPool.values()) {
@@ -396,10 +348,9 @@ export class PreviewEngine implements PreviewRenderer {
    }
 
    const kind = media.kind === "image" ? "image" : "video";
-   const rel = this.currentTime - clip.startOnTrack;
-   const rate = effectiveSpeed(clip, rel);
-   const targetSourceTime = sourceTimeAtTimeline(clip, Math.max(0, rel));
-   const kf = sampleAllKeyframes(clip.keyframes, rel);
+   const rel = evaluated.relativeTime;
+   const rate = evaluated.speed;
+   const targetSourceTime = evaluated.sourceTime;
    const previousClip = this.activeBaseClip;
    const sameMediaContinuous =
      previousClip &&
@@ -407,24 +358,24 @@ export class PreviewEngine implements PreviewRenderer {
      !clip.speedCurve?.length &&
      !previousClip.speedCurve?.length &&
      Math.abs(clip.sourceIn - previousClip.sourceOut) < 0.05 &&
-     Math.abs(rate - effectiveSpeed(previousClip, previousClip.duration)) < 0.01;
+     Math.abs(rate - Math.max(0.0001, Math.abs(previousClip.speed || 1))) < 0.01;
 
    const item = await this.mediaPool.acquire(media.id, src, kind);
    item.el.style.zIndex = "3";
    item.el.style.objectFit = "cover";
    // base 层也读取 clip.transform（图片底层需要支持位置/缩放/旋转/不透明度）
-   const tf = clip.transform;
-   const x = kf.x ?? tf?.x ?? 50;
-   const y = kf.y ?? tf?.y ?? 50;
-   const scale = (kf.scale ?? tf?.scale ?? 100) / 100;
-   const rotation = kf.rotation ?? tf?.rotation ?? 0;
+   const layout = visualLayerCssStyle(evaluated);
+   item.el.style.inset = "auto";
+   item.el.style.left = layout.left;
+   item.el.style.top = layout.top;
+   item.el.style.width = layout.width;
+   item.el.style.height = layout.height;
    item.el.style.transformOrigin = "center center";
-   item.el.style.transform = `translate(${x - 50}%, ${y - 50}%) rotate(${rotation}deg) scale(${scale})`;
+   item.el.style.transform = layout.transform;
    // T4.x: 裁剪 + 入场/出场转场近似（fade 类）
    const cropPath = cropToClipPath(clip.crop);
-   const transOpacity = transitionOpacityMultiplier(clip, rel);
    item.el.style.clipPath = cropPath || "";
-   item.el.style.opacity = String(((kf.opacity ?? tf?.opacity ?? 100) / 100) * transOpacity);
+   item.el.style.opacity = layout.opacity;
    item.el.style.filter = previewCssFilter(clip);
 
    if (kind === "video") {
@@ -434,20 +385,9 @@ export class PreviewEngine implements PreviewRenderer {
      if (force || !sameMediaContinuous || Math.abs(video.currentTime - targetSourceTime) > seekThreshold) {
        await this.mediaPool.seekTo(item, Math.min(Math.max(0, targetSourceTime), Math.max(0, (media.duration || 0) - 0.05)));
      }
-     const track = this.project.tracks.find((t) => t.id === clip.trackId);
      if (item.gain) {
-       // 基础音量：关键帧采样 > 静态 volume
-       let volume = kf.volume ?? clip.volume;
-       // T4.9: 视频轨 fadeIn/fadeOut（之前仅音频轨应用）
-       const fadeIn = Math.max(0, clip.fadeIn ?? 0);
-       const fadeOut = Math.max(0, clip.fadeOut ?? 0);
-       if (fadeIn > 0.001 && rel < fadeIn) {
-         volume = volume * (rel / fadeIn);
-       } else if (fadeOut > 0.001 && rel > clip.duration - fadeOut) {
-         const remaining = Math.max(0, clip.duration - rel);
-         volume = volume * (remaining / fadeOut);
-       }
-       item.gain.gain.value = track?.muted || track?.hidden ? 0 : Math.min(2, Math.max(0, volume));
+       const audioLayer = this.evaluatedFrame()?.audioLayers.find((layer) => layer.id === clip.id);
+       item.gain.gain.value = audioLayer?.gain ?? 0;
        this.clipGainNodes.set(clip.id, item.gain);
      }
      if (this.playing && video.paused) void video.play().catch(() => {});
@@ -493,10 +433,12 @@ export class PreviewEngine implements PreviewRenderer {
       const item = await this.mediaPool.acquire(media.id, src, kind);
       if (item.el !== this.videoEl) item.el.style.opacity = "0";
       if (kind === "video") {
-        const rel = Math.max(0, this.currentTime - clip.startOnTrack);
-        const target = sourceTimeAtTimeline(clip, rel);
+        const evaluationTime = Math.max(this.currentTime, clip.startOnTrack);
+        const target = this.renderGraph
+          ? evaluateFrame(this.renderGraph, evaluationTime).visualLayers.find((layer) => layer.id === clip.id)?.sourceTime
+          : undefined;
         if (!item.seeked || item.seekTarget === null) {
-          await this.mediaPool.seekTo(item, Math.max(0, target));
+          await this.mediaPool.seekTo(item, Math.max(0, target ?? clip.sourceIn));
         }
       }
     }
@@ -523,8 +465,8 @@ export class PreviewEngine implements PreviewRenderer {
    */
   private syncOverlays() {
     if (!this.project) return;
-    const overlays = this.findAllClipsAt(this.currentTime, ["video", "image"]).slice(1);
-    const activeIds = new Set(overlays.map((c) => c.id));
+    const overlays = this.evaluatedFrame()?.visualLayers.slice(1) ?? [];
+    const activeIds = new Set(overlays.map((layer) => layer.id));
     const now = performance.now();
 
     // 1. 移除不再活跃的 overlay video
@@ -544,10 +486,11 @@ export class PreviewEngine implements PreviewRenderer {
     // 2. 为活跃 clip 分配 video（上限 3）
     const MAX_OVERLAYS = 3;
     let allocated = 0;
-    for (const clip of overlays) {
+    for (const evaluated of overlays) {
       if (allocated >= MAX_OVERLAYS) break;
       allocated++;
-      const media = this.findMedia(clip.sourceId);
+      const clip = evaluated.clip;
+      const media = evaluated.media;
       const src = media ? this.resolveSrc(media) : null;
       if (!src) continue;
 
@@ -579,29 +522,21 @@ export class PreviewEngine implements PreviewRenderer {
       // 应用 transform（位置/缩放/不透明度/混合模式）
       // T4.2: 有 keyframes 时按当前时间采样覆盖
       const tf = clip.transform;
-      const rel = this.currentTime - clip.startOnTrack;
-      const kf = sampleAllKeyframes(clip.keyframes, rel);
-      const x = kf.x ?? tf?.x ?? 50;
-      const y = kf.y ?? tf?.y ?? 50;
-      const scaleVal = kf.scale ?? tf?.scale ?? 100;
-      const scale = scaleVal / 100;
-      const opacity = (kf.opacity ?? tf?.opacity ?? 100) / 100;
-      const rotation = kf.rotation ?? tf?.rotation ?? 0;
+      const layout = visualLayerCssStyle(evaluated);
       // T4.4: 蒙版（CSS clip-path / mask 近似）
       const m = clip.mask;
       const cssFilter = previewCssFilter(clip);
       // T4.x: 裁剪（crop）+ 入场/出场转场近似（fade 类）
       const cropPath = cropToClipPath(clip.crop);
-      const transOpacity = transitionOpacityMultiplier(clip, rel);
-      const finalOpacity = Math.min(1, opacity) * transOpacity;
-      const styleSignature = JSON.stringify({ x, y, scaleVal, scale, opacity: finalOpacity, rotation, mix: tf?.mix ?? "", mask: m ?? null, cssFilter, cropPath });
+      const styleSignature = JSON.stringify({ layout, mix: tf?.mix ?? "", mask: m ?? null, cssFilter, cropPath });
       if (this.overlayStyleSignatures.get(clip.id) !== styleSignature) {
         this.overlayStyleSignatures.set(clip.id, styleSignature);
-        v.style.left = `${x}%`;
-        v.style.top = `${y}%`;
-        v.style.width = `${scaleVal}%`;
-        v.style.transform = `translate(-50%, -50%) rotate(${rotation}deg) scale(${scale})`;
-        v.style.opacity = String(finalOpacity);
+        v.style.left = layout.left;
+        v.style.top = layout.top;
+        v.style.width = layout.width;
+        v.style.height = layout.height;
+        v.style.transform = layout.transform;
+        v.style.opacity = layout.opacity;
         v.style.filter = cssFilter;
         v.style.clipPath = cropPath || "";
         if (tf?.mix) {
@@ -613,8 +548,8 @@ export class PreviewEngine implements PreviewRenderer {
       }
 
       // seek 追赶（同主 video 逻辑，rel 已在上面计算）
-      const targetSourceTime = sourceTimeAtTimeline(clip, Math.max(0, rel));
-      const rate = effectiveSpeed(clip, rel);
+      const targetSourceTime = evaluated.sourceTime;
+      const rate = evaluated.speed;
       if (v instanceof HTMLVideoElement) {
         v.playbackRate = rate;
         const seekThreshold = 0.3 + rate * 0.2;
@@ -772,19 +707,21 @@ export class PreviewEngine implements PreviewRenderer {
         const clipEnd = clip.startOnTrack + clip.duration;
         if (clipEnd <= this.currentTime) continue;
         const offsetIntoClip = Math.max(0, this.currentTime - clip.startOnTrack);
-        // T4.3: 曲线变速支持 -- 用 sourceTimeAtTimeline 精确映射，effectiveSpeed 处理 speedCurve
-        const sourceOffset = sourceTimeAtTimeline(clip, offsetIntoClip);
+        const evaluationTime = Math.max(this.currentTime, clip.startOnTrack);
+        const evaluated = this.renderGraph
+          ? evaluateFrame(this.renderGraph, evaluationTime).audioLayers.find((layer) => layer.id === clip.id)
+          : undefined;
+        if (!evaluated) continue;
+        const sourceOffset = evaluated.sourceTime;
         const whenOffset = Math.max(0, clip.startOnTrack - this.currentTime);
         const remainingDuration = clip.duration - offsetIntoClip;
 
         const node = ctx.createBufferSource();
         node.buffer = buffer;
         // playbackRate 在 start 时固定，speedCurve 用瞬时速度（近似）
-        node.playbackRate.value = effectiveSpeed(clip, offsetIntoClip);
+        node.playbackRate.value = evaluated.speed;
         const gain = ctx.createGain();
-        // T4.9: 音量上限对齐 UI 200%（之前 clamp ≤1）
-        const sampled = sampleAllKeyframes(clip.keyframes, offsetIntoClip);
-        const vol = Math.min(2, Math.max(0, sampled.volume ?? clip.volume));
+        const vol = evaluated.volume;
         // T4.9: fadeIn/fadeOut 用 linearRampToValueAtTime
         const fadeIn = Math.max(0, clip.fadeIn ?? 0);
         const fadeOut = Math.max(0, clip.fadeOut ?? 0);
@@ -850,10 +787,10 @@ export class PreviewEngine implements PreviewRenderer {
       });
       return;
     }
-    // 多字幕轨：用 findAllClipsAt 收集所有活跃字幕 clip（按 track order 降序：底层在前）
-    const allSubs = this.findAllClipsAt(this.currentTime, ["subtitle"]);
-    // 字幕需要 order 小=画面上层=数组前，反转
-    const sortedSubs = allSubs.slice().reverse();
+    const frame = this.evaluatedFrame();
+    if (!frame) return;
+    const projection = projectFrameToEngineState(frame);
+    const sortedSubs = projection.activeSubtitleClips;
     // 引用比较：clip id 集合不变则复用旧数组，避免每帧触发 React 重渲染
     const subIds = sortedSubs.map((c) => c.id).join("|");
     const activeSubtitleClips = subIds === this.lastPublishedSubIds
@@ -864,9 +801,8 @@ export class PreviewEngine implements PreviewRenderer {
       this.lastPublishedSubs = sortedSubs;
     }
     // 所有活跃画面 clip（视频轨 + 图片轨，按 order 降序：底层在前）
-    const allVideoClips = this.findAllClipsAt(this.currentTime, ["video", "image"]);
-    const baseClip = allVideoClips[0] || null;
-    const overlayCandidates = allVideoClips.slice(1);
+    const baseClip = projection.activeVideoClip;
+    const overlayCandidates = projection.activeOverlayClips;
     const overlayIds = overlayCandidates.map((clip) => clip.id).join("|");
     const overlayClips = overlayIds === this.lastPublishedOverlayIds
       ? this.lastPublishedOverlayClips
@@ -884,29 +820,6 @@ export class PreviewEngine implements PreviewRenderer {
       activeVideoClip,
       activeOverlayClips: overlayClips,
     });
-  }
-
-  /** 找当前时间所有活跃的指定 kind clip（按轨道 order 降序：底层在前） */
-  private findAllClipsAt(time: number, kinds: TrackKind[]): Clip[] {
-    if (!this.project) return [];
-    // 收集该 kind 的所有轨道，按 order 降序（order 大=底层，排前面）
-    const tracks = this.project.tracks
-      .filter((t) => kinds.includes(t.kind) && !t.hidden)
-      .sort((a, b) => b.order - a.order);
-    const trackIds = new Set(tracks.map((t) => t.id));
-    const clips = this.project.clips.filter(
-      (clip) =>
-        trackIds.has(clip.trackId) &&
-        time >= clip.startOnTrack - 1e-3 &&
-        time < clip.startOnTrack + clip.duration - 1e-3,
-    );
-    // 按轨道 order 降序（底层在前）
-    clips.sort((a, b) => {
-      const oa = tracks.find((t) => t.id === a.trackId)?.order ?? 0;
-      const ob = tracks.find((t) => t.id === b.trackId)?.order ?? 0;
-      return ob - oa;
-    });
-    return clips;
   }
 
   private findTrack(trackId: string) {

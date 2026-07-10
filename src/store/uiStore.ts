@@ -1,8 +1,14 @@
 import { create } from "zustand";
 import type { ExportState } from "../panels/ExportDialog";
 import type { ContextMenuState } from "../timeline/ContextMenu";
-
-export type TabKind = "media" | "text" | "audio" | "transition";
+import {
+  defaultInspectorTabForTrack,
+  resolveInspectorTab,
+  type EditorMode,
+  type InspectorTab,
+  type ToolTab,
+} from "../editor/editorLayout";
+import type { TrackKind } from "../types";
 
 export type ToastType = "error" | "warning" | "info" | "success";
 
@@ -22,7 +28,10 @@ export interface Toast {
 }
 
 interface UiStore {
-  activeTab: TabKind;
+  editorMode: EditorMode;
+  activeToolTab: ToolTab;
+  activeInspectorTab: InspectorTab;
+  lastInspectorTabByTrackKind: Partial<Record<TrackKind, InspectorTab>>;
   showSettings: boolean;
   showAddTrackMenu: boolean;
   contextMenu: ContextMenuState | null;
@@ -35,7 +44,12 @@ interface UiStore {
   previewZoom: number;
   toasts: Toast[];
 
-  setActiveTab: (activeTab: TabKind) => void;
+  setEditorMode: (editorMode: EditorMode) => void;
+  resetEditorMode: () => void;
+  setActiveToolTab: (activeToolTab: ToolTab) => void;
+  setActiveInspectorTab: (activeInspectorTab: InspectorTab) => void;
+  setInspectorTabForTrack: (trackKind: TrackKind, activeInspectorTab: InspectorTab) => void;
+  activateInspectorForTrack: (trackKind: TrackKind) => void;
   setShowSettings: (showSettings: boolean | ((previous: boolean) => boolean)) => void;
   setShowAddTrackMenu: (showAddTrackMenu: boolean | ((previous: boolean) => boolean)) => void;
   setContextMenu: (contextMenu: ContextMenuState | null) => void;
@@ -56,7 +70,10 @@ function uid(prefix: string): string {
 }
 
 export const useUiStore = create<UiStore>((set) => ({
-  activeTab: "text",
+  editorMode: "professional",
+  activeToolTab: "media",
+  activeInspectorTab: "basic",
+  lastInspectorTabByTrackKind: {},
   showSettings: false,
   showAddTrackMenu: false,
   contextMenu: null,
@@ -69,7 +86,28 @@ export const useUiStore = create<UiStore>((set) => ({
   previewZoom: 100,
   toasts: [],
 
-  setActiveTab: (activeTab) => set({ activeTab }),
+  setEditorMode: (editorMode) => set({ editorMode }),
+  resetEditorMode: () => set({ editorMode: "professional" }),
+  setActiveToolTab: (activeToolTab) => set({ activeToolTab }),
+  setActiveInspectorTab: (activeInspectorTab) => set({ activeInspectorTab }),
+  setInspectorTabForTrack: (trackKind, requestedTab) =>
+    set((state) => {
+      const activeInspectorTab = resolveInspectorTab(trackKind, requestedTab);
+      return {
+        activeInspectorTab,
+        lastInspectorTabByTrackKind: {
+          ...state.lastInspectorTabByTrackKind,
+          [trackKind]: activeInspectorTab,
+        },
+      };
+    }),
+  activateInspectorForTrack: (trackKind) =>
+    set((state) => ({
+      activeInspectorTab: resolveInspectorTab(
+        trackKind,
+        state.lastInspectorTabByTrackKind[trackKind] ?? defaultInspectorTabForTrack(trackKind),
+      ),
+    })),
   setShowSettings: (showSettings) =>
     set((state) => ({
       showSettings: typeof showSettings === "function" ? showSettings(state.showSettings) : showSettings,

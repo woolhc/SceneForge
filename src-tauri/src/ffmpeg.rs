@@ -13,16 +13,65 @@ static H264_ENCODER: OnceLock<String> = OnceLock::new();
 static HEVC_ENCODER: OnceLock<String> = OnceLock::new();
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
-/// 在首次渲染时调用，预检测硬件编码器
-pub async fn init_hw_encoder() {
-    if H264_ENCODER.get().is_some() {
-        return;
+use crate::models::{Clip, FfmpegStatus, MediaSource, Project, TrackKind};
+use crate::ffmpeg_expression::{
+    compile_keyframe_expression, compile_opacity_alpha_filter,
+    compile_static_opacity_filter,
+};
+use crate::render_graph::compile_render_graph;
+use crate::render_plan::{
+    clips_for_indices, compile_render_plan, RenderUnit as PlannedRenderUnit,
+};
+use crate::source_window::{compile_source_window, SourceWindowPart};
+
+fn apply_source_window_filter(mut filter: String, part: &SourceWindowPart) -> String {
+    if part.reverse {
+        filter.push_str(",reverse");
     }
-    let encoder = detect_hw_encoder("h264").await;
-    let _ = H264_ENCODER.set(encoder);
+    if (part.speed - 1.0).abs() > f64::EPSILON {
+        filter.push_str(&format!(
+            ",setpts={:.6}*(PTS-STARTPTS)",
+            1.0 / part.speed
+        ));
+    } else {
+        filter.push_str(",setpts=PTS-STARTPTS");
+    }
+    filter
 }
 
-use crate::models::{Clip, FfmpegStatus, MediaSource, Project, TrackKind};
+fn compile_multi_part_source_filter(
+    input_index: usize,
+    parts: &[SourceWindowPart],
+) -> Option<(String, String)> {
+    if parts.len() <= 1 {
+        return None;
+    }
+    let input_labels = (0..parts.len())
+        .map(|part_index| format!("[src{input_index}in{part_index}]"))
+        .collect::<String>();
+    let mut filter = format!("[{input_index}:v]split={}{input_labels};", parts.len());
+    for (part_index, part) in parts.iter().enumerate() {
+        let part_filter = apply_source_window_filter(
+            format!(
+                "trim=start={:.6}:end={:.6}",
+                part.source_start, part.source_end
+            ),
+            part,
+        );
+        filter.push_str(&format!(
+            "[src{input_index}in{part_index}]{part_filter}[src{input_index}part{part_index}];"
+        ));
+    }
+    let part_labels = (0..parts.len())
+        .map(|part_index| format!("[src{input_index}part{part_index}]"))
+        .collect::<String>();
+    let output_label = format!("[src{input_index}]");
+    filter.push_str(&format!(
+        "{part_labels}concat=n={}:v=1:a=0{output_label};",
+        parts.len()
+    ));
+    Some((filter, output_label))
+}
 
 pub async fn run_with_timeout(cmd: &mut Command, secs: u64) -> anyhow::Result<Output> {
     cmd.kill_on_drop(true);
@@ -113,6 +162,22 @@ pub fn collect_mix_audio_clips(project: &Project) -> Vec<&Clip> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     audio_clips
+}
+
+#[cfg(test)]
+fn project_output_duration(project: &Project) -> f64 {
+    let visible_track_ids: std::collections::HashSet<&str> = project
+        .tracks
+        .iter()
+        .filter(|track| !track.hidden)
+        .map(|track| track.id.as_str())
+        .collect();
+    project
+        .clips
+        .iter()
+        .filter(|clip| visible_track_ids.contains(clip.track_id.as_str()))
+        .map(|clip| clip.start_on_track + clip.duration.max(0.0))
+        .fold(0.0_f64, f64::max)
 }
 
 pub async fn check_ffmpeg() -> FfmpegStatus {
@@ -733,59 +798,24 @@ pub async fn render_project_video(
         export_dimensions_for_project(project)
     };
 
-    // 收集视频轨 + 图片轨（图片轨叠加在视频轨之上）
-    let mut video_tracks: Vec<&crate::models::Track> = project
-        .tracks
-        .iter()
-        .filter(|t| (t.kind == TrackKind::Video || t.kind == TrackKind::Image) && !t.hidden)
-        .collect();
-    video_tracks.sort_by(|a, b| b.order.cmp(&a.order)); // order 大在前=底层
-    let video_track_ids: Vec<String> = video_tracks.iter().map(|t| t.id.clone()).collect();
-
-    let video_clips: Vec<&Clip> = project
-        .clips
-        .iter()
-        .filter(|c| video_track_ids.contains(&c.track_id))
-        .collect();
-
-    if video_clips.is_empty() {
-        anyhow::bail!("时间线上没有视频片段");
-    }
-
-    // 计算时间轴总时长
-    let total_duration = video_clips
-        .iter()
-        .map(|c| c.start_on_track + c.duration)
-        .fold(0.0_f64, f64::max);
-
-    // 切分时间段：收集所有 clip 的起止边界点
-    let mut boundaries: Vec<f64> = vec![0.0];
-    for clip in &video_clips {
-        boundaries.push(clip.start_on_track);
-        boundaries.push(clip.start_on_track + clip.duration);
-    }
-    boundaries.push(total_duration);
-    boundaries.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    boundaries.dedup_by(|a, b| (*a - *b).abs() < 0.01);
-
-    // 构造时间段：相邻边界之间为一段
-    let mut segments: Vec<(f64, f64)> = Vec::new();
-    for window in boundaries.windows(2) {
-        let start = window[0];
-        let end = window[1];
-        if end - start > 0.05 {
-            segments.push((start, end));
-        }
-    }
-    let render_units = build_render_units(
-        &video_clips,
-        total_duration,
+    let render_graph = compile_render_graph(project);
+    let render_plan = compile_render_plan(
+        &render_graph,
         project.render_config.transition_duration.max(0.1),
     );
+    if render_plan.visual_layer_indices.is_empty() {
+        anyhow::bail!("时间线上没有视频片段");
+    }
+    let total_duration = render_plan.duration;
 
-    if let Some(single_pass_graph) =
-        plan_single_pass_video_graph(project, &video_clips, &video_track_ids, total_duration)
-    {
+    if let Some(single_pass_plan) = render_plan.single_pass.as_ref() {
+        let single_pass_graph = SinglePassVideoGraph {
+            base_clips: clips_for_indices(&render_graph, &single_pass_plan.base_layer_indices),
+            overlay_clips: clips_for_indices(
+                &render_graph,
+                &single_pass_plan.overlay_layer_indices,
+            ),
+        };
         eprintln!(
             "渲染路径: 单遍 (base_clips={}, overlay_clips={})",
             single_pass_graph.base_clips.len(),
@@ -845,95 +875,100 @@ pub async fn render_project_video(
     tokio::fs::create_dir_all(&segment_dir).await?;
 
     eprintln!(
-        "渲染路径: 段渲染 (segments={}, total_duration={:.2}s)"
-    , segments.len(), total_duration);
+        "渲染路径: 段渲染 (segments={}, total_duration={:.2}s)",
+        render_plan.units.len(),
+        total_duration
+    );
     // 渲染每一段
     let mut segment_paths = Vec::new();
-    let mut rendered_segment_durations = Vec::new();
-    let total_segs = render_units.len();
-    for (seg_index, unit) in render_units.iter().enumerate() {
+    let total_segs = render_plan.units.len();
+    for (seg_index, unit) in render_plan.units.iter().enumerate() {
         check_cancel(cancel_flag)?;
         // T3.3: 段级进度（0-70% 分配给段渲染）
         if let Some(cb) = progress_cb {
             let percent = ((seg_index as f64 / total_segs.max(1) as f64) * 70.0) as u32;
             cb(percent, &format!("渲染片段 {}/{total_segs}", seg_index + 1));
         }
-        let (seg_start, seg_end, is_transition, boundary) = match unit {
-            RenderUnit::Normal { start, end } => (*start, *end, false, *start),
-            RenderUnit::Transition {
+        let (path, render_duration, active_clips) = match unit {
+            PlannedRenderUnit::Normal {
+                start,
+                end,
+                layer_indices,
+            } => {
+                let render_duration = end - start;
+                let active_clips = clips_for_indices(&render_graph, layer_indices);
+                let path = if active_clips.is_empty() {
+                    render_black_segment(
+                        &segment_dir,
+                        project,
+                        render_duration,
+                        seg_index,
+                        preview,
+                        &encoder,
+                        target_w,
+                        target_h,
+                    )
+                    .await?
+                } else {
+                    render_segment_with_overlay(
+                        cache_dir,
+                        &segment_dir,
+                        project,
+                        &active_clips,
+                        *start,
+                        render_duration,
+                        seg_index,
+                        preview,
+                        &encoder,
+                        target_w,
+                        target_h,
+                    )
+                    .await?
+                };
+                (path, render_duration, active_clips)
+            }
+            PlannedRenderUnit::Transition {
                 start,
                 boundary,
                 end,
-            } => (*start, *end, true, *boundary),
-        };
-        let render_duration = seg_end - seg_start;
-        let active_clips =
-            active_clips_for_window(&video_clips, &video_track_ids, seg_start, seg_end);
-
-        if is_transition {
-            let path = render_transition_unit(
-                cache_dir,
-                &segment_dir,
-                project,
-                &video_clips,
-                &video_track_ids,
-                seg_start,
-                boundary,
-                render_duration,
-                seg_index,
-                preview,
-                &encoder,
-                target_w,
-                target_h,
-                cancel_flag,
-            )
-            .await?;
-            if let Ok(meta) = tokio::fs::metadata(&path).await {
-                eprintln!(
-                    "段 {seg_index:03}: 类型=transition 时长={render_duration:.2}s 大小={}KB",
-                    meta.len() / 1024
-                );
+                previous_layer_indices,
+                next_layer_indices,
+                transition,
+            } => {
+                let render_duration = end - start;
+                let previous_clips = clips_for_indices(&render_graph, previous_layer_indices);
+                let next_clips = clips_for_indices(&render_graph, next_layer_indices);
+                let path = render_transition_unit(
+                    cache_dir,
+                    &segment_dir,
+                    project,
+                    &previous_clips,
+                    &next_clips,
+                    &transition.name,
+                    *start,
+                    *boundary,
+                    render_duration,
+                    seg_index,
+                    preview,
+                    &encoder,
+                    target_w,
+                    target_h,
+                    cancel_flag,
+                )
+                .await?;
+                if let Ok(meta) = tokio::fs::metadata(&path).await {
+                    eprintln!(
+                        "段 {seg_index:03}: 类型=transition 时长={render_duration:.2}s 大小={}KB",
+                        meta.len() / 1024
+                    );
+                }
+                segment_paths.push(path);
+                continue;
             }
-            segment_paths.push(path);
-            rendered_segment_durations.push(render_duration);
-            continue;
-        }
-
-        // 空段（无活跃 clip）：渲染纯黑背景，保证时间线连续
+        };
         if active_clips.is_empty() {
-            let path = render_black_segment(
-                &segment_dir,
-                project,
-                render_duration,
-                seg_index,
-                preview,
-                &encoder,
-                target_w,
-                target_h,
-            )
-            .await?;
-            eprintln!(
-                "段 {seg_index:03}: 类型=black 时长={render_duration:.2}s（空段）"
-            );
-            segment_paths.push(path);
-            rendered_segment_durations.push(render_duration);
-            continue;
+            eprintln!("段 {seg_index:03}: 类型=black 时长={render_duration:.2}s（空段）");
         }
-
-        let path = render_segment_with_overlay(
-            cache_dir,
-            &segment_dir,
-            project,
-            &active_clips,
-            seg_start,
-            render_duration,
-            seg_index,
-            preview,
-            &encoder,
-            target_w,
-            target_h,
-        )
-        .await?;
         // 诊断：记录每段输出文件大小 + ffprobe 时长
         if let Ok(meta) = tokio::fs::metadata(&path).await {
             let size_kb = meta.len() / 1024;
@@ -956,10 +991,9 @@ pub async fn render_project_video(
             );
         }
         segment_paths.push(path);
-        rendered_segment_durations.push(render_duration);
     }
 
-    // 合并所有段：有转场的相邻段用 xfade，否则 concat
+    // 转场已经渲染成独立片段，最终只需按计划顺序拼接。
     let render_dir = projects_dir.join(&project.id).join("renders");
     tokio::fs::create_dir_all(&render_dir).await?;
     let raw_output = render_dir.join(if preview {
@@ -968,11 +1002,8 @@ pub async fn render_project_video(
         "final-raw.mp4"
     });
 
-    // R3.2: transition 已经作为独立 RenderUnit 渲染，最终合并只需要 concat。
-    let has_transitions = false;
-
     check_cancel(cancel_flag)?;
-    if !has_transitions || segment_paths.len() <= 1 {
+    {
         // 先尝试 concat copy（快），若失败则 fallback 到 concat filter（重编码）
         // 注意：concat copy 要求所有段的编码参数（timebase/SAR/profile/pix_fmt）严格一致，
         // 不同源视频/图片/黑屏段混排时往往不一致，会导致输出"时长对但后半黑屏"。
@@ -1128,122 +1159,6 @@ pub async fn render_project_video(
                 );
             }
         }
-    } else {
-        // 有转场：用 filter_complex xfade 逐段合并
-        let fallback_transition_duration = project.render_config.transition_duration.max(0.1);
-        // R3.2: 有入场转场的段已额外渲染 handle，用 xfade 吃掉 overlap 后总时长仍等于原时间线。
-        let seg_durations = rendered_segment_durations.clone();
-        // 构建 filter_complex
-        let mut args: Vec<String> = vec!["-y".to_string()];
-        for p in &segment_paths {
-            args.push("-i".to_string());
-            args.push(p.to_string_lossy().to_string());
-        }
-        let mut filter = String::new();
-        let mut prev_label = "[0:v]".to_string();
-        let mut accumulated = seg_durations[0];
-        for i in 1..segment_paths.len() {
-            // 查这个段对应的 clip 是否有转场
-            let seg_start = segments[i].0;
-            let clip_with_trans = video_clips.iter().find(|c| {
-                (c.start_on_track - seg_start).abs() < 0.5 && transition_name(c).is_some()
-            });
-            let xfade_type = clip_with_trans
-                .and_then(|c| transition_name(c))
-                .unwrap_or("fade");
-            let transition_duration = clip_with_trans
-                .map(|clip| transition_duration(clip, fallback_transition_duration))
-                .unwrap_or(fallback_transition_duration);
-            // T4.5: xfade 名映射 —— 新种类（已是 xfade 原生名）直接透传，旧短名兼容
-            let xfade_name = match xfade_type {
-                "slide" => "slideleft",
-                "zoom" => "smoothleft",
-                "wipe" => "wipeleft",
-                "blur" => "dissolve",
-                // 以下已是 xfade 原生名，直接透传
-                "fade" | "dissolve" | "fadeblack" | "fadewhite" | "wipeleft" | "wiperight"
-                | "wipeup" | "wipedown" | "slideleft" | "slideright" | "slideup" | "slidedown"
-                | "smoothleft" | "smoothright" | "smoothup" | "smoothdown" | "circleopen"
-                | "circleclose" | "radial" | "horzopen" | "horzclose" | "vertopen"
-                | "vertclose" | "diagbl" | "diagbr" | "diagtl" | "diagtr" | "hlslice"
-                | "hrslice" | "vuslice" | "vdslice" | "hblur" | "fadegrays" | "pixellize"
-                | "sshred" => xfade_type,
-                _ => "fade",
-            };
-            let this_label = format!("[{}:v]", i);
-            let out_label = format!("[v{}]", i);
-            // xfade：offset = accumulated - transition_duration（转场从上一段末尾开始重叠）
-            let offset = (accumulated - transition_duration).max(0.0);
-            filter.push_str(&format!(
-                "{prev_label}{this_label}xfade=transition={xfade_name}:duration={transition_duration}:offset={offset:.3}{out_label};"
-            ));
-            prev_label = out_label.clone();
-            // xfade 后总时长 = 前面累积 + 本段 - 转场重叠
-            accumulated += seg_durations[i] - transition_duration;
-        }
-        let filter = filter.trim_end_matches(';');
-        args.push("-filter_complex".to_string());
-        args.push(filter.to_string());
-        args.push("-map".to_string());
-        args.push(prev_label);
-        // 编码器：统一用 encoder_args（硬件编码器用 bitrate，软编用 preset+crf）
-        let (xfade_enc_name, xfade_enc_extra) =
-            encoder_args(&encoder, preview, Some(project.render_config.bitrate_mbps));
-        args.push("-c:v".to_string());
-        args.push(xfade_enc_name);
-        args.extend(xfade_enc_extra);
-        args.push("-r".to_string());
-        args.push(format!("{}", project.render_config.fps));
-        args.push("-an".to_string());
-        args.push("-movflags".to_string());
-        args.push("+faststart".to_string());
-        args.push(raw_output.to_string_lossy().to_string());
-
-        check_cancel(cancel_flag)?;
-        let mut cmd = Command::new("ffmpeg");
-        cmd.args(&args);
-        let output = run_with_timeout_and_cancel(&mut cmd, 1800, cancel_flag).await?;
-        if !output.status.success() {
-            // xfade 失败时回退到 concat
-            eprintln!(
-                "xfade 转场失败，回退到 concat：{}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-            let list_path = cache_dir.join(format!(
-                "concat-fallback-{}-{}.txt",
-                project.id,
-                chrono::Utc::now().timestamp_millis()
-            ));
-            let list_content = segment_paths
-                .iter()
-                .map(|path| format!("file '{}'\n", path.to_string_lossy().replace('\'', "'\\''")))
-                .collect::<String>();
-            tokio::fs::write(&list_path, list_content).await?;
-            check_cancel(cancel_flag)?;
-            let mut fallback_cmd = Command::new("ffmpeg");
-            fallback_cmd.args([
-                "-y",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                &list_path.to_string_lossy(),
-                "-c",
-                "copy",
-                "-movflags",
-                "+faststart",
-                &raw_output.to_string_lossy(),
-            ]);
-            let fallback =
-                run_with_timeout_and_cancel(&mut fallback_cmd, 1800, cancel_flag).await?;
-            if !fallback.status.success() {
-                anyhow::bail!(
-                    "拼接失败：{}",
-                    String::from_utf8_lossy(&fallback.stderr).trim()
-                );
-            }
-        }
     }
 
     // 第二遍：叠加配音轨 + 烧录字幕轨
@@ -1281,123 +1196,6 @@ pub async fn render_project_video(
 struct SinglePassVideoGraph<'a> {
     base_clips: Vec<&'a Clip>,
     overlay_clips: Vec<&'a Clip>,
-}
-
-fn plan_single_pass_video_graph<'a>(
-    project: &Project,
-    video_clips: &[&'a Clip],
-    video_track_ids: &[String],
-    total_duration: f64,
-) -> Option<SinglePassVideoGraph<'a>> {
-    if video_clips.is_empty() || video_track_ids.is_empty() {
-        return None;
-    }
-
-    let base_track_id = &video_track_ids[0];
-    let mut base_clips: Vec<&Clip> = video_clips
-        .iter()
-        .copied()
-        .filter(|clip| &clip.track_id == base_track_id)
-        .collect();
-    if base_clips.is_empty() {
-        return None;
-    }
-    base_clips.sort_by(|a, b| {
-        a.start_on_track
-            .partial_cmp(&b.start_on_track)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let mut cursor = 0.0;
-    for clip in &base_clips {
-        if !single_pass_common_supported(project, clip)
-            || clip.mask.is_some()
-            || clip.keyframes.is_some()
-            || !clip_transform_is_identity(clip.transform.as_ref())
-            || (clip.start_on_track - cursor).abs() > 0.03
-        {
-            return None;
-        }
-        cursor = clip.start_on_track + clip.duration;
-    }
-    if cursor + 0.03 < total_duration {
-        return None;
-    }
-
-    let mut overlay_clips: Vec<&Clip> = video_clips
-        .iter()
-        .copied()
-        .filter(|clip| &clip.track_id != base_track_id)
-        .collect();
-    overlay_clips.sort_by(|a, b| {
-        let track_order = video_track_ids
-            .iter()
-            .position(|track_id| *track_id == a.track_id)
-            .unwrap_or(usize::MAX)
-            .cmp(
-                &video_track_ids
-                    .iter()
-                    .position(|track_id| *track_id == b.track_id)
-                    .unwrap_or(usize::MAX),
-            );
-        track_order.then_with(|| {
-            a.start_on_track
-                .partial_cmp(&b.start_on_track)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-    });
-    for clip in &overlay_clips {
-        if !single_pass_common_supported(project, clip)
-            || clip.keyframes.is_some()
-            || clip.mask.is_some()
-            || !overlay_transform_supported(clip.transform.as_ref())
-        {
-            return None;
-        }
-    }
-    Some(SinglePassVideoGraph {
-        base_clips,
-        overlay_clips,
-    })
-}
-
-fn single_pass_common_supported(project: &Project, clip: &Clip) -> bool {
-    if transition_name(clip).is_some()
-        || clip.transition_out.is_some()
-        || clip.speed <= 0.0
-        || clip
-            .speed_curve
-            .as_ref()
-            .is_some_and(|curve| !curve.is_empty())
-        || clip.source_id.is_none()
-    {
-        return false;
-    }
-    project
-        .media
-        .iter()
-        .find(|media| Some(&media.id) == clip.source_id.as_ref())
-        .is_some_and(|source| source.kind == "video" || source.kind == "image")
-}
-
-fn clip_transform_is_identity(transform: Option<&crate::models::ClipTransform>) -> bool {
-    let Some(transform) = transform else {
-        return true;
-    };
-    (transform.x - 50.0).abs() < 0.01
-        && (transform.y - 50.0).abs() < 0.01
-        && (transform.scale - 100.0).abs() < 0.01
-        && (transform.opacity - 100.0).abs() < 0.01
-        && transform.corner_radius == 0
-        && transform.mix == "normal"
-        && transform.rotation.abs() < 0.01
-}
-
-fn overlay_transform_supported(transform: Option<&crate::models::ClipTransform>) -> bool {
-    let Some(transform) = transform else {
-        return true;
-    };
-    transform.corner_radius == 0 && transform.mix == "normal" && transform.rotation.abs() < 0.01
 }
 
 async fn render_single_pass_video_graph(
@@ -1645,7 +1443,7 @@ async fn render_segment_with_overlay(
 
     // 多 clip：用 filter_complex 叠加
     // 准备每个 clip 的本地文件路径 + 素材类型作为输入
-    let mut inputs: Vec<(PathBuf, &Clip, bool)> = Vec::new(); // (path, clip, is_image)
+    let mut inputs: Vec<(PathBuf, &Clip, bool, Vec<SourceWindowPart>)> = Vec::new();
     for clip in active_clips {
         let source = match project
             .media
@@ -1656,7 +1454,17 @@ async fn render_segment_with_overlay(
             None => continue, // 跳过未绑定素材的 clip（避免渲染崩溃）
         };
         let local_path = ensure_media_local(cache_dir, source).await?;
-        inputs.push((local_path, *clip, source.kind == "image"));
+        let is_image = source.kind == "image";
+        let source_parts = if is_image {
+            Vec::new()
+        } else {
+            let plan = compile_source_window(clip, seg_start, seg_duration);
+            if plan.parts.is_empty() {
+                continue;
+            }
+            plan.parts
+        };
+        inputs.push((local_path, *clip, is_image, source_parts));
     }
     if inputs.is_empty() {
         anyhow::bail!("该时间段没有已绑定素材的视频片段");
@@ -1664,7 +1472,7 @@ async fn render_segment_with_overlay(
 
     // 构造 ffmpeg 命令：图片用 -loop 1，视频用 -ss 定位
     let mut args: Vec<String> = vec!["-y".to_string()];
-    for (local_path, clip, is_image) in &inputs {
+    for (local_path, _clip, is_image, source_parts) in &inputs {
         if *is_image {
             args.push("-loop".to_string());
             args.push("1".to_string());
@@ -1672,13 +1480,14 @@ async fn render_segment_with_overlay(
             args.push(format!("{:.3}", seg_duration));
             args.push("-i".to_string());
             args.push(local_path.to_string_lossy().to_string());
-        } else {
-            let offset_into_clip = (seg_start - clip.start_on_track).max(0.0);
-            let source_time = clip.source_in + offset_into_clip * clip.speed.clamp(0.25, 4.0);
+        } else if let [part] = source_parts.as_slice() {
             args.push("-ss".to_string());
-            args.push(format!("{:.3}", source_time));
+            args.push(format!("{:.3}", part.source_start));
             args.push("-t".to_string());
-            args.push(format!("{:.3}", seg_duration));
+            args.push(format!("{:.3}", part.source_end - part.source_start));
+            args.push("-i".to_string());
+            args.push(local_path.to_string_lossy().to_string());
+        } else {
             args.push("-i".to_string());
             args.push(local_path.to_string_lossy().to_string());
         }
@@ -1690,8 +1499,15 @@ async fn render_segment_with_overlay(
     // [v0][v1] overlay=x:y → [vout]
     let mut filter = String::new();
     let mut prev_label = String::new();
-    for (i, (_path, clip, _is_image)) in inputs.iter().enumerate() {
-        let in_label = format!("[{}:v]", i);
+    for (i, (_path, clip, _is_image, source_parts)) in inputs.iter().enumerate() {
+        let in_label = if let Some((source_filter, source_label)) =
+            compile_multi_part_source_filter(i, source_parts)
+        {
+            filter.push_str(&source_filter);
+            source_label
+        } else {
+            format!("[{}:v]", i)
+        };
         let out_label = format!("[v{}]", i);
         let tf = clip.transform.as_ref();
         // 第一层（底层）：全屏缩放裁切
@@ -1708,7 +1524,12 @@ async fn render_segment_with_overlay(
             if let Some(kfs) = scale_kfs {
                 // B3: scale 关键帧 -- 用表达式 + eval=frame 每帧重算
                 let offset = clip.start_on_track - seg_start;
-                let expr = keyframes_to_value_expr(kfs, tf.map(|t| t.scale).unwrap_or(100.0), offset);
+                let expr = compile_keyframe_expression(
+                    kfs,
+                    tf.map(|t| t.scale).unwrap_or(100.0),
+                    offset,
+                    "t",
+                );
                 format!(
                     "scale=w='{width}*({expr})/100':h='{height}*({expr})/100':eval=frame:force_original_aspect_ratio=decrease"
                 )
@@ -1727,6 +1548,9 @@ async fn render_segment_with_overlay(
         } else {
             format!("{},{}", source_crop.trim_start_matches(','), scale_expr)
         };
+        if let [part] = source_parts.as_slice() {
+            chain = apply_source_window_filter(chain, part);
+        }
         // B2/B4: 旋转（仅叠加层，避免底层旋转导致黑边）
         if i > 0 {
             let rot_kfs = clip
@@ -1736,7 +1560,12 @@ async fn render_segment_with_overlay(
             if let Some(kfs) = rot_kfs {
                 // B4: 关键帧旋转 -- 用 rotate + 表达式
                 let offset = clip.start_on_track - seg_start;
-                let deg_expr = keyframes_to_value_expr(kfs, tf.map(|t| t.rotation).unwrap_or(0.0), offset);
+                let deg_expr = compile_keyframe_expression(
+                    kfs,
+                    tf.map(|t| t.rotation).unwrap_or(0.0),
+                    offset,
+                    "t",
+                );
                 chain.push_str(&format!(
                     ",format=rgba,rotate=angle='({deg_expr})*PI/180':fillcolor=black@0:ow=hypot(iw,ih):oh=hypot(iw,ih):eval=frame,format=yuva420p"
                 ));
@@ -1763,19 +1592,21 @@ async fn render_segment_with_overlay(
         }
         chain.push_str(",format=yuva420p");
         // 不透明度
-        if let Some(t) = tf {
-            let opacity = (t.opacity).clamp(0.0, 100.0) / 100.0;
-            if opacity < 1.0 {
-                chain.push_str(&format!(",colorchannelmixer=aa={:.3}", opacity));
-            }
-        }
-        if i > 0 {
-            if let Some(opacity_kfs) = clip.keyframes.as_ref().and_then(|k| k.opacity.as_ref()) {
-                if let Some(opacity_fade) =
-                    opacity_keyframes_to_fade_filters(opacity_kfs, clip.start_on_track - seg_start)
-                {
-                    chain.push_str(&opacity_fade);
-                }
+        let opacity_keyframes = clip
+            .keyframes
+            .as_ref()
+            .and_then(|keyframes| keyframes.opacity.as_deref())
+            .filter(|keyframes| !keyframes.is_empty());
+        chain.push_str(&compile_static_opacity_filter(
+            tf.map(|transform| transform.opacity).unwrap_or(100.0),
+            opacity_keyframes.is_some(),
+        ));
+        if let Some(opacity_kfs) = opacity_keyframes {
+            if let Some(opacity_fade) = compile_opacity_alpha_filter(
+                opacity_kfs,
+                clip.start_on_track - seg_start,
+            ) {
+                chain.push_str(&opacity_fade);
             }
         }
         // T4.4: 蒙版（geq alpha）
@@ -1862,8 +1693,9 @@ async fn render_transition_unit(
     cache_dir: &Path,
     segment_dir: &Path,
     project: &Project,
-    video_clips: &[&Clip],
-    video_track_ids: &[String],
+    prev_clips: &[&Clip],
+    next_clips: &[&Clip],
+    transition_name: &str,
     start: f64,
     boundary: f64,
     duration: f64,
@@ -1874,29 +1706,10 @@ async fn render_transition_unit(
     height: u32,
     cancel_flag: Option<&std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<PathBuf> {
-    // 先查 transition_in（incoming clip 的入场转场），再查 transition_out（outgoing clip 的出场转场）
-    let transition_clip_in = video_clips.iter().copied().find(|clip| {
-        (clip.start_on_track - boundary).abs() < 0.05 && transition_name(clip).is_some()
-    });
-    let transition_clip_out = video_clips.iter().copied().find(|clip| {
-        (clip.start_on_track + clip.duration - boundary).abs() < 0.05
-            && transition_out_name(clip).is_some()
-    });
-    // transition_in 优先；若无则用 transition_out
-    let xfade_name = if let Some(clip) = transition_clip_in {
-        transition_name(clip).map(xfade_filter_name).unwrap_or("fade")
-    } else if let Some(clip) = transition_clip_out {
-        transition_out_name(clip).map(xfade_filter_name).unwrap_or("fade")
-    } else {
-        "fade"
-    };
+    let xfade_name = xfade_filter_name(transition_name);
 
     let work_dir = segment_dir.join(format!("transition-{:03}", seg_index));
     tokio::fs::create_dir_all(&work_dir).await?;
-
-    let prev_clips = active_clips_for_window(video_clips, video_track_ids, start, boundary);
-    let next_clips =
-        active_clips_for_window(video_clips, video_track_ids, boundary, boundary + duration);
 
     let prev_path = if prev_clips.is_empty() {
         render_black_segment(
@@ -1908,7 +1721,7 @@ async fn render_transition_unit(
             cache_dir,
             &work_dir,
             project,
-            &prev_clips,
+            prev_clips,
             start,
             duration,
             0,
@@ -1929,7 +1742,7 @@ async fn render_transition_unit(
             cache_dir,
             &work_dir,
             project,
-            &next_clips,
+            next_clips,
             boundary,
             duration,
             1,
@@ -2024,13 +1837,32 @@ async fn render_single_clip_for_segment(
         "scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},format=yuv420p"
     );
     let is_image = source.kind == "image";
-    if !is_image && clip.speed_curve.as_ref().is_some_and(|c| !c.is_empty()) {
-        return render_curve_speed_clip_for_segment(
+    let source_plan = (!is_image).then(|| compile_source_window(clip, seg_start, seg_duration));
+    if source_plan
+        .as_ref()
+        .is_some_and(|plan| plan.parts.is_empty())
+    {
+        return render_black_segment(
             segment_dir,
             project,
-            clip,
+            seg_duration,
+            seg_index,
+            preview,
+            encoder,
+            width,
+            height,
+        )
+        .await;
+    }
+    if let Some(parts) = source_plan
+        .as_ref()
+        .map(|plan| plan.parts.as_slice())
+        .filter(|parts| parts.len() > 1)
+    {
+        return render_source_window_parts_for_segment(
+            segment_dir,
+            project,
             &local_path,
-            seg_start,
             seg_duration,
             seg_index,
             preview,
@@ -2038,12 +1870,12 @@ async fn render_single_clip_for_segment(
             width,
             height,
             &scale_filter,
+            clip,
+            parts,
         )
         .await;
     }
 
-    let speed_abs = clip.speed.abs().clamp(0.25, 4.0);
-    let is_reverse = clip.speed < 0.0 || clip.reverse;
     let color_fx = clip_color_filter(clip);
     let source_crop = clip_source_crop(clip);
     // crop 在 scale 之前执行（操作源帧）
@@ -2052,16 +1884,12 @@ async fn render_single_clip_for_segment(
     } else {
         format!("{},{}", source_crop.trim_start_matches(','), scale_filter)
     };
-    if is_reverse {
-        video_filter.push_str(",reverse");
-    }
-    if (speed_abs - 1.0).abs() > f64::EPSILON {
-        video_filter = format!("{video_filter},setpts={:.6}*PTS", 1.0 / speed_abs);
+    let source_part = source_plan.as_ref().and_then(|plan| plan.parts.first());
+    if let Some(part) = source_part {
+        video_filter = apply_source_window_filter(video_filter, part);
     }
     video_filter.push_str(&color_fx);
 
-    let offset_into_clip = (seg_start - clip.start_on_track).max(0.0);
-    let source_time = clip.source_in + offset_into_clip * speed_abs;
     let output_path = segment_dir.join(format!("seg-{:03}.mp4", seg_index));
 
     let local_str = local_path.to_string_lossy().to_string();
@@ -2073,16 +1901,23 @@ async fn render_single_clip_for_segment(
         args.push("-i".to_string());
         args.push(local_str);
     } else {
-        // 视频：-ss 定位 + -stream_loop 循环（素材短于段时长时补足）
+        let part = source_part.expect("video source window checked above");
         args.push("-ss".to_string());
-        args.push(format!("{:.3}", source_time));
+        args.push(format!("{:.3}", part.source_start));
+        args.push("-t".to_string());
+        args.push(format!("{:.3}", part.source_end - part.source_start));
         args.push("-stream_loop".to_string());
         args.push("-1".to_string());
         args.push("-i".to_string());
         args.push(local_str);
     }
     args.push("-t".to_string());
-    args.push(format!("{:.3}", seg_duration));
+    args.push(format!(
+        "{:.3}",
+        source_part
+            .map(|part| part.timeline_duration)
+            .unwrap_or(seg_duration)
+    ));
     args.push("-vf".to_string());
     args.push(video_filter);
     args.push("-r".to_string());
@@ -2109,83 +1944,10 @@ async fn render_single_clip_for_segment(
     Ok(output_path)
 }
 
-#[derive(Debug, Clone)]
-struct CurveRenderSegment {
-    source_in: f64,
-    speed: f64,
-    timeline_start: f64,
-    timeline_end: f64,
-}
-
-fn speed_curve_to_segments(
-    curve: &[crate::models::SpeedPoint],
-    source_duration: f64,
-) -> Vec<CurveRenderSegment> {
-    if curve.is_empty() || source_duration <= 0.0 {
-        return vec![];
-    }
-    let mut points = curve.to_vec();
-    points.sort_by(|a, b| {
-        a.time
-            .partial_cmp(&b.time)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    if let Some(first) = points.first().cloned() {
-        if first.time > 0.0 {
-            points.insert(
-                0,
-                crate::models::SpeedPoint {
-                    time: 0.0,
-                    speed: first.speed,
-                },
-            );
-        }
-    }
-    if let Some(last) = points.last().cloned() {
-        if last.time < 1.0 {
-            points.push(crate::models::SpeedPoint {
-                time: 1.0,
-                speed: last.speed,
-            });
-        }
-    }
-
-    let mut segments = Vec::new();
-    let mut timeline_cursor = 0.0;
-    for pair in points.windows(2) {
-        let t0 = pair[0].time * source_duration;
-        let t1 = pair[1].time * source_duration;
-        let span = t1 - t0;
-        if span <= 0.0 {
-            continue;
-        }
-        let sub_count = (span / 0.5).ceil().max(1.0) as usize;
-        for s in 0..sub_count {
-            let sub_t0 = t0 + (span * s as f64) / sub_count as f64;
-            let sub_t1 = t0 + (span * (s + 1) as f64) / sub_count as f64;
-            let r = (s as f64 + 0.5) / sub_count as f64;
-            let speed = (pair[0].speed + (pair[1].speed - pair[0].speed) * r)
-                .abs()
-                .clamp(0.0625, 16.0);
-            let timeline_span = (sub_t1 - sub_t0) / speed;
-            segments.push(CurveRenderSegment {
-                source_in: sub_t0,
-                speed,
-                timeline_start: timeline_cursor,
-                timeline_end: timeline_cursor + timeline_span,
-            });
-            timeline_cursor += timeline_span;
-        }
-    }
-    segments
-}
-
-async fn render_curve_speed_clip_for_segment(
+async fn render_source_window_parts_for_segment(
     segment_dir: &Path,
     project: &Project,
-    clip: &Clip,
     local_path: &Path,
-    seg_start: f64,
     seg_duration: f64,
     seg_index: usize,
     preview: bool,
@@ -2193,11 +1955,10 @@ async fn render_curve_speed_clip_for_segment(
     width: u32,
     height: u32,
     scale_filter: &str,
+    clip: &Clip,
+    parts: &[SourceWindowPart],
 ) -> anyhow::Result<PathBuf> {
-    let curve = clip.speed_curve.as_ref().expect("checked by caller");
-    let source_duration = (clip.source_out - clip.source_in).max(0.0);
-    let curve_segments = speed_curve_to_segments(curve, source_duration);
-    if curve_segments.is_empty() {
+    if parts.is_empty() {
         return render_black_segment(
             segment_dir,
             project,
@@ -2211,8 +1972,6 @@ async fn render_curve_speed_clip_for_segment(
         .await;
     }
 
-    let rel_start = (seg_start - clip.start_on_track).max(0.0);
-    let rel_end = rel_start + seg_duration;
     let source_crop = clip_source_crop(clip);
     let color_fx = clip_color_filter(clip);
     let base_filter = if source_crop.is_empty() {
@@ -2223,22 +1982,9 @@ async fn render_curve_speed_clip_for_segment(
     let output_path = segment_dir.join(format!("seg-{:03}.mp4", seg_index));
     let mut part_paths = Vec::new();
 
-    for (part_index, curve_seg) in curve_segments.iter().enumerate() {
-        let part_start = rel_start.max(curve_seg.timeline_start);
-        let part_end = rel_end.min(curve_seg.timeline_end);
-        if part_end <= part_start {
-            continue;
-        }
-        let source_part_in =
-            curve_seg.source_in + (part_start - curve_seg.timeline_start) * curve_seg.speed;
-        let source_part_out =
-            curve_seg.source_in + (part_end - curve_seg.timeline_start) * curve_seg.speed;
-        let source_span = (source_part_out - source_part_in).max(0.001);
-        let timeline_span = part_end - part_start;
-        let mut video_filter = base_filter.clone();
-        if (curve_seg.speed - 1.0).abs() > f64::EPSILON {
-            video_filter = format!("{video_filter},setpts={:.6}*PTS", 1.0 / curve_seg.speed);
-        }
+    for (part_index, part) in parts.iter().enumerate() {
+        let source_span = (part.source_end - part.source_start).max(0.001);
+        let mut video_filter = apply_source_window_filter(base_filter.clone(), part);
         video_filter.push_str(&color_fx);
 
         let part_path =
@@ -2246,7 +1992,7 @@ async fn render_curve_speed_clip_for_segment(
         let mut args: Vec<String> = vec![
             "-y".to_string(),
             "-ss".to_string(),
-            format!("{:.3}", clip.source_in + source_part_in),
+            format!("{:.3}", part.source_start),
             "-i".to_string(),
             local_path.to_string_lossy().to_string(),
             "-t".to_string(),
@@ -2265,7 +2011,7 @@ async fn render_curve_speed_clip_for_segment(
         args.push("-movflags".to_string());
         args.push("+faststart".to_string());
         args.push("-t".to_string());
-        args.push(format!("{:.3}", timeline_span));
+        args.push(format!("{:.3}", part.timeline_duration));
         args.push(part_path.to_string_lossy().to_string());
 
         let output = Command::new("ffmpeg").args(&args).output().await?;
@@ -3406,33 +3152,7 @@ fn keyframes_to_overlay_expr(
         let pct = fallback.clamp(0.0, 100.0) / 100.0;
         return format!("({dim}-{dim_cap})*{pct:.4}");
     }
-    // 按 time 排序
-    let mut sorted: Vec<&crate::models::Keyframe> = kfs.iter().collect();
-    sorted.sort_by(|a, b| {
-        a.time
-            .partial_cmp(&b.time)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    // 对百分比（0-100 数值）做分段线性插值，默认取末帧值
-    let mut expr = format!("{:.4}", sorted[sorted.len() - 1].value);
-    for i in (1..sorted.len()).rev() {
-        let a = sorted[i - 1];
-        let b = sorted[i];
-        let ta = a.time + offset;
-        let tb = b.time + offset;
-        let span = (tb - ta).max(0.001);
-        expr = format!(
-            "if(lt(t,{tb:.4}),{va:.4}+(t-{ta:.4})*{dv:.4}/{span:.4},{expr})",
-            tb = tb,
-            va = a.value,
-            ta = ta,
-            dv = b.value - a.value,
-            span = span,
-            expr = expr
-        );
-    }
-    // 外层转像素：0-100 百分比 → (主画面-叠加画面) * pct/100
+    let expr = compile_keyframe_expression(kfs, fallback, offset, "t");
     format!("({dim}-{dim_cap})*({expr})/100")
 }
 
@@ -3443,44 +3163,8 @@ fn keyframes_to_volume_filter(kfs: &[crate::models::Keyframe], fallback: f64) ->
     if kfs.is_empty() {
         return format!("volume={fallback:.4}");
     }
-    let expr = keyframes_to_value_expr(kfs, fallback, 0.0);
+    let expr = compile_keyframe_expression(kfs, fallback, 0.0, "t");
     format!("volume='{expr}':eval=frame")
-}
-
-/// B3/B4: 通用关键帧分段线性插值表达式（返回纯表达式，不带滤镜前缀）。
-/// t 是 ffmpeg 内置时间变量。offset 把关键帧相对 clip 时间对齐到段内时间。
-fn keyframes_to_value_expr(
-    kfs: &[crate::models::Keyframe],
-    fallback: f64,
-    offset: f64,
-) -> String {
-    if kfs.is_empty() {
-        return format!("{:.4}", fallback);
-    }
-    let mut sorted: Vec<&crate::models::Keyframe> = kfs.iter().collect();
-    sorted.sort_by(|a, b| {
-        a.time
-            .partial_cmp(&b.time)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut expr = format!("{:.4}", sorted[sorted.len() - 1].value);
-    for i in (1..sorted.len()).rev() {
-        let a = sorted[i - 1];
-        let b = sorted[i];
-        let ta = a.time + offset;
-        let tb = b.time + offset;
-        let span = (tb - ta).max(0.001);
-        expr = format!(
-            "if(lt(t,{tb:.4}),{va:.4}+(t-{ta:.4})*{dv:.4}/{span:.4},{expr})",
-            tb = tb,
-            va = a.value,
-            ta = ta,
-            dv = b.value - a.value,
-            span = span,
-            expr = expr
-        );
-    }
-    expr
 }
 
 /// B2: 静态旋转滤镜。90/180/270 度用 transpose（更快），其他角度用 rotate。
@@ -3502,50 +3186,6 @@ fn rotation_filter(rotation: f64) -> String {
     }
 }
 
-/// T4.2: opacity 关键帧导出近似。
-/// ffmpeg 的 overlay alpha 动画无法像 x/y 一样直接表达每帧透明度，这里严格按文档只取首尾关键帧：
-/// 首帧 < 末帧 → alpha fade in；首帧 > 末帧 → alpha fade out；中间关键帧暂按预览 only。
-fn opacity_keyframes_to_fade_filters(
-    kfs: &[crate::models::Keyframe],
-    offset: f64,
-) -> Option<String> {
-    if kfs.len() < 2 {
-        return None;
-    }
-    let mut sorted: Vec<&crate::models::Keyframe> = kfs.iter().collect();
-    sorted.sort_by(|a, b| {
-        a.time
-            .partial_cmp(&b.time)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    // B6: 支持任意数量关键帧 -- 用 geq 在 alpha 通道做分段线性插值
-    // opacity value 是 0-100 百分比，转为 0-1 的 alpha 值
-    let mut expr = format!("{:.4}", sorted[sorted.len() - 1].value / 100.0);
-    for i in (1..sorted.len()).rev() {
-        let a = sorted[i - 1];
-        let b = sorted[i];
-        let ta = a.time + offset;
-        let tb = b.time + offset;
-        let span = (tb - ta).max(0.001);
-        let va = a.value / 100.0;
-        let vb = b.value / 100.0;
-        expr = format!(
-            "if(lt(t,{tb:.4}),{va:.4}+(t-{ta:.4})*{dv:.4}/{span:.4},{expr})",
-            tb = tb,
-            va = va,
-            ta = ta,
-            dv = vb - va,
-            span = span,
-            expr = expr
-        );
-    }
-    // geq 设置 alpha = 原alpha * expr / 1（expr 已是 0-1）
-    // format=rgba 确保有 alpha 通道
-    Some(format!(
-        ",format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*{expr}'"
-    ))
-}
-
 fn escape_filter_path(path: &str) -> String {
     path.replace('\'', "'\\''")
 }
@@ -3555,40 +3195,6 @@ fn sanitize_file_stem(value: &str) -> String {
         .chars()
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
         .collect()
-}
-
-fn transition_name(clip: &Clip) -> Option<&str> {
-    let name = clip.transition_in.as_ref()?.name();
-    if name == "none" {
-        None
-    } else {
-        Some(name)
-    }
-}
-
-fn transition_duration(clip: &Clip, fallback: f64) -> f64 {
-    clip.transition_in
-        .as_ref()
-        .map(|transition| transition.duration(fallback))
-        .unwrap_or(fallback)
-        .max(0.1)
-}
-
-fn transition_out_name(clip: &Clip) -> Option<&str> {
-    let name = clip.transition_out.as_ref()?.name();
-    if name == "none" {
-        None
-    } else {
-        Some(name)
-    }
-}
-
-fn transition_out_duration(clip: &Clip, fallback: f64) -> f64 {
-    clip.transition_out
-        .as_ref()
-        .map(|transition| transition.duration(fallback))
-        .unwrap_or(fallback)
-        .max(0.1)
 }
 
 fn xfade_filter_name(name: &str) -> &str {
@@ -3607,160 +3213,11 @@ fn xfade_filter_name(name: &str) -> &str {
     }
 }
 
-fn active_clips_for_window<'a>(
-    video_clips: &[&'a Clip],
-    video_track_ids: &[String],
-    start: f64,
-    end: f64,
-) -> Vec<&'a Clip> {
-    let mut active_clips: Vec<&Clip> = video_clips
-        .iter()
-        .filter(|clip| {
-            clip.start_on_track < end - 0.01 && clip.start_on_track + clip.duration > start + 0.01
-        })
-        .copied()
-        .collect();
-    active_clips.sort_by_key(|clip| {
-        video_track_ids
-            .iter()
-            .position(|track_id| *track_id == clip.track_id)
-            .unwrap_or(0)
-    });
-    active_clips
-}
-
-#[derive(Debug, Clone)]
-enum RenderUnit {
-    Normal { start: f64, end: f64 },
-    Transition { start: f64, boundary: f64, end: f64 },
-}
-
-fn build_render_units(
-    video_clips: &[&Clip],
-    total_duration: f64,
-    fallback_transition_duration: f64,
-) -> Vec<RenderUnit> {
-    let mut transitions: Vec<(f64, f64)> = Vec::new();
-    for incoming in video_clips {
-        let Some(_) = transition_name(incoming) else {
-            continue;
-        };
-        let boundary = incoming.start_on_track;
-        if boundary <= 0.05 {
-            continue;
-        }
-        let Some(prev) = video_clips.iter().copied().find(|candidate| {
-            candidate.track_id == incoming.track_id
-                && (candidate.start_on_track + candidate.duration - boundary).abs() < 0.05
-        }) else {
-            continue;
-        };
-        let duration = transition_duration(incoming, fallback_transition_duration)
-            .min(prev.duration)
-            .min(incoming.duration)
-            .min(boundary)
-            .max(0.0);
-        if duration > 0.05 {
-            transitions.push((boundary, duration));
-        }
-    }
-    // B7: transition_out 扫描 -- outgoing clip 结束时与下一个 clip 的转场
-    for outgoing in video_clips {
-        let Some(_) = transition_out_name(outgoing) else {
-            continue;
-        };
-        let boundary = outgoing.start_on_track + outgoing.duration;
-        if boundary >= total_duration - 0.05 {
-            continue;
-        }
-        let Some(next) = video_clips.iter().copied().find(|candidate| {
-            candidate.track_id == outgoing.track_id
-                && (candidate.start_on_track - boundary).abs() < 0.05
-        }) else {
-            continue;
-        };
-        let duration = transition_out_duration(outgoing, fallback_transition_duration)
-            .min(outgoing.duration)
-            .min(next.duration)
-            .min(boundary)
-            .max(0.0);
-        if duration > 0.05 && !transitions.iter().any(|(b, _)| (*b - boundary).abs() < 0.05) {
-            transitions.push((boundary, duration));
-        }
-    }
-    transitions.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    // 收集所有 clip 边界（用于切分 Normal 段）
-    // 关键：如果不按 clip 边界切分，单轨多 clip 的整个时间线会被当成 1 个 segment，
-    // render_segment_with_overlay 把所有 clip 作为 overlay 输入，主输入素材短会导致输出被截断
-    let mut clip_boundaries: Vec<f64> = Vec::new();
-    for clip in video_clips {
-        clip_boundaries.push(clip.start_on_track);
-        clip_boundaries.push(clip.start_on_track + clip.duration);
-    }
-    clip_boundaries.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    clip_boundaries.dedup_by(|a, b| (*a - *b).abs() < 0.05);
-
-    let mut units = Vec::new();
-    let mut cursor = 0.0;
-    for (boundary, duration) in transitions {
-        let start = (boundary - duration).max(cursor);
-        // Normal 段 [cursor, start]：按 clip 边界进一步切分
-        if start - cursor > 0.05 {
-            units.extend(split_normal_by_clip_boundaries(&clip_boundaries, cursor, start));
-        }
-        if boundary - start > 0.05 {
-            units.push(RenderUnit::Transition {
-                start,
-                boundary,
-                end: boundary,
-            });
-        }
-        cursor = boundary;
-    }
-    // 最后的 Normal 段 [cursor, total_duration]：按 clip 边界切分
-    if total_duration - cursor > 0.05 {
-        units.extend(split_normal_by_clip_boundaries(&clip_boundaries, cursor, total_duration));
-    }
-    units
-}
-
-/// 在 [seg_start, seg_end] 区间内，按 clip 边界把 Normal 段切分成多个子段。
-/// 这样每个子段内只有 1 个活跃 clip（单轨情况），走 render_single_clip_for_segment 路径，
-/// 该路径有 -stream_loop -1，能正确处理素材短于段时长的情况。
-fn split_normal_by_clip_boundaries(
-    clip_boundaries: &[f64],
-    seg_start: f64,
-    seg_end: f64,
-) -> Vec<RenderUnit> {
-    let mut boundaries: Vec<f64> = vec![seg_start];
-    for &b in clip_boundaries {
-        if b > seg_start + 0.05 && b < seg_end - 0.05 {
-            boundaries.push(b);
-        }
-    }
-    boundaries.push(seg_end);
-    boundaries.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    boundaries.dedup_by(|a, b| (*a - *b).abs() < 0.05);
-
-    let mut units = Vec::new();
-    for window in boundaries.windows(2) {
-        let start = window[0];
-        let end = window[1];
-        if end - start > 0.05 {
-            units.push(RenderUnit::Normal { start, end });
-        }
-    }
-    units
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{
-        ClipTransform, ClipTransition, MediaSource, Project, RenderConfig, Track, TrackKind,
-        TransitionConfig,
-    };
+    use crate::models::{MediaSource, Project, RenderConfig, Track, TrackKind};
+    use crate::source_window::SourceWindowPart;
 
     fn clip(id: &str, track_id: &str, start: f64, duration: f64) -> Clip {
         Clip {
@@ -3798,16 +3255,6 @@ mod tests {
         }
     }
 
-    fn total_unit_duration(units: &[RenderUnit]) -> f64 {
-        units
-            .iter()
-            .map(|unit| match unit {
-                RenderUnit::Normal { start, end } => end - start,
-                RenderUnit::Transition { start, end, .. } => end - start,
-            })
-            .sum()
-    }
-
     fn media(id: &str) -> MediaSource {
         MediaSource {
             id: id.to_string(),
@@ -3840,6 +3287,19 @@ mod tests {
         }
     }
 
+    fn track_kind(id: &str, kind: TrackKind, hidden: bool) -> Track {
+        Track {
+            id: id.to_string(),
+            kind,
+            name: id.to_string(),
+            order: 0,
+            muted: false,
+            locked: false,
+            hidden,
+            height: 0,
+        }
+    }
+
     fn project_for(clips: Vec<Clip>) -> Project {
         let media = clips
             .iter()
@@ -3856,6 +3316,8 @@ mod tests {
             tracks: vec![track("v1", 2), track("v2", 1)],
             clips,
             render_config: RenderConfig::default(),
+            chapters: Vec::new(),
+            cover_time: None,
             preview_path: None,
             final_path: None,
             created_at: String::new(),
@@ -3864,110 +3326,104 @@ mod tests {
     }
 
     #[test]
-    fn render_units_keep_timeline_duration_for_config_transition() {
-        let a = clip("a", "v1", 0.0, 2.0);
-        let mut b = clip("b", "v1", 2.0, 2.0);
-        b.transition_in = Some(ClipTransition::Config(TransitionConfig {
-            name: "fade".to_string(),
-            duration: 0.5,
-        }));
-        let clips = vec![&a, &b];
+    fn project_output_duration_uses_all_visible_track_kinds() {
+        let mut project = project_for(vec![
+            clip("video", "video", 0.0, 5.0),
+            clip("audio", "audio", 0.0, 12.0),
+            clip("subtitle", "subtitle", 10.0, 8.0),
+            clip("hidden", "hidden", 0.0, 30.0),
+            clip("orphan", "missing", 0.0, 40.0),
+        ]);
+        project.tracks = vec![
+            track_kind("video", TrackKind::Video, false),
+            track_kind("audio", TrackKind::Audio, false),
+            track_kind("subtitle", TrackKind::Subtitle, false),
+            track_kind("hidden", TrackKind::Video, true),
+        ];
 
-        let units = build_render_units(&clips, 4.0, 0.75);
+        assert!((project_output_duration(&project) - 18.0).abs() < 0.001);
+    }
 
-        assert_eq!(units.len(), 3);
-        assert!((total_unit_duration(&units) - 4.0).abs() < 0.001);
-        assert!(matches!(
-            units[1],
-            RenderUnit::Transition {
-                start,
-                boundary,
-                end
-            } if (start - 1.5).abs() < 0.001
-                && (boundary - 2.0).abs() < 0.001
-                && (end - 2.0).abs() < 0.001
+    #[test]
+    fn source_window_filter_reverses_and_retimes_the_selected_source_range() {
+        let part = SourceWindowPart {
+            source_start: 15.0,
+            source_end: 18.0,
+            timeline_duration: 1.5,
+            speed: 2.0,
+            reverse: true,
+        };
+
+        let filter = apply_source_window_filter("scale=1920:1080".to_string(), &part);
+
+        assert_eq!(
+            filter,
+            "scale=1920:1080,reverse,setpts=0.500000*(PTS-STARTPTS)"
+        );
+    }
+
+    #[test]
+    fn multi_part_source_filter_splits_trims_retimes_and_concats() {
+        let parts = vec![
+            SourceWindowPart {
+                source_start: 0.0,
+                source_end: 1.0,
+                timeline_duration: 1.0,
+                speed: 1.0,
+                reverse: false,
+            },
+            SourceWindowPart {
+                source_start: 2.0,
+                source_end: 4.0,
+                timeline_duration: 1.0,
+                speed: 2.0,
+                reverse: false,
+            },
+        ];
+
+        let (filter, label) = compile_multi_part_source_filter(3, &parts)
+            .expect("multiple parts must compile a source filter");
+
+        assert_eq!(label, "[src3]");
+        assert!(filter.contains("[3:v]split=2[src3in0][src3in1]"));
+        assert!(filter.contains(
+            "[src3in0]trim=start=0.000000:end=1.000000,setpts=PTS-STARTPTS[src3part0]"
         ));
-    }
-
-    #[test]
-    fn render_units_keep_timeline_duration_for_legacy_transition() {
-        let a = clip("a", "v1", 0.0, 2.0);
-        let mut b = clip("b", "v1", 2.0, 2.0);
-        b.transition_in = Some(ClipTransition::Legacy("fade".to_string()));
-        let clips = vec![&a, &b];
-
-        let units = build_render_units(&clips, 4.0, 0.75);
-
-        assert!((total_unit_duration(&units) - 4.0).abs() < 0.001);
-        assert!(matches!(
-            units[1],
-            RenderUnit::Transition { start, .. } if (start - 1.25).abs() < 0.001
+        assert!(filter.contains(
+            "[src3in1]trim=start=2.000000:end=4.000000,setpts=0.500000*(PTS-STARTPTS)[src3part1]"
         ));
+        assert!(filter.contains("[src3part0][src3part1]concat=n=2:v=1:a=0[src3]"));
     }
 
     #[test]
-    fn render_units_keep_timeline_duration_for_multiple_transitions() {
-        let a = clip("a", "v1", 0.0, 2.0);
-        let mut b = clip("b", "v1", 2.0, 2.0);
-        let mut c = clip("c", "v1", 4.0, 2.0);
-        b.transition_in = Some(ClipTransition::Config(TransitionConfig {
-            name: "fade".to_string(),
-            duration: 0.5,
-        }));
-        c.transition_in = Some(ClipTransition::Config(TransitionConfig {
-            name: "wipeleft".to_string(),
-            duration: 0.5,
-        }));
-        let clips = vec![&a, &b, &c];
+    fn multi_part_source_filter_preserves_reverse_timeline_order() {
+        let parts = vec![
+            SourceWindowPart {
+                source_start: 3.0,
+                source_end: 4.0,
+                timeline_duration: 1.0,
+                speed: 1.0,
+                reverse: true,
+            },
+            SourceWindowPart {
+                source_start: 1.0,
+                source_end: 3.0,
+                timeline_duration: 1.0,
+                speed: 2.0,
+                reverse: true,
+            },
+        ];
 
-        let units = build_render_units(&clips, 6.0, 0.5);
+        let (filter, _) = compile_multi_part_source_filter(0, &parts)
+            .expect("reverse parts must compile");
 
-        assert_eq!(units.len(), 5);
-        assert!((total_unit_duration(&units) - 6.0).abs() < 0.001);
+        let first = filter
+            .find("trim=start=3.000000:end=4.000000,reverse")
+            .expect("first reverse part missing");
+        let second = filter
+            .find("trim=start=1.000000:end=3.000000,reverse")
+            .expect("second reverse part missing");
+        assert!(first < second);
     }
 
-    #[test]
-    fn single_pass_planner_accepts_simple_overlay_track() {
-        let base_a = clip("a", "v1", 0.0, 2.0);
-        let base_b = clip("b", "v1", 2.0, 2.0);
-        let mut overlay = clip("overlay", "v2", 1.0, 1.0);
-        overlay.transform = Some(ClipTransform {
-            x: 25.0,
-            y: 25.0,
-            scale: 40.0,
-            opacity: 80.0,
-            corner_radius: 0,
-            mix: "normal".to_string(),
-            rotation: 0.0,
-        });
-        let project = project_for(vec![base_a, base_b, overlay]);
-        let clips: Vec<&Clip> = project.clips.iter().collect();
-        let track_ids = vec!["v1".to_string(), "v2".to_string()];
-
-        let graph = plan_single_pass_video_graph(&project, &clips, &track_ids, 4.0)
-            .expect("simple overlay timeline should use single-pass graph");
-
-        assert_eq!(graph.base_clips.len(), 2);
-        assert_eq!(graph.overlay_clips.len(), 1);
-    }
-
-    #[test]
-    fn single_pass_planner_rejects_complex_overlay_transform() {
-        let base = clip("a", "v1", 0.0, 4.0);
-        let mut overlay = clip("overlay", "v2", 1.0, 1.0);
-        overlay.transform = Some(ClipTransform {
-            x: 50.0,
-            y: 50.0,
-            scale: 50.0,
-            opacity: 100.0,
-            corner_radius: 12,
-            mix: "normal".to_string(),
-            rotation: 0.0,
-        });
-        let project = project_for(vec![base, overlay]);
-        let clips: Vec<&Clip> = project.clips.iter().collect();
-        let track_ids = vec!["v1".to_string(), "v2".to_string()];
-
-        assert!(plan_single_pass_video_graph(&project, &clips, &track_ids, 4.0).is_none());
-    }
 }

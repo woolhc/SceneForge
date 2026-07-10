@@ -205,18 +205,6 @@ pub enum TrackKind {
     Subtitle,
 }
 
-impl TrackKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            TrackKind::Video => "video",
-            TrackKind::Image => "image",
-            TrackKind::Voiceover => "voiceover",
-            TrackKind::Audio => "audio",
-            TrackKind::Subtitle => "subtitle",
-        }
-    }
-}
-
 /// 素材库实体 —— 一段可播放的源媒体。
 /// Pexels 视频、本地导入视频、TTS 配音、本地音频都统一成这个结构。
 /// 它是"资产"，Clip 是"资产在时间线上的引用"。
@@ -653,13 +641,6 @@ pub struct Clip {
     /// 出场转场
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transition_out: Option<ClipTransition>,
-}
-
-impl Clip {
-    /// 片段在时间线上的结束位置
-    pub fn end_on_track(&self) -> f64 {
-        self.start_on_track + self.duration
-    }
 }
 
 fn default_speed() -> f64 {
