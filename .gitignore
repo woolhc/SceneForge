@@ -30,3 +30,15 @@ tauri-dev.log
 # Runtime data
 storage/
 app.db
+*.db
+*.sqlite
+*.sqlite3
+
+# Secrets / keys / credentials
+*.pem
+*.key
+*.p12
+*.pfx
+secrets.json
+config.local.*
+credentials.json
