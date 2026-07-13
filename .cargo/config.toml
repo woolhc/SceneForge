@@ -1,9 +1,9 @@
-[source.crates-io]
-replace-with = "ustc"
+[registries.crates-io]
+protocol = "sparse"
 
-[source.ustc]
-registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
+[net]
+retry = 10
 
 [http]
 timeout = 120
-multiplexing = false
+multiplexing = true
