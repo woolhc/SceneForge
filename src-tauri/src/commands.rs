@@ -18,6 +18,7 @@ use crate::pexels;
 use crate::storage;
 use crate::storage::AppState;
 use crate::tts;
+use crate::whisper_models::{self, WhisperModelStatus};
 
 fn map_error(error: impl std::fmt::Display) -> String {
     error.to_string()
@@ -184,6 +185,156 @@ pub fn save_settings(
 ) -> Result<AppSettings, String> {
     let conn = state.db.lock().map_err(map_error)?;
     storage::save_settings(&conn, &settings).map_err(map_error)
+}
+
+#[tauri::command]
+pub fn get_whisper_model_status(state: State<'_, AppState>) -> Result<WhisperModelStatus, String> {
+    let settings = {
+        let conn = state.db.lock().map_err(map_error)?;
+        storage::load_settings(&conn).map_err(map_error)?
+    };
+    Ok(whisper_models::get_status(
+        &state.paths.models_dir,
+        &settings,
+        state
+            .whisper_download_active
+            .load(std::sync::atomic::Ordering::Relaxed),
+    ))
+}
+
+#[tauri::command]
+pub async fn download_whisper_model(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    model_id: String,
+) -> Result<WhisperModelStatus, String> {
+    if model_id != "medium-q5" {
+        return Err(format!("未知的 Whisper 模型：{model_id}"));
+    }
+    let _guard = state
+        .whisper_download_lock
+        .try_lock()
+        .map_err(|_| "已有 Whisper 模型下载任务正在进行".to_string())?;
+    state
+        .whisper_download_active
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    state
+        .whisper_download_cancel
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    let result = whisper_models::download_recommended_model(
+        &state.paths.models_dir,
+        &app_handle,
+        &state.whisper_download_cancel,
+    )
+    .await;
+    state
+        .whisper_download_active
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    let path = result.map_err(|error| map_pipeline_error(error, "WHISPER_MODEL_DOWNLOAD", true))?;
+    let settings = {
+        let conn = state.db.lock().map_err(map_error)?;
+        let mut settings = storage::load_settings(&conn).map_err(map_error)?;
+        settings.whisper_model = path.to_string_lossy().to_string();
+        storage::save_settings(&conn, &settings).map_err(map_error)?
+    };
+    Ok(whisper_models::get_status(
+        &state.paths.models_dir,
+        &settings,
+        false,
+    ))
+}
+
+#[tauri::command]
+pub fn cancel_whisper_model_download(state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .whisper_download_cancel
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn select_whisper_model(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<WhisperModelStatus, String> {
+    let _guard = state
+        .whisper_download_lock
+        .try_lock()
+        .map_err(|_| "Whisper 模型下载期间不能切换模型".to_string())?;
+    let path = PathBuf::from(path);
+    whisper_models::validate_selected_model(&path).map_err(map_error)?;
+    let settings = {
+        let conn = state.db.lock().map_err(map_error)?;
+        let mut settings = storage::load_settings(&conn).map_err(map_error)?;
+        settings.whisper_model = path.to_string_lossy().to_string();
+        storage::save_settings(&conn, &settings).map_err(map_error)?
+    };
+    Ok(whisper_models::get_status(
+        &state.paths.models_dir,
+        &settings,
+        state
+            .whisper_download_active
+            .load(std::sync::atomic::Ordering::Relaxed),
+    ))
+}
+
+#[tauri::command]
+pub fn delete_whisper_model(state: State<'_, AppState>) -> Result<WhisperModelStatus, String> {
+    let _guard = state
+        .whisper_download_lock
+        .try_lock()
+        .map_err(|_| "Whisper 模型下载期间不能删除模型".to_string())?;
+    let managed = whisper_models::managed_model_path(&state.paths.models_dir);
+    let settings_before = {
+        let conn = state.db.lock().map_err(map_error)?;
+        storage::load_settings(&conn).map_err(map_error)?
+    };
+    if !settings_before.whisper_model.trim().is_empty()
+        && PathBuf::from(&settings_before.whisper_model) != managed
+    {
+        return Err(
+            "自定义 Whisper 模型不会由 SceneForge 删除，请在文件管理器中自行管理".to_string(),
+        );
+    }
+    whisper_models::delete_managed_model(&state.paths.models_dir).map_err(map_error)?;
+    let settings = {
+        let conn = state.db.lock().map_err(map_error)?;
+        let mut settings = settings_before;
+        if PathBuf::from(&settings.whisper_model) == managed {
+            settings.whisper_model.clear();
+            storage::save_settings(&conn, &settings).map_err(map_error)?;
+        }
+        settings
+    };
+    Ok(whisper_models::get_status(
+        &state.paths.models_dir,
+        &settings,
+        false,
+    ))
+}
+
+#[tauri::command]
+pub fn open_models_directory(state: State<'_, AppState>) -> Result<(), String> {
+    let path = &state.paths.models_dir;
+    std::fs::create_dir_all(path).map_err(map_error)?;
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("open")
+        .arg(path)
+        .spawn()
+        .map_err(map_error)?;
+    #[cfg(target_os = "windows")]
+    std::process::Command::new("explorer")
+        .arg(path)
+        .spawn()
+        .map_err(map_error)?;
+    #[cfg(target_os = "linux")]
+    std::process::Command::new("xdg-open")
+        .arg(path)
+        .spawn()
+        .map_err(map_error)?;
+    Ok(())
 }
 
 // ============================================================================

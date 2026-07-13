@@ -4570,3 +4570,227 @@ textarea {
 .home-content > section {
   flex: 0 0 auto;
 }
+
+.home-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.home-settings-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #191b1e;
+  color: #f2f0ea;
+}
+
+.home-settings-button:hover {
+  border-color: rgba(34, 211, 166, 0.55);
+}
+
+.home-readiness-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 16px;
+  align-items: center;
+  margin: 14px 24px 0;
+  padding: 14px;
+  border: 1px solid rgba(243, 201, 105, 0.28);
+  border-radius: 14px;
+  background: rgba(243, 201, 105, 0.08);
+}
+
+.home-readiness-card strong,
+.home-readiness-card span {
+  display: block;
+}
+
+.home-readiness-card span,
+.home-readiness-card li {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.home-readiness-card ul {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.home-readiness-actions,
+.settings-inline-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.home-readiness-actions button,
+.settings-inline-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #181a1d;
+}
+
+.unified-settings-modal {
+  width: min(820px, calc(100vw - 80px));
+}
+
+.settings-section {
+  padding: 14px;
+  border-bottom: 1px solid var(--soft-line);
+}
+
+.settings-section .settings-grid {
+  padding: 0;
+}
+
+.settings-status-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid var(--soft-line);
+  border-radius: 10px;
+  background: #151719;
+}
+
+.settings-status-card strong,
+.settings-status-card span {
+  display: block;
+}
+
+.settings-status-card span {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.settings-diagnostics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.settings-diagnostics span,
+.whisper-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--soft-line);
+  background: #151719;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.settings-diagnostics .ok,
+.whisper-status.ok {
+  color: var(--accent);
+  border-color: rgba(34, 211, 166, 0.32);
+}
+
+.settings-diagnostics .warn,
+.whisper-status.warn {
+  color: var(--accent-2);
+  border-color: rgba(243, 201, 105, 0.32);
+}
+
+.danger-button {
+  color: var(--danger);
+}
+
+.whisper-setup-dialog {
+  width: min(560px, calc(100vw - 80px));
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #1b1c1f;
+  box-shadow: 0 28px 90px rgba(0, 0, 0, 0.55);
+}
+
+.whisper-setup-body {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+}
+
+.whisper-setup-body p {
+  margin: 0;
+  color: var(--text-dim);
+  line-height: 1.55;
+}
+
+.download-progress {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--soft-line);
+  border-radius: 10px;
+  background: #151719;
+}
+
+.download-progress > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+}
+
+.download-progress progress {
+  width: 100%;
+  height: 8px;
+  accent-color: var(--accent);
+}
+
+.download-progress small,
+.settings-error {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.settings-error {
+  color: var(--danger);
+}
+
+@media (max-width: 900px) {
+  .home-readiness-card {
+    grid-template-columns: 1fr;
+  }
+}
+
+.whisper-model-card {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid rgba(34, 211, 166, 0.24);
+  border-radius: 10px;
+  background: rgba(34, 211, 166, 0.06);
+}
+
+.whisper-model-card > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.whisper-model-card span {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.whisper-model-card p {
+  font-size: 12px;
+}

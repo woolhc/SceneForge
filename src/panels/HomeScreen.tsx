@@ -11,6 +11,8 @@ import {
   ImagePlay,
   MoreVertical,
   Plus,
+  Settings,
+  Download,
   Search,
   SlidersHorizontal,
   Sparkles,
@@ -18,7 +20,8 @@ import {
 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { SceneForgeLogo } from "../components/SceneForgeLogo";
-import type { ProjectSummary } from "../types";
+import type { AppSettings, ProjectSummary, WhisperModelStatus } from "../types";
+import { getApiReadiness, getReadinessIssues, whisperStatusLabel } from "../editor/readiness";
 
 const workflowSteps = [
   {
@@ -72,6 +75,10 @@ export function HomeScreen({
   onDuplicate,
   onDelete,
   onGenerate,
+  settings,
+  whisperStatus,
+  onSettings,
+  onDownloadWhisper,
 }: {
   projects: ProjectSummary[];
   onOpen: (id: string) => void;
@@ -80,6 +87,10 @@ export function HomeScreen({
   onDuplicate: (id: string) => void;
   onDelete: (id: string) => void;
   onGenerate: () => void;
+  settings: AppSettings;
+  whisperStatus: WhisperModelStatus | null;
+  onSettings: () => void;
+  onDownloadWhisper: () => void;
 }) {
   const [search, setSearch] = useState("");
   const [menuOpen, setMenuOpen] = useState<string | null>(null);
@@ -92,6 +103,8 @@ export function HomeScreen({
   }, [projects, search]);
 
   const hasProjects = projects.length > 0;
+  const readinessIssues = useMemo(() => getReadinessIssues(settings, whisperStatus), [settings, whisperStatus]);
+  const apiReadiness = useMemo(() => getApiReadiness(settings), [settings]);
 
   return (
     <div className="home-screen">
@@ -101,15 +114,39 @@ export function HomeScreen({
           <strong>SceneForge</strong>
           <span>AI 脚本到视频</span>
         </div>
-        <div className="home-search">
-          <Search size={16} />
-          <input
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-            placeholder="搜索项目..."
-          />
+        <div className="home-header-actions">
+          <div className="home-search">
+            <Search size={16} />
+            <input
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder="搜索项目..."
+            />
+          </div>
+          <button className="home-settings-button" onClick={onSettings} title="设置">
+            <Settings size={17} />
+            设置
+          </button>
         </div>
       </header>
+
+      {readinessIssues.length > 0 && (
+        <section className="home-readiness-card">
+          <div>
+            <strong>开始前还差一点配置</strong>
+            <span>Whisper：{whisperStatusLabel(whisperStatus)} · API：DeepSeek {apiReadiness.deepseekReady ? "已配置" : "未配置"} / Pexels {apiReadiness.pexelsReady ? "已配置" : "未配置"} / Fish {apiReadiness.fishAudioReady ? "已配置" : "未配置"}</span>
+          </div>
+          <ul>
+            {readinessIssues.slice(0, 3).map((issue) => <li key={issue.id}>{issue.title}</li>)}
+          </ul>
+          <div className="home-readiness-actions">
+            {readinessIssues.some((issue) => issue.id === "whisper") && (
+              <button className="primary-button" onClick={onDownloadWhisper}><Download size={15} />下载模型</button>
+            )}
+            <button onClick={onSettings}>打开设置</button>
+          </div>
+        </section>
+      )}
 
       <main className={`home-content ${hasProjects ? "has-projects" : "is-empty"}`}>
         <section className="home-create-section">

@@ -16,6 +16,8 @@ import type {
   GenerateNarrationResult,
   VoicePreviewResult,
   VoiceProfile,
+  WhisperModelDownloadProgress,
+  WhisperModelStatus,
 } from "./types";
 import { DEFAULT_RENDER_CONFIG } from "./types";
 
@@ -250,6 +252,44 @@ async function webFallback<T>(command: string, args?: Record<string, unknown>): 
       modelsDir: "localStorage",
       databasePath: "localStorage",
     } as T;
+  }
+
+  if (command === "get_whisper_model_status") {
+    return {
+      model: {
+        id: "medium-q5",
+        name: "Medium Q5",
+        fileName: "ggml-medium-q5_0.bin",
+        sizeBytes: 539212467,
+        sha256: "19fea4b380c3a618ec4723c3eef2eb785ffba0d0538cf43f8f235e7b3b34220f",
+        description: "适合中文、英文和中英混合旁白，在准确率、速度和磁盘占用之间较平衡。",
+        recommended: true,
+      },
+      available: false,
+      resolvedPath: null,
+      configuredPath: null,
+      selectedModelId: null,
+      downloadedBytes: 0,
+      totalBytes: 539212467,
+      partialDownload: false,
+      downloading: false,
+      modelsDir: "浏览器预览模式",
+      whisperAvailable: false,
+      whisperPath: "whisper-cli",
+    } as T;
+  }
+
+  if (
+    command === "download_whisper_model" ||
+    command === "select_whisper_model" ||
+    command === "delete_whisper_model" ||
+    command === "open_models_directory"
+  ) {
+    throw new Error("浏览器预览模式无法管理本地 Whisper 模型，请在桌面客户端中使用");
+  }
+
+  if (command === "cancel_whisper_model_download") {
+    return undefined as T;
   }
 
   if (command === "check_ffmpeg") {
@@ -659,6 +699,31 @@ export const desktopApi = {
   writeDebugLog: (content: string) => call<string>("write_debug_log", { content }),
   loadSettings: () => call<AppSettings>("load_settings"),
   saveSettings: (settings: AppSettings) => call<AppSettings>("save_settings", { settings }),
+  getWhisperModelStatus: () => call<WhisperModelStatus>("get_whisper_model_status"),
+  downloadWhisperModel: (modelId = "medium-q5") =>
+    call<WhisperModelStatus>("download_whisper_model", { modelId }),
+  cancelWhisperModelDownload: () => call<void>("cancel_whisper_model_download"),
+  selectWhisperModel: (path: string) =>
+    call<WhisperModelStatus>("select_whisper_model", { path }),
+  deleteWhisperModel: () => call<WhisperModelStatus>("delete_whisper_model"),
+  openModelsDirectory: () => call<void>("open_models_directory"),
+  pickWhisperModelFile: async () => {
+    if (!isTauri) return null;
+    const selected = await open({
+      multiple: false,
+      filters: [{ name: "Whisper 模型", extensions: ["bin"] }],
+    });
+    return typeof selected === "string" ? selected : null;
+  },
+  listenWhisperModelProgress: async (
+    callback: (progress: WhisperModelDownloadProgress) => void,
+  ) => {
+    if (!isTauri) return () => {};
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<WhisperModelDownloadProgress>("whisper-model-download-progress", (event) => {
+      callback(event.payload);
+    });
+  },
   listProjects: () => call<ProjectSummary[]>("list_projects"),
   createProject: (request: { title?: string; ratio?: string }) =>
     call<Project>("create_project", { request }),

@@ -13,6 +13,7 @@ mod storage;
 mod temp;
 mod tools;
 mod tts;
+mod whisper_models;
 
 use storage::AppState;
 
@@ -45,6 +46,12 @@ pub fn run() {
             commands::generate_waveform,
             commands::load_settings,
             commands::save_settings,
+            commands::get_whisper_model_status,
+            commands::download_whisper_model,
+            commands::cancel_whisper_model_download,
+            commands::select_whisper_model,
+            commands::delete_whisper_model,
+            commands::open_models_directory,
             commands::list_projects,
             commands::create_project,
             commands::get_project,

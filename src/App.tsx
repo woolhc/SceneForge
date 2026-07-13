@@ -11,12 +11,10 @@ import {
   Pause,
   Play,
   Plus,
-  Save,
   Scissors,
   Search,
   SkipBack,
   SkipForward,
-  Settings as SettingsIcon,
   SlidersHorizontal,
   Volume2,
   XCircle,
@@ -44,6 +42,8 @@ import type {
   TrackKind,
   TimedSentencesResult,
   VoiceProfile,
+  WhisperModelDownloadProgress,
+  WhisperModelStatus,
 } from "./types";
 import { DEFAULT_SUBTITLE_STYLE, DEFAULT_TRANSFORM, DEFAULT_CROP, videoWidthForProject } from "./types";
 import type { AiSegment } from "./types";
@@ -142,10 +142,20 @@ import { VisualEffectsInspector } from "./editor/inspector/VisualEffectsInspecto
 import { ColorInspector } from "./editor/inspector/ColorInspector";
 import { VisualTransformInspector } from "./editor/inspector/VisualTransformInspector";
 import { SubtitleInspector } from "./editor/inspector/SubtitleInspector";
+import { UnifiedSettingsDialog } from "./components/UnifiedSettingsDialog";
+import { WhisperSetupDialog } from "./components/WhisperSetupDialog";
+import {
+  createPendingWhisperAction,
+  hasWhisperModel,
+  shouldGateWhisperAction,
+  type PendingWhisperAction,
+} from "./editor/readiness";
 // PanelTitle 已不再直接使用（各 Tab 自带标题）；TimelineTrack/Track 类型保留供时间线渲染
 
 const ratios = ["9:16", "16:9", "1:1"];
 const isDevelopmentPreview = (import.meta as ImportMeta & { env?: { DEV?: boolean } }).env?.DEV === true;
+
+const recommendedWhisperModelId = "medium-q5";
 
 /** 时间码格式化：秒 → MM:SS.frame（剪映式） */
 function formatTC(seconds: number, fps = 30): string {
@@ -509,8 +519,15 @@ export function App() {
     whisperBin: whisperDefaultBin,
     whisperModel: whisperDefaultModel,
   });
+  const [settingsDraft, setSettingsDraft] = useState<AppSettings>(settings);
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [ffmpeg, setFfmpeg] = useState<FfmpegStatus | null>(null);
+  const [whisperModelStatus, setWhisperModelStatus] = useState<WhisperModelStatus | null>(null);
+  const [whisperDownloadProgress, setWhisperDownloadProgress] = useState<WhisperModelDownloadProgress | null>(null);
+  const [whisperSetupOpen, setWhisperSetupOpen] = useState(false);
+  const [whisperSetupError, setWhisperSetupError] = useState<string | null>(null);
+  const pendingWhisperActionRef = useRef<PendingWhisperAction<GeneratePipelineInput | { translate: boolean; mode: SubtitleGenerationMode }> | null>(null);
+  const pendingWhisperActionId = useRef(0);
   const showSettings = useUiStore((s) => s.showSettings);
   const setShowSettings = useUiStore((s) => s.setShowSettings);
   const [busy, setBusy] = useState<string | null>(null);
@@ -804,6 +821,22 @@ export function App() {
     void bootstrap();
   }, []);
 
+  useEffect(() => {
+    void refreshWhisperModelStatus();
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void desktopApi.listenWhisperModelProgress((progress) => {
+      if (!disposed) setWhisperDownloadProgress(progress);
+    }).then((nextUnlisten) => {
+      if (disposed) nextUnlisten();
+      else unlisten = nextUnlisten;
+    }).catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
   // project 变化时同步给预览引擎（重新构建调度 + 预加载配音）
   useEffect(() => {
     void syncProject(project);
@@ -1032,6 +1065,7 @@ export function App() {
       setAppInfo(info);
       setFfmpeg(ffmpegStatus);
       setSettings(loadedSettings);
+      setSettingsDraft(loadedSettings);
       setProjects(loadedProjects);
       setVoiceProfiles(voices);
       setSelectedVoiceId(loadedSettings.defaultVoiceId || voices[0]?.id || "");
@@ -1074,11 +1108,156 @@ export function App() {
     }
   }
 
+  function openSettings() {
+    setSettingsDraft(settings);
+    setShowSettings(true);
+  }
+
+  async function refreshWhisperModelStatus() {
+    try {
+      setWhisperModelStatus(await desktopApi.getWhisperModelStatus());
+    } catch (error) {
+      const parsed = parsePipelineError(error);
+      setWhisperModelStatus(null);
+      setStatus(parsed.message);
+    }
+  }
+
+  function openWhisperSetup() {
+    pendingWhisperActionRef.current = null;
+    setWhisperSetupError(null);
+    setWhisperDownloadProgress(null);
+    setWhisperSetupOpen(true);
+  }
+
+  function requestWhisperSetup(kind: PendingWhisperAction["kind"], payload: GeneratePipelineInput | { translate: boolean; mode: SubtitleGenerationMode }) {
+    const nextId = pendingWhisperActionId.current + 1;
+    pendingWhisperActionId.current = nextId;
+    const pending = createPendingWhisperAction(nextId, kind, payload);
+    pendingWhisperActionRef.current = pending;
+    setWhisperSetupError(null);
+    setWhisperDownloadProgress(null);
+    setWhisperSetupOpen(true);
+    setStatus("请先完成 Whisper 模型设置");
+  }
+
+  async function handleDownloadWhisperModel() {
+    setBusy("whisper-download");
+    setWhisperSetupError(null);
+    setWhisperDownloadProgress(null);
+    let installedStatus: WhisperModelStatus | null = null;
+    try {
+      installedStatus = await desktopApi.downloadWhisperModel(recommendedWhisperModelId);
+      setWhisperModelStatus(installedStatus);
+      setSettings((current) => ({
+        ...current,
+        whisperModel: installedStatus?.configuredPath || installedStatus?.resolvedPath || current.whisperModel,
+      }));
+      setSettingsDraft((current) => ({
+        ...current,
+        whisperModel: installedStatus?.configuredPath || installedStatus?.resolvedPath || current.whisperModel,
+      }));
+      setStatus("Whisper 模型已就绪");
+    } catch (error) {
+      const parsed = parsePipelineError(error);
+      setWhisperSetupError(parsed.message);
+      setStatus(`Whisper 模型下载失败：${parsed.message}`);
+    } finally {
+      setBusy(null);
+    }
+    if (installedStatus) {
+      await resumePendingWhisperAction(installedStatus);
+    }
+  }
+
+  async function handleCancelWhisperDownload() {
+    try {
+      await desktopApi.cancelWhisperModelDownload();
+      setWhisperDownloadProgress(null);
+      setStatus("已取消 Whisper 模型下载");
+    } catch (error) {
+      setWhisperSetupError(parsePipelineError(error).message);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleSelectWhisperModel() {
+    setBusy("whisper-select");
+    setWhisperSetupError(null);
+    let selectedStatus: WhisperModelStatus | null = null;
+    try {
+      const path = await desktopApi.pickWhisperModelFile();
+      if (!path) return;
+      selectedStatus = await desktopApi.selectWhisperModel(path);
+      setWhisperModelStatus(selectedStatus);
+      setSettings((current) => ({ ...current, whisperModel: path }));
+      setSettingsDraft((current) => ({ ...current, whisperModel: path }));
+      setStatus("已选择本地 Whisper 模型");
+    } catch (error) {
+      const parsed = parsePipelineError(error);
+      setWhisperSetupError(parsed.message);
+      setStatus(`选择 Whisper 模型失败：${parsed.message}`);
+    } finally {
+      setBusy(null);
+    }
+    if (selectedStatus) {
+      await resumePendingWhisperAction(selectedStatus);
+    }
+  }
+
+  async function handleDeleteWhisperModel() {
+    setBusy("whisper-delete");
+    try {
+      const nextStatus = await desktopApi.deleteWhisperModel();
+      setWhisperModelStatus(nextStatus);
+      setSettings((current) => ({ ...current, whisperModel: nextStatus.configuredPath || "" }));
+      setSettingsDraft((current) => ({ ...current, whisperModel: nextStatus.configuredPath || "" }));
+      setStatus("Whisper 模型已删除");
+    } catch (error) {
+      setStatus(parsePipelineError(error).message);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleOpenModelsDirectory() {
+    try {
+      await desktopApi.openModelsDirectory();
+    } catch (error) {
+      setStatus(parsePipelineError(error).message);
+    }
+  }
+
+  async function resumePendingWhisperAction(statusOverride?: WhisperModelStatus | null) {
+    if (!hasWhisperModel(statusOverride ?? whisperModelStatus)) return;
+    const pending = pendingWhisperActionRef.current;
+    pendingWhisperActionRef.current = null;
+    setWhisperSetupOpen(false);
+    setWhisperSetupError(null);
+    setWhisperDownloadProgress(null);
+    if (!pending) return;
+    if (pending.kind === "generate-pipeline") {
+      await handleGeneratePipeline(pending.payload as GeneratePipelineInput, { skipWhisperGate: true });
+      return;
+    }
+    await handleRecognizeSubtitles(pending.payload as { translate: boolean; mode: SubtitleGenerationMode }, { skipWhisperGate: true });
+  }
+
+  function cancelPendingWhisperAction() {
+    pendingWhisperActionRef.current = null;
+    setWhisperSetupOpen(false);
+    setWhisperSetupError(null);
+    setStatus("已取消 Whisper 设置");
+  }
+
   async function handleSaveSettings() {
     setBusy("settings");
     try {
-      const saved = await desktopApi.saveSettings(settings);
+      const saved = await desktopApi.saveSettings(settingsDraft);
       setSettings(saved);
+      setSettingsDraft(saved);
+      await refreshWhisperModelStatus();
       setShowSettings(false);
       setStatus("设置已保存");
     } finally {
@@ -1112,7 +1291,7 @@ export function App() {
     if (!project) return;
     if (!selectedVoiceId && !settings.fishAudioReferenceId) {
       setStatus("请先选择 Fish 音色，或在设置中配置 Fish Audio Reference ID");
-      setShowSettings(true);
+      openSettings();
       return;
     }
     setBusy("audio");
@@ -1270,8 +1449,12 @@ export function App() {
   }
 
   /** 识别字幕：项目旁白单次 Whisper → AI 语义断句 → Layout Engine → 可选翻译。 */
-  async function handleRecognizeSubtitles(options: { translate: boolean; mode: SubtitleGenerationMode }) {
+  async function handleRecognizeSubtitles(options: { translate: boolean; mode: SubtitleGenerationMode }, control?: { skipWhisperGate?: boolean }) {
     const { translate, mode } = options;
+    if (!control?.skipWhisperGate && shouldGateWhisperAction(whisperModelStatus)) {
+      requestWhisperSetup("subtitle-recognition", options);
+      return;
+    }
     const currentProject = projectRef.current;
     if (!currentProject) return;
     setBusy("subtitles");
@@ -1436,7 +1619,7 @@ export function App() {
     if (!project || !selectedClip) return;
     if (!selectedVoiceId && !settings.fishAudioReferenceId) {
       setStatus("请先选择 Fish 音色，或在设置中配置 Fish Audio Reference ID");
-      setShowSettings(true);
+      openSettings();
       return;
     }
     // 找到当前选中 clip 同起始位置的配音 clip（支持多配音轨）
@@ -1487,7 +1670,11 @@ export function App() {
    * 文案模式：文案 → Fish Audio 整篇旁白 → whisper 句级识别 → AI 配关键词 → 自动配素材 → 字幕识别
    * 音频模式：导入音频 → whisper 句级识别 → AI 配关键词 → 自动配素材 → 字幕识别
    */
-  async function handleGeneratePipeline(input: GeneratePipelineInput) {
+  async function handleGeneratePipeline(input: GeneratePipelineInput, control?: { skipWhisperGate?: boolean }) {
+    if (!control?.skipWhisperGate && shouldGateWhisperAction(whisperModelStatus)) {
+      requestWhisperSetup("generate-pipeline", input);
+      return;
+    }
     const sourceType = input.audioPath ? "audio" as const : "script" as const;
     let pipelineProject: Project | null = null;
 
@@ -2685,9 +2872,55 @@ export function App() {
     : "basic";
 
   // 诊断：错误日志已改为 main.tsx 自动写文件，不再在 UI 显示
+  const sharedOverlays = (
+    <>
+      <GenerateWizard
+        open={showGenerate}
+        onClose={() => { setShowGenerate(false); resetPipeline(); }}
+        voiceProfiles={voiceProfiles}
+        hasDeepSeekKey={!!settings.deepseekApiKey}
+        hasPexelsKey={!!settings.pexelsApiKey}
+        hasFishAudioKey={!!settings.fishAudioApiKey}
+        hasFishAudioVoice={!!settings.fishAudioReferenceId}
+        pipeline={pipeline}
+        onStart={(input) => handleGeneratePipeline(input)}
+        onError={(msg) => setStatus(msg)}
+      />
+      {showSettings && (
+        <UnifiedSettingsDialog
+          settings={settingsDraft}
+          appInfo={appInfo}
+          ffmpeg={ffmpeg}
+          whisperStatus={whisperModelStatus}
+          busy={busy}
+          onChange={setSettingsDraft}
+          onSave={handleSaveSettings}
+          onClose={() => setShowSettings(false)}
+          onDownloadWhisper={openWhisperSetup}
+          onSelectWhisper={handleSelectWhisperModel}
+          onDeleteWhisper={handleDeleteWhisperModel}
+          onOpenModelsDirectory={handleOpenModelsDirectory}
+        />
+      )}
+      <WhisperSetupDialog
+        open={whisperSetupOpen}
+        status={whisperModelStatus}
+        progress={whisperDownloadProgress}
+        busy={busy === "whisper-download" || busy === "whisper-select"}
+        error={whisperSetupError}
+        onDownload={handleDownloadWhisperModel}
+        onSelectLocal={handleSelectWhisperModel}
+        onContinue={() => { void resumePendingWhisperAction(); }}
+        onCancelDownload={handleCancelWhisperDownload}
+        onCancel={cancelPendingWhisperAction}
+      />
+    </>
+  );
+
   // 首页 vs 编辑器
   if (view === "home") {
     return (
+      <>
       <HomeScreen
         projects={projects}
         onOpen={async (id) => {
@@ -2724,7 +2957,13 @@ export function App() {
           await desktopApi.deleteProject(id);
           await refreshProjects();
         }}
+        settings={settings}
+        whisperStatus={whisperModelStatus}
+        onSettings={() => openSettings()}
+        onDownloadWhisper={openWhisperSetup}
       />
+      {sharedOverlays}
+      </>
     );
   }
 
@@ -2757,7 +2996,7 @@ export function App() {
         onRedo={redo}
         onSave={() => project && persist(project)}
         onModeChange={setEditorMode}
-        onSettings={() => setShowSettings(true)}
+        onSettings={() => openSettings()}
         onExport={() => { setShowExport(true); setExportState("idle"); }}
       />
 
@@ -3882,20 +4121,6 @@ export function App() {
       )}
 
       {/* 导出弹窗 */}
-      {/* 一键生成向导 */}
-      <GenerateWizard
-        open={showGenerate}
-        onClose={() => { setShowGenerate(false); resetPipeline(); }}
-        voiceProfiles={voiceProfiles}
-        hasDeepSeekKey={!!settings.deepseekApiKey}
-        hasPexelsKey={!!settings.pexelsApiKey}
-        hasFishAudioKey={!!settings.fishAudioApiKey}
-        hasFishAudioVoice={!!settings.fishAudioReferenceId}
-        pipeline={pipeline}
-        onStart={(input) => handleGeneratePipeline(input)}
-        onError={(msg) => setStatus(msg)}
-      />
-
       {/* EDL 预览：AI 分段后先让用户确认/编辑，再执行编排 */}
       {edlSegments && (
         <EdlPreview
@@ -4186,137 +4411,7 @@ export function App() {
         );
       })()}
 
-      {showSettings && (
-        <div className="modal-backdrop">
-          <div className="settings-modal">
-            <div className="modal-title">
-              <div>
-                <SettingsIcon size={18} />
-                <strong>统一设置</strong>
-              </div>
-              <button className="icon-button" onClick={() => setShowSettings(false)}>
-                <XCircle size={18} />
-              </button>
-            </div>
-            <div className="settings-grid">
-              <label>
-                DeepSeek Key
-                <input
-                  type="password"
-                  value={settings.deepseekApiKey}
-                  onChange={(event) => setSettings({ ...settings, deepseekApiKey: event.target.value })}
-                  placeholder="sk-..."
-                />
-              </label>
-              <label>
-                Pexels Key
-                <input
-                  type="password"
-                  value={settings.pexelsApiKey}
-                  onChange={(event) => setSettings({ ...settings, pexelsApiKey: event.target.value })}
-                />
-              </label>
-              <label>
-                Fish Audio API Key
-                <input
-                  type="password"
-                  value={settings.fishAudioApiKey || ""}
-                  onChange={(event) => setSettings({ ...settings, fishAudioApiKey: event.target.value })}
-                  placeholder="Bearer token"
-                />
-              </label>
-              <label>
-                Fish 模型
-                <input
-                  value={settings.fishAudioModel || "s1"}
-                  onChange={(event) => setSettings({ ...settings, fishAudioModel: event.target.value })}
-                  placeholder="s1"
-                />
-              </label>
-              <label>
-                Fish Reference ID
-                <input
-                  value={settings.fishAudioReferenceId || ""}
-                  onChange={(event) => setSettings({ ...settings, fishAudioReferenceId: event.target.value })}
-                  placeholder="Fish Audio voice/reference id"
-                />
-              </label>
-              <label>
-                Fish 输出格式
-                <select
-                  value={settings.fishAudioFormat || "mp3"}
-                  onChange={(event) => setSettings({ ...settings, fishAudioFormat: event.target.value })}
-                >
-                  <option value="mp3">MP3</option>
-                  <option value="wav">WAV</option>
-                  <option value="aac">AAC</option>
-                  <option value="opus">OPUS</option>
-                </select>
-              </label>
-              <label>
-                Fish 采样率
-                <input
-                  type="number"
-                  value={settings.fishAudioSampleRate || 44100}
-                  onChange={(event) => setSettings({ ...settings, fishAudioSampleRate: Number(event.target.value) || 44100 })}
-                />
-              </label>
-              <label>
-                默认比例
-                <select
-                  value={settings.defaultRatio}
-                  onChange={(event) => setSettings({ ...settings, defaultRatio: event.target.value })}
-                >
-                  {ratios.map((ratio) => (
-                    <option key={ratio}>{ratio}</option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                渲染预设
-                <select
-                  value={settings.renderPreset}
-                  onChange={(event) => setSettings({ ...settings, renderPreset: event.target.value })}
-                >
-                  <option value="preview-fast">快速预览</option>
-                  <option value="export-high">高清导出</option>
-                </select>
-              </label>
-              <label>
-                Whisper 命令（通常无需修改）
-                <input
-                  value={settings.whisperBin || whisperDefaultBin}
-                  onChange={(event) => setSettings({ ...settings, whisperBin: event.target.value })}
-                  placeholder={whisperDefaultBin}
-                />
-              </label>
-              <label>
-                Whisper 模型路径（.bin 文件）
-                <input
-                  value={settings.whisperModel || ""}
-                  onChange={(event) => setSettings({ ...settings, whisperModel: event.target.value })}
-                  placeholder={appInfo?.modelsDir ? `${appInfo.modelsDir}/ggml-medium-q5_0.bin` : "留空则自动扫描应用 models 目录"}
-                />
-              </label>
-            </div>
-
-            {/* 导出设置已移至导出弹窗 */}
-            <p className="settings-hint" style={{ marginTop: 8 }}>
-              导出设置（分辨率/帧率/码率）已移至「导出」弹窗，点击顶栏「导出」按钮即可设置。
-            </p>
-            <p className="settings-hint">
-              Fish Audio 用于配音生成；桌面安装包已内置 FFmpeg、FFprobe 和 whisper-cli。Whisper 模型请放入 {appInfo?.modelsDir || "应用数据 models 目录"}，或在上方指定路径。
-            </p>
-            <div className="modal-actions">
-              <button onClick={() => setShowSettings(false)}>取消</button>
-              <button className="primary-button" onClick={handleSaveSettings}>
-                {busy === "settings" ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
-                保存设置
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      {sharedOverlays}
     </div>
   );
 }

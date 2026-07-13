@@ -32,6 +32,39 @@ export type AppSettings = {
   whisperModel?: string;
 };
 
+export type WhisperModelDescriptor = {
+  id: string;
+  name: string;
+  fileName: string;
+  sizeBytes: number;
+  sha256: string;
+  description: string;
+  recommended: boolean;
+};
+
+export type WhisperModelStatus = {
+  model: WhisperModelDescriptor;
+  available: boolean;
+  resolvedPath?: string | null;
+  configuredPath?: string | null;
+  selectedModelId?: string | null;
+  downloadedBytes: number;
+  totalBytes: number;
+  partialDownload: boolean;
+  downloading: boolean;
+  modelsDir: string;
+  whisperAvailable: boolean;
+  whisperPath: string;
+};
+
+export type WhisperModelDownloadProgress = {
+  modelId: string;
+  downloadedBytes: number;
+  totalBytes: number;
+  progress: number;
+  message: string;
+};
+
 // ============================================================================
 // 音色
 // ============================================================================

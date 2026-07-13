@@ -237,7 +237,15 @@ pub fn whisper_model_candidates(configured: &str, app_data_dir: &Path) -> Vec<Pa
 pub fn resolve_whisper_model(configured: &str, app_data_dir: &Path) -> Option<PathBuf> {
     whisper_model_candidates(configured, app_data_dir)
         .into_iter()
-        .find(|path| path.is_file())
+        .find(|path| {
+            std::fs::symlink_metadata(path)
+                .map(|metadata| {
+                    metadata.file_type().is_file()
+                        && !metadata.file_type().is_symlink()
+                        && metadata.len() >= 1_000_000
+                })
+                .unwrap_or(false)
+        })
 }
 
 #[cfg(test)]

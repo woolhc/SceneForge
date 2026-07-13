@@ -21,8 +21,9 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "r
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 tauri = { version = "2.9.1", features = ["protocol-asset"] }
-tokio = { version = "1.42", features = ["process", "rt-multi-thread", "macros", "fs"] }
+tokio = { version = "1.42", features = ["process", "rt-multi-thread", "macros", "fs", "io-util", "sync", "time"] }
 uuid = { version = "1.11", features = ["v4", "serde"] }
 tauri-plugin-dialog = "2.7.1"
 which = "8.0.4"

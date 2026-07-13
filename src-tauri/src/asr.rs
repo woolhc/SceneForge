@@ -138,15 +138,9 @@ fn parse_timestamp(s: &str) -> f64 {
     h * 3600.0 + m * 60.0 + sec + millis
 }
 
-/// 跨平台 whisper 安装指引
+/// Whisper 就绪指引。安装包内置 whisper-cli，模型由应用首次使用流程管理。
 fn whisper_install_hint() -> String {
-    if cfg!(target_os = "macos") {
-        "macOS：终端运行 `brew install whisper-cpp`，然后下载量化模型：\n  curl -L -o /opt/homebrew/share/whisper-cpp/ggml-medium-q5_0.bin \\\n    https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-medium-q5_0.bin".to_string()
-    } else if cfg!(target_os = "windows") {
-        "Windows：从 https://github.com/ggerganov/whisper.cpp/releases 下载预编译版（whisper-bin-x64.zip），解压后在命令行运行，或用 vcpkg：`vcpkg install whisper-cpp`。模型从 https://huggingface.co/ggerganov/whisper.cpp 下载（如 ggml-medium-q5_0.bin）".to_string()
-    } else {
-        "Linux：`sudo apt install whisper-cpp` 或从源码编译，模型放 /usr/local/share/whisper-cpp/。下载：curl -L -o ggml-medium-q5_0.bin https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-medium-q5_0.bin".to_string()
-    }
+    "请打开 SceneForge「设置 → 语音识别」下载推荐模型，或选择已有的 Whisper `.bin` 模型。若 whisper-cli 缺失，请重新安装 SceneForge；开发模式可在设置中指定本机命令。".to_string()
 }
 
 /// 调用 whisper-cli 识别音频，返回带时间戳的原始片段。
