@@ -243,8 +243,8 @@ pub fn resolve_whisper_model(configured: &str, app_data_dir: &Path) -> Option<Pa
 #[cfg(test)]
 mod tests {
     use super::{
-        bundled_candidates_for_roots, path_candidates, resolve_with, whisper_model_candidates,
-        NativeTool, ToolSource,
+        bundled_candidates_for_roots, path_candidates, platform_executable_name, resolve_with,
+        whisper_model_candidates, NativeTool, ToolSource,
     };
     use std::path::{Path, PathBuf};
 
@@ -285,13 +285,22 @@ mod tests {
 
     #[test]
     fn bundle_roots_cover_executable_and_resource_layouts() {
+        let executable_root = PathBuf::from("/app/bin");
+        let resource_root = PathBuf::from("/app/resources");
+        let executable = platform_executable_name(NativeTool::Ffmpeg);
         let candidates = bundled_candidates_for_roots(
-            &[PathBuf::from("/app/bin"), PathBuf::from("/app/resources")],
+            &[executable_root.clone(), resource_root.clone()],
             NativeTool::Ffmpeg,
         );
-        assert!(candidates.iter().any(|path| path.ends_with("bin/ffmpeg")));
-        assert!(candidates
-            .iter()
-            .any(|path| path.ends_with("resources/ffmpeg")));
+
+        assert_eq!(
+            candidates,
+            vec![
+                executable_root.join(&executable),
+                executable_root.join("bin").join(&executable),
+                resource_root.join(&executable),
+                resource_root.join("bin").join(&executable),
+            ]
+        );
     }
 }
