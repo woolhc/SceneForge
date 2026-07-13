@@ -3,6 +3,8 @@ name: Desktop Build
 on:
   push:
     branches: [main, dev]
+    tags:
+      - "v*"
   pull_request:
   workflow_dispatch:
 
@@ -109,3 +111,67 @@ jobs:
             src-tauri/target/release/bundle/deb/*.deb
             src-tauri/target/release/bundle/rpm/*.rpm
           if-no-files-found: error
+
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download native installers
+        uses: actions/download-artifact@v5
+        with:
+          path: release-assets
+
+      - name: Collect release assets
+        id: assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' files < <(
+            find release-assets -type f \
+              \( \
+                -iname '*.dmg' \
+                -o -iname '*.exe' \
+                -o -iname '*.msi' \
+                -o -iname '*.appimage' \
+                -o -iname '*.deb' \
+                -o -iname '*.rpm' \
+              \) \
+              -print0
+          )
+
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No native installers found"
+            exit 1
+          fi
+
+          printf 'Release assets:\n'
+          printf '  %s\n' "${files[@]}"
+          printf '%s\0' "${files[@]}" > "$RUNNER_TEMP/release-assets.list"
+
+      - name: Publish or update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mapfile -d '' files < "$RUNNER_TEMP/release-assets.list"
+
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" \
+              "${files[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              "${files[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --generate-notes \
+              --title "SceneForge $GITHUB_REF_NAME"
+          fi
