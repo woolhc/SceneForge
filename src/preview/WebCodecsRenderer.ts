@@ -87,6 +87,11 @@ export class WebCodecsRenderer implements PreviewRenderer {
   private lutCache = new Map<string, Uint8Array | null>();
   private uploadCanvas: HTMLCanvasElement | null = null;
   private uploadCtx: CanvasRenderingContext2D | null = null;
+  private lastPublishedVideoClip: Clip | null = null;
+  private lastPublishedOverlayIds = "";
+  private lastPublishedOverlayClips: Clip[] = [];
+  private lastPublishedSubIds = "";
+  private lastPublishedSubs: Clip[] = [];
 
   constructor(stageContainer: HTMLElement, private onTick: (state: EngineState) => void) {
     this.canvas = document.createElement("canvas");
@@ -113,6 +118,13 @@ export class WebCodecsRenderer implements PreviewRenderer {
     const previousProjectId = this.project?.id ?? null;
     this.project = project;
     this.renderGraph = project ? compileRenderGraph(project) : null;
+    // 同一项目内字幕文本/样式/时间也可能改变；每次同步项目都失效发布缓存，
+    // 随后的逐帧 publish 再按 id 复用新快照，避免旧 clip 引用卡住预览。
+    this.lastPublishedVideoClip = null;
+    this.lastPublishedOverlayIds = "";
+    this.lastPublishedOverlayClips = [];
+    this.lastPublishedSubIds = "";
+    this.lastPublishedSubs = [];
     if (!project || previousProjectId !== project.id) {
       this.currentClipId = null;
       this.decodedClip = null;
@@ -542,10 +554,34 @@ export class WebCodecsRenderer implements PreviewRenderer {
     const projection = frame
       ? projectFrameToEngineState(frame)
       : { activeVideoClip: null, activeOverlayClips: [], activeSubtitleClips: [] };
+    const subIds = projection.activeSubtitleClips.map((clip) => clip.id).join("|");
+    const activeSubtitleClips = subIds === this.lastPublishedSubIds
+      ? this.lastPublishedSubs
+      : projection.activeSubtitleClips;
+    if (subIds !== this.lastPublishedSubIds) {
+      this.lastPublishedSubIds = subIds;
+      this.lastPublishedSubs = projection.activeSubtitleClips;
+    }
+
+    const overlayIds = projection.activeOverlayClips.map((clip) => clip.id).join("|");
+    const activeOverlayClips = overlayIds === this.lastPublishedOverlayIds
+      ? this.lastPublishedOverlayClips
+      : projection.activeOverlayClips;
+    if (overlayIds !== this.lastPublishedOverlayIds) {
+      this.lastPublishedOverlayIds = overlayIds;
+      this.lastPublishedOverlayClips = projection.activeOverlayClips;
+    }
+
+    const activeVideoClip = projection.activeVideoClip?.id === this.lastPublishedVideoClip?.id
+      ? this.lastPublishedVideoClip
+      : projection.activeVideoClip;
+    this.lastPublishedVideoClip = activeVideoClip;
     this.onTick({
       currentTime: this.currentTime,
       playing: this.playing,
-      ...projection,
+      activeVideoClip,
+      activeOverlayClips,
+      activeSubtitleClips,
     });
   }
 

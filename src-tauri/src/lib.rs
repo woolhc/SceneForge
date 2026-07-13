@@ -11,6 +11,7 @@ mod render_plan;
 mod source_window;
 mod storage;
 mod temp;
+mod tools;
 mod tts;
 
 use storage::AppState;
@@ -29,6 +30,10 @@ pub fn run() {
     };
 
     tauri::Builder::default()
+        .setup(|app| {
+            tools::initialize_bundle_roots(app.handle());
+            Ok(())
+        })
         .plugin(tauri_plugin_dialog::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
@@ -57,6 +62,7 @@ pub fn run() {
             commands::search_pexels_videos,
             commands::search_pexels_photos,
             commands::cache_asset_video,
+            commands::generate_narration,
             commands::generate_audio,
             commands::detach_audio,
             commands::separate_vocals,
@@ -64,6 +70,11 @@ pub fn run() {
             commands::import_srt,
             commands::transcribe_to_text,
             commands::transcribe_to_sentences,
+            commands::transcribe_project_narration,
+            commands::save_subtitle_artifact,
+            commands::refine_transcript,
+            commands::analyze_subtitle_language_context,
+            commands::advise_subtitle_breaks,
             commands::enrich_segments,
             commands::import_media,
             commands::generate_thumbnail,

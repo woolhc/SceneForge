@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { computeDraggedClip, type DragState } from "../../src/timeline/clipInteraction";
+import { computeDraggedClip, hasExceededPointerDragThreshold, shouldStartTimelinePan, type DragState } from "../../src/timeline/clipInteraction";
 import type { Clip } from "../../src/types";
 
 function clip(patch: Partial<Clip> = {}): Clip {
@@ -60,3 +60,9 @@ assert.equal(leftTrim.startOnTrack, 14);
 assert.equal(leftTrim.duration, 6);
 assert.equal(leftTrim.sourceIn, 0);
 assert.equal(leftTrim.sourceOut, 6);
+
+assert.equal(hasExceededPointerDragThreshold(100, 104), false, "4px 手抖不应触发拖拽");
+assert.equal(hasExceededPointerDragThreshold(100, 105), true, "达到 5px 后才正式拖拽");
+assert.equal(shouldStartTimelinePan(0, false), false, "普通左键拖动不应误触时间轴平移");
+assert.equal(shouldStartTimelinePan(1, false), true, "中键可平移时间轴");
+assert.equal(shouldStartTimelinePan(0, true), true, "Alt+左键可平移时间轴");

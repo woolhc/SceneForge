@@ -1,6 +1,7 @@
 import { CheckCircle2, FileText, Loader2, Mic, Sparkles, Upload, X, XCircle } from "lucide-react";
 import { useState } from "react";
 import type { VoiceProfile } from "../types";
+import type { GenerationReport } from "../editor/generationSession";
 import { desktopApi } from "../tauri";
 
 export type PipelineStep = {
@@ -12,6 +13,7 @@ export type PipelineState = {
   active: boolean;
   steps: PipelineStep[];
   error: string | null;
+  report: GenerationReport | null;
 };
 
 export function GenerateWizard({
@@ -20,6 +22,8 @@ export function GenerateWizard({
   voiceProfiles,
   hasDeepSeekKey,
   hasPexelsKey,
+  hasFishAudioKey,
+  hasFishAudioVoice,
   pipeline,
   onStart,
   onError,
@@ -29,25 +33,33 @@ export function GenerateWizard({
   voiceProfiles: VoiceProfile[];
   hasDeepSeekKey: boolean;
   hasPexelsKey: boolean;
+  hasFishAudioKey: boolean;
+  hasFishAudioVoice: boolean;
   pipeline: PipelineState;
-  onStart: (input: { script: string; ratio: string; voiceId: string; translate: boolean; audioPath?: string | null }) => void;
+  onStart: (input: { script: string; ratio: string; voiceId: string; translate: boolean; materialDirection: string; audioPath?: string | null }) => void;
   onError?: (message: string) => void;
 }) {
   const [mode, setMode] = useState<"script" | "audio">("script");
   const [script, setScript] = useState("");
   const [ratio, setRatio] = useState("9:16");
   const [voiceId, setVoiceId] = useState("");
+  const [materialDirection, setMaterialDirection] = useState("auto");
+  const [customMaterialKeywords, setCustomMaterialKeywords] = useState("");
   const [translate, setTranslate] = useState(false);
-  const [transcribing, setTranscribing] = useState(false);
   const [audioPath, setAudioPath] = useState<string | null>(null);
 
   if (!open) return null;
 
   const canStart =
-    script.trim().length > 0 &&
-    (mode === "audio" || voiceId) &&
+    (mode === "audio" ? Boolean(audioPath) : script.trim().length > 0 && Boolean(voiceId || hasFishAudioVoice)) &&
     hasDeepSeekKey &&
-    hasPexelsKey;
+    hasPexelsKey &&
+    (mode === "audio" || hasFishAudioKey);
+
+  const resolvedMaterialDirection =
+    materialDirection === "custom"
+      ? `custom:${customMaterialKeywords.trim()}`
+      : materialDirection;
 
   async function handleImportAudio() {
     const path = await desktopApi.pickMediaFile();
@@ -58,19 +70,8 @@ export function GenerateWizard({
       return;
     }
     setAudioPath(path);
-    setTranscribing(true);
+    // 不在导入阶段预转写；正式生成时只运行一次 Whisper，并复用其时间戳生成字幕。
     setScript("");
-    try {
-      const text = await desktopApi.transcribeToText(path);
-      setScript(text);
-    } catch (e) {
-      setScript("");
-      const msg = e instanceof Error ? e.message : String(e);
-      // M3: 用 onError 回调替代 alert，由父组件统一用 status 条提示
-      onError?.("音频识别失败：" + msg);
-    } finally {
-      setTranscribing(false);
-    }
   }
 
   // 流水线运行中 → 显示进度
@@ -96,8 +97,25 @@ export function GenerateWizard({
           {pipeline.error && (
             <div className="pipeline-error">{pipeline.error}</div>
           )}
-          {pipeline.error && (
-            <button className="primary-button" onClick={onClose}>关闭</button>
+          {pipeline.report && (
+            <div className="generation-report">
+              <strong>生成报告</strong>
+              <div><span>旁白时长</span><b>{pipeline.report.narrationDuration.toFixed(1)}s</b></div>
+              <div><span>分镜数量</span><b>{pipeline.report.segmentCount}</b></div>
+              <div><span>成功匹配素材</span><b>{pipeline.report.matchedAssetCount}</b></div>
+              <div><span>重复素材</span><b>{pipeline.report.duplicateAssetCount}</b></div>
+              <div><span>低置信度片段</span><b>{pipeline.report.lowConfidenceSegmentCount}</b></div>
+              <div><span>失败片段</span><b>{pipeline.report.failedSegmentCount}</b></div>
+              <div><span>字幕质量提示</span><b>{pipeline.report.subtitleIssueCount}</b></div>
+              {pipeline.report.lowConfidenceSegmentCount > 0 && (
+                <small>低置信度片段已保留为空素材，可在时间线中逐段搜索、替换或改为文字卡。</small>
+              )}
+            </div>
+          )}
+          {(pipeline.error || pipeline.report) && (
+            <button className="primary-button" onClick={onClose}>
+              {pipeline.report ? "进入编辑器" : "关闭"}
+            </button>
           )}
         </div>
       </div>
@@ -142,30 +160,34 @@ export function GenerateWizard({
               <div className="audio-imported">
                 <Mic size={16} />
                 <span>{audioPath.split("/").pop()}</span>
-                <button onClick={handleImportAudio} disabled={transcribing}>更换</button>
+                <button onClick={handleImportAudio} >更换</button>
               </div>
             ) : (
-              <button className="wizard-upload" onClick={handleImportAudio} disabled={transcribing}>
-                {transcribing ? <Loader2 className="spin" size={18} /> : <Upload size={18} />}
-                {transcribing ? "正在识别音频..." : "导入音频文件"}
+              <button className="wizard-upload" onClick={handleImportAudio} >
+                <Upload size={18} />
+                导入音频文件
               </button>
             )}
           </div>
         )}
 
-        {/* 文案输入 */}
-        <div className="wizard-section">
-          <label className="wizard-label">
-            {mode === "audio" ? "识别结果（可编辑）" : "文案内容"}
-          </label>
-          <textarea
-            className="wizard-script"
-            value={script}
-            onChange={(e) => setScript(e.target.value)}
-            placeholder={mode === "audio" ? "导入音频后自动识别..." : "粘贴你的文案，例如：\n人生最好的状态，不是一直向前冲，而是知道什么时候停下来..."}
-            rows={6}
-          />
-        </div>
+        {/* 文案输入；音频模式不预转写，避免和正式流水线重复执行 Whisper。 */}
+        {mode === "script" ? (
+          <div className="wizard-section">
+            <label className="wizard-label">文案内容</label>
+            <textarea
+              className="wizard-script"
+              value={script}
+              onChange={(e) => setScript(e.target.value)}
+              placeholder={"粘贴你的文案，例如：\n人生最好的状态，不是一直向前冲，而是知道什么时候停下来..."}
+              rows={6}
+            />
+          </div>
+        ) : (
+          <div className="wizard-section wizard-note">
+            主旁白会在生成阶段统一执行一次 Whisper 转写；分镜和字幕将复用同一份时间戳。
+          </div>
+        )}
 
         {/* 设置 */}
         <div className="wizard-options">
@@ -179,13 +201,34 @@ export function GenerateWizard({
           </label>
           {mode === "script" && (
             <label className="wizard-field">
-              配音音色
+              Fish 音色
               <select value={voiceId} onChange={(e) => setVoiceId(e.target.value)}>
-                <option value="">选择音色</option>
+                <option value="">使用默认 Reference ID</option>
                 {voiceProfiles.map((v) => (
                   <option key={v.id} value={v.id}>{v.name}</option>
                 ))}
               </select>
+            </label>
+          )}
+          <label className="wizard-field">
+            素材方向
+            <select value={materialDirection} onChange={(e) => setMaterialDirection(e.target.value)}>
+              <option value="auto">AI 自动判断</option>
+              <option value="scenery">风景 / 空镜</option>
+              <option value="people">人物 / 生活方式</option>
+              <option value="business">商业 / 办公</option>
+              <option value="abstract">抽象 / 质感</option>
+              <option value="custom">自定义关键词</option>
+            </select>
+          </label>
+          {materialDirection === "custom" && (
+            <label className="wizard-field wizard-field-wide">
+              自定义关键词
+              <input
+                value={customMaterialKeywords}
+                onChange={(e) => setCustomMaterialKeywords(e.target.value)}
+                placeholder="例如：海边、日落、年轻人、城市夜景"
+              />
             </label>
           )}
           <label className="wizard-checkbox">
@@ -197,7 +240,9 @@ export function GenerateWizard({
         {/* 校验提示 */}
         {!hasDeepSeekKey && <p className="wizard-warn">⚠️ 需要先在设置中配置 DeepSeek API Key</p>}
         {!hasPexelsKey && <p className="wizard-warn">⚠️ 需要先在设置中配置 Pexels API Key</p>}
-        {mode === "script" && voiceProfiles.length === 0 && <p className="wizard-warn">⚠️ 需要先在音频 Tab 上传克隆音色</p>}
+        {mode === "script" && !hasFishAudioKey && <p className="wizard-warn">⚠️ 需要先在设置中配置 Fish Audio API Key</p>}
+        {mode === "script" && !voiceId && !hasFishAudioVoice && <p className="wizard-warn">⚠️ 需要配置 Fish Audio Reference ID，或选择一个 Fish 音色</p>}
+        {mode === "audio" && !audioPath && <p className="wizard-warn">⚠️ 音频生成需要先导入音频文件</p>}
 
         {/* 启动按钮 */}
         <div className="wizard-actions">
@@ -205,7 +250,14 @@ export function GenerateWizard({
           <button
             className="primary-button"
             disabled={!canStart}
-            onClick={() => onStart({ script, ratio, voiceId: mode === "audio" ? "" : voiceId, translate, audioPath: mode === "audio" ? audioPath : null })}
+            onClick={() => onStart({
+              script,
+              ratio,
+              voiceId: mode === "audio" ? "" : voiceId,
+              translate,
+              materialDirection: resolvedMaterialDirection,
+              audioPath: mode === "audio" ? audioPath : null,
+            })}
           >
             <Sparkles size={16} />
             开始生成

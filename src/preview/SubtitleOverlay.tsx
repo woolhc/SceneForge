@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import type { Clip, SubtitleStyle, WordCue } from "../types";
 import { DEFAULT_SUBTITLE_STYLE } from "../types";
 import { usePlaybackStore } from "../store/playbackStore";
+import { quantizeSubtitleClock, subtitleNeedsLiveClock } from "./subtitleClock";
 
 /**
  * 字幕叠层组件（剪映式）：用 react-moveable 实现
@@ -65,7 +66,11 @@ export function SubtitleOverlay({
   const shadowBlur = style.shadowBlur ?? 0;
   const letterSpacing = style.letterSpacing ?? 0;
   const lineHeight = style.lineHeight ?? 1.4;
-  const storeTime = usePlaybackStore((s) => s.currentTime);
+  const needsLiveClock = currentTime === undefined && subtitleNeedsLiveClock(clip);
+  const storeTime = usePlaybackStore((s) => needsLiveClock ? quantizeSubtitleClock(s.currentTime) : 0);
+  const storeActive = usePlaybackStore((s) => currentTime === undefined
+    ? s.currentTime >= clip.startOnTrack && s.currentTime < clip.startOnTrack + clip.duration
+    : true);
   const effectiveTime = currentTime ?? storeTime;
   // 描边粗细随 strokeWidth 调整（用多个 textShadow 模拟描边）
   const strokeShadow = strokeWidth > 0
@@ -125,7 +130,7 @@ export function SubtitleOverlay({
 
   // 选中字幕但播放头不在该 clip 时间范围内时，文字半透明（表示这不是当前播放的字幕，仅作编辑预览）
   const rel = effectiveTime - clip.startOnTrack;
-  const isActive = rel >= 0 && rel < clip.duration;
+  const isActive = currentTime === undefined ? storeActive : rel >= 0 && rel < clip.duration;
   const editPreviewOpacity = isActive ? 1 : 0.35;
 
   return (

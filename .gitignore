@@ -43,3 +43,6 @@ secrets.json
 config.local.*
 credentials.json
 .superpowers/
+
+# Tauri sidecar binaries staged by scripts/prepare-sidecars.mjs
+src-tauri/binaries/

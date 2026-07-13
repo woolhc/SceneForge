@@ -5,6 +5,7 @@
 export type AppInfo = {
   appDataDir: string;
   cacheDir: string;
+  modelsDir: string;
   databasePath: string;
 };
 
@@ -19,6 +20,11 @@ export type AppSettings = {
   deepseekApiKey: string;
   pexelsApiKey: string;
   ttsBaseUrl: string;
+  fishAudioApiKey?: string;
+  fishAudioModel?: string;
+  fishAudioReferenceId?: string;
+  fishAudioFormat?: string;
+  fishAudioSampleRate?: number;
   defaultRatio: string;
   defaultVoiceId?: string | null;
   renderPreset: string;
@@ -44,6 +50,12 @@ export type VoicePreviewResult = {
   voiceId: string;
   audioPath: string;
   duration: number;
+};
+
+export type GenerateNarrationResult = {
+  audioPath: string;
+  duration: number;
+  sourceId: string;
 };
 
 // ============================================================================
@@ -267,6 +279,12 @@ export type Clip = {
   subtitleStyle?: SubtitleStyle | null;
   /** 字幕逐词时间戳（用于逐字高亮；null/空表示无词级数据） */
   words?: WordCue[] | null;
+  /** 双语字幕配对 ID；原文轨和译文轨通过该字段关联。 */
+  subtitleGroupId?: string | null;
+  /** 字幕在双语组中的角色。 */
+  subtitleRole?: "source" | "target" | null;
+  /** 字幕语言标识，例如 en、zh-CN。 */
+  subtitleLanguage?: string | null;
   /** 入场转场 */
   transitionIn?: string | TransitionConfig | null;
   /** 出场转场 */
@@ -383,6 +401,8 @@ export type TimedSentence = {
   start: number;
   end: number;
   text: string;
+  /** 单次 Whisper 产出的词级时间戳，字幕直接复用。 */
+  words?: WordCue[];
 };
 
 /** 音频模式：whisper 识别返回的句子级结果 */
@@ -447,4 +467,49 @@ export const DEFAULT_RENDER_CONFIG: RenderConfig = {
   exportMode: "video",
   transitionDuration: 0.5,
   hwaccel: true,
+};
+
+export type SubtitleProtectedRange = {
+  startWordIndex: number;
+  endWordIndex: number;
+};
+
+export type SubtitleBreakWordTiming = {
+  text: string;
+  start: number;
+  end: number;
+  gapAfter: number;
+};
+
+export type SubtitleBreakConstraints = {
+  ratio: "9:16" | "16:9" | "1:1";
+  maxLines: number;
+  preferredCharsPerLine: number;
+  maxCharsPerCue: number;
+  minDuration: number;
+  preferredDuration: number;
+  maxDuration: number;
+  preferredCps: number;
+  maxCps: number;
+};
+
+export type SubtitleBreakAdviceResult = {
+  preferredBreakAfterIndices: number[];
+  protectedRanges: SubtitleProtectedRange[];
+  confidence: number;
+};
+
+export type SubtitleGenerationMode = "precise" | "natural" | "short_form";
+
+export type SubtitleLanguageTerm = {
+  source: string;
+  target?: string | null;
+  note?: string | null;
+};
+
+export type SubtitleLanguageContext = {
+  summary: string;
+  contentType: string;
+  tone: string;
+  terms: SubtitleLanguageTerm[];
 };

@@ -13,15 +13,12 @@ static H264_ENCODER: OnceLock<String> = OnceLock::new();
 static HEVC_ENCODER: OnceLock<String> = OnceLock::new();
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
-use crate::models::{Clip, FfmpegStatus, MediaSource, Project, TrackKind};
 use crate::ffmpeg_expression::{
-    compile_keyframe_expression, compile_opacity_alpha_filter,
-    compile_static_opacity_filter,
+    compile_keyframe_expression, compile_opacity_alpha_filter, compile_static_opacity_filter,
 };
+use crate::models::{Clip, FfmpegStatus, MediaSource, Project, TrackKind};
 use crate::render_graph::compile_render_graph;
-use crate::render_plan::{
-    clips_for_indices, compile_render_plan, RenderUnit as PlannedRenderUnit,
-};
+use crate::render_plan::{clips_for_indices, compile_render_plan, RenderUnit as PlannedRenderUnit};
 use crate::source_window::{compile_source_window, SourceWindowPart};
 
 fn apply_source_window_filter(mut filter: String, part: &SourceWindowPart) -> String {
@@ -29,10 +26,7 @@ fn apply_source_window_filter(mut filter: String, part: &SourceWindowPart) -> St
         filter.push_str(",reverse");
     }
     if (part.speed - 1.0).abs() > f64::EPSILON {
-        filter.push_str(&format!(
-            ",setpts={:.6}*(PTS-STARTPTS)",
-            1.0 / part.speed
-        ));
+        filter.push_str(&format!(",setpts={:.6}*(PTS-STARTPTS)", 1.0 / part.speed));
     } else {
         filter.push_str(",setpts=PTS-STARTPTS");
     }
@@ -181,21 +175,27 @@ fn project_output_duration(project: &Project) -> f64 {
 }
 
 pub async fn check_ffmpeg() -> FfmpegStatus {
-    match Command::new("ffmpeg").arg("-version").output().await {
+    let resolution = crate::tools::resolve(crate::tools::NativeTool::Ffmpeg, None);
+    let display_path = resolution.path.to_string_lossy().to_string();
+    match crate::tools::command(crate::tools::NativeTool::Ffmpeg)
+        .arg("-version")
+        .output()
+        .await
+    {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let version = stdout.lines().next().map(|line| line.to_string());
             FfmpegStatus {
                 available: true,
                 version,
-                path: Some("ffmpeg".to_string()),
+                path: Some(display_path.clone()),
                 error: None,
             }
         }
         Ok(output) => FfmpegStatus {
             available: false,
             version: None,
-            path: Some("ffmpeg".to_string()),
+            path: Some(display_path),
             error: Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
         },
         Err(error) => FfmpegStatus {
@@ -221,7 +221,7 @@ pub async fn detect_hw_encoder(codec: &str) -> String {
         )
     };
     // M15: -encoders 只跑一次（之前循环内重复跑）
-    let encoders_text = match Command::new("ffmpeg")
+    let encoders_text = match crate::tools::command(crate::tools::NativeTool::Ffmpeg)
         .args(["-hide_banner", "-encoders"])
         .output()
         .await
@@ -234,7 +234,7 @@ pub async fn detect_hw_encoder(codec: &str) -> String {
             continue;
         }
         // 验证能否真正工作（快速测试编码）
-        let test = Command::new("ffmpeg")
+        let test = crate::tools::command(crate::tools::NativeTool::Ffmpeg)
             .args([
                 "-y",
                 "-f",
@@ -404,7 +404,7 @@ pub async fn extract_audio_from_video(
         chrono::Utc::now().timestamp_millis()
     ));
 
-    let output = Command::new("ffmpeg")
+    let output = crate::tools::command(crate::tools::NativeTool::Ffmpeg)
         .args([
             "-y",
             "-i",
@@ -479,7 +479,7 @@ pub async fn separate_vocals(
     let instrumental_path = out_dir.join(format!("{}_instrumental_{}.wav", stem, timestamp));
 
     // 人声近似：提取中置声道（L+R 的和）
-    let vocals_out = Command::new("ffmpeg")
+    let vocals_out = crate::tools::command(crate::tools::NativeTool::Ffmpeg)
         .args([
             "-y",
             "-i",
@@ -500,7 +500,7 @@ pub async fn separate_vocals(
     }
 
     // 伴奏近似：左右相减消除中置（人声）
-    let inst_out = Command::new("ffmpeg")
+    let inst_out = crate::tools::command(crate::tools::NativeTool::Ffmpeg)
         .args([
             "-y",
             "-i",
@@ -548,7 +548,7 @@ pub async fn generate_thumbnail(
     if output_path.exists() {
         return Ok(output_path);
     }
-    let output = Command::new("ffmpeg")
+    let output = crate::tools::command(crate::tools::NativeTool::Ffmpeg)
         .args([
             "-y",
             "-ss",
@@ -592,7 +592,7 @@ pub async fn generate_proxy_video(
     }
 
     let scale = "scale='if(gte(iw,ih),min(960,iw),-2)':'if(gte(iw,ih),-2,min(960,ih))'";
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = crate::tools::command(crate::tools::NativeTool::Ffmpeg);
     cmd.args([
         "-y",
         "-i",
@@ -642,7 +642,7 @@ pub async fn generate_proxy_video(
 }
 
 async fn probe_video_resolution_public(path: &Path) -> anyhow::Result<(u32, u32)> {
-    let mut cmd = Command::new("ffprobe");
+    let mut cmd = crate::tools::command(crate::tools::NativeTool::Ffprobe);
     cmd.args([
         "-v",
         "error",
@@ -689,7 +689,7 @@ pub async fn generate_filmstrip(
         let id = format!("{}-{}-{}", sanitize_file_stem(stem), (t * 1000.0) as u64, i);
         let output_path = filmstrip_dir.join(format!("{}.jpg", id));
         if !output_path.exists() {
-            let output = Command::new("ffmpeg")
+            let output = crate::tools::command(crate::tools::NativeTool::Ffmpeg)
                 .args([
                     "-y",
                     "-ss",
@@ -724,7 +724,7 @@ pub async fn generate_waveform(
 ) -> anyhow::Result<Vec<(f32, f32)>> {
     // M16: 降采样到 8000Hz（波形显示不需要 CD 质量），大幅减少内存占用
     let sample_rate = 8000u32;
-    let output = Command::new("ffmpeg")
+    let output = crate::tools::command(crate::tools::NativeTool::Ffmpeg)
         .args([
             "-y",
             "-i",
@@ -972,11 +972,14 @@ pub async fn render_project_video(
         // 诊断：记录每段输出文件大小 + ffprobe 时长
         if let Ok(meta) = tokio::fs::metadata(&path).await {
             let size_kb = meta.len() / 1024;
-            let probe_dur = tokio::process::Command::new("ffprobe")
+            let probe_dur = crate::tools::command(crate::tools::NativeTool::Ffprobe)
                 .args([
-                    "-v", "error",
-                    "-show_entries", "format=duration",
-                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
                     &path.to_string_lossy(),
                 ])
                 .output()
@@ -1015,12 +1018,12 @@ pub async fn render_project_video(
         ));
         let list_content = segment_paths
             .iter()
-            .map(|path| format!("file '{}'\n", path.to_string_lossy().replace('\'', "'\\''")))
+            .map(|path| ffconcat_file_entry(path))
             .collect::<String>();
         tokio::fs::write(&list_path, list_content).await?;
 
         // 先尝试 concat copy
-        let mut cmd = Command::new("ffmpeg");
+        let mut cmd = crate::tools::command(crate::tools::NativeTool::Ffmpeg);
         cmd.args([
             "-y",
             "-f",
@@ -1040,7 +1043,7 @@ pub async fn render_project_video(
         if copy_output.status.success() {
             // 验证输出时长是否接近 total_duration（容差 0.5s）
             // 若偏差过大说明 concat copy 失败，走 fallback
-            let probe_ok = tokio::process::Command::new("ffprobe")
+            let probe_ok = crate::tools::command(crate::tools::NativeTool::Ffprobe)
                 .args([
                     "-v",
                     "error",
@@ -1102,10 +1105,9 @@ pub async fn render_project_video(
                 fb_args.push(raw_output.to_string_lossy().to_string());
 
                 check_cancel(cancel_flag)?;
-                let mut fb_cmd = Command::new("ffmpeg");
+                let mut fb_cmd = crate::tools::command(crate::tools::NativeTool::Ffmpeg);
                 fb_cmd.args(&fb_args);
-                let fb_output =
-                    run_with_timeout_and_cancel(&mut fb_cmd, 1800, cancel_flag).await?;
+                let fb_output = run_with_timeout_and_cancel(&mut fb_cmd, 1800, cancel_flag).await?;
                 if !fb_output.status.success() {
                     anyhow::bail!(
                         "concat filter 重编码失败：{}",
@@ -1148,10 +1150,9 @@ pub async fn render_project_video(
             fb_args.push(raw_output.to_string_lossy().to_string());
 
             check_cancel(cancel_flag)?;
-            let mut fb_cmd = Command::new("ffmpeg");
+            let mut fb_cmd = crate::tools::command(crate::tools::NativeTool::Ffmpeg);
             fb_cmd.args(&fb_args);
-            let fb_output =
-                run_with_timeout_and_cancel(&mut fb_cmd, 1800, cancel_flag).await?;
+            let fb_output = run_with_timeout_and_cancel(&mut fb_cmd, 1800, cancel_flag).await?;
             if !fb_output.status.success() {
                 anyhow::bail!(
                     "concat filter 重编码失败：{}",
@@ -1346,7 +1347,7 @@ async fn render_single_pass_video_graph(
     ]);
 
     check_cancel(cancel_flag)?;
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = crate::tools::command(crate::tools::NativeTool::Ffmpeg);
     cmd.args(&args);
     let output = run_with_timeout_and_cancel(&mut cmd, 1800, cancel_flag).await?;
     if !output.status.success() {
@@ -1394,7 +1395,10 @@ async fn render_black_segment(
         "+faststart".to_string(),
         output_path.to_string_lossy().to_string(),
     ]);
-    let output = Command::new("ffmpeg").args(&args).output().await?;
+    let output = crate::tools::command(crate::tools::NativeTool::Ffmpeg)
+        .args(&args)
+        .output()
+        .await?;
     if !output.status.success() {
         anyhow::bail!(
             "渲染黑屏段 {} 失败：{}",
@@ -1602,10 +1606,9 @@ async fn render_segment_with_overlay(
             opacity_keyframes.is_some(),
         ));
         if let Some(opacity_kfs) = opacity_keyframes {
-            if let Some(opacity_fade) = compile_opacity_alpha_filter(
-                opacity_kfs,
-                clip.start_on_track - seg_start,
-            ) {
+            if let Some(opacity_fade) =
+                compile_opacity_alpha_filter(opacity_kfs, clip.start_on_track - seg_start)
+            {
                 chain.push_str(&opacity_fade);
             }
         }
@@ -1678,7 +1681,10 @@ async fn render_segment_with_overlay(
     let output_path = segment_dir.join(format!("seg-{:03}.mp4", seg_index));
     args.push(output_path.to_string_lossy().to_string());
 
-    let output = Command::new("ffmpeg").args(&args).output().await?;
+    let output = crate::tools::command(crate::tools::NativeTool::Ffmpeg)
+        .args(&args)
+        .output()
+        .await?;
     if !output.status.success() {
         anyhow::bail!(
             "叠加渲染段 {} 失败：{}",
@@ -1718,16 +1724,7 @@ async fn render_transition_unit(
         .await?
     } else {
         render_segment_with_overlay(
-            cache_dir,
-            &work_dir,
-            project,
-            prev_clips,
-            start,
-            duration,
-            0,
-            preview,
-            encoder,
-            width,
+            cache_dir, &work_dir, project, prev_clips, start, duration, 0, preview, encoder, width,
             height,
         )
         .await?
@@ -1739,17 +1736,8 @@ async fn render_transition_unit(
         .await?
     } else {
         render_segment_with_overlay(
-            cache_dir,
-            &work_dir,
-            project,
-            next_clips,
-            boundary,
-            duration,
-            1,
-            preview,
-            encoder,
-            width,
-            height,
+            cache_dir, &work_dir, project, next_clips, boundary, duration, 1, preview, encoder,
+            width, height,
         )
         .await?
     };
@@ -1784,7 +1772,7 @@ async fn render_transition_unit(
     ]);
 
     check_cancel(cancel_flag)?;
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = crate::tools::command(crate::tools::NativeTool::Ffmpeg);
     cmd.args(&args);
     let output = run_with_timeout_and_cancel(&mut cmd, 1800, cancel_flag).await?;
     if !output.status.success() {
@@ -1933,7 +1921,10 @@ async fn render_single_clip_for_segment(
     args.push("+faststart".to_string());
     args.push(output_path.to_string_lossy().to_string());
 
-    let output = Command::new("ffmpeg").args(&args).output().await?;
+    let output = crate::tools::command(crate::tools::NativeTool::Ffmpeg)
+        .args(&args)
+        .output()
+        .await?;
     if !output.status.success() {
         anyhow::bail!(
             "渲染段 {} 失败：{}",
@@ -2014,7 +2005,10 @@ async fn render_source_window_parts_for_segment(
         args.push(format!("{:.3}", part.timeline_duration));
         args.push(part_path.to_string_lossy().to_string());
 
-        let output = Command::new("ffmpeg").args(&args).output().await?;
+        let output = crate::tools::command(crate::tools::NativeTool::Ffmpeg)
+            .args(&args)
+            .output()
+            .await?;
         if !output.status.success() {
             anyhow::bail!(
                 "曲线变速子段 {}-{} 渲染失败：{}",
@@ -2051,11 +2045,11 @@ async fn render_source_window_parts_for_segment(
     ));
     let list_content = part_paths
         .iter()
-        .map(|path| format!("file '{}'\n", path.to_string_lossy().replace('\'', "'\\''")))
+        .map(|path| ffconcat_file_entry(path))
         .collect::<String>();
     tokio::fs::write(&list_path, list_content).await?;
 
-    let output = Command::new("ffmpeg")
+    let output = crate::tools::command(crate::tools::NativeTool::Ffmpeg)
         .args([
             "-y",
             "-f",
@@ -2143,8 +2137,13 @@ async fn burn_subtitle_and_mix_audio(
         let mut track_groups: Vec<(String, String, Vec<&Clip>)> = Vec::new();
         for clip in &subtitle_clips {
             let track = project.tracks.iter().find(|t| t.id == clip.track_id);
-            let track_name = track.map(|t| t.name.clone()).unwrap_or_else(|| "unknown".to_string());
-            if let Some(group) = track_groups.iter_mut().find(|(id, _, _)| *id == clip.track_id) {
+            let track_name = track
+                .map(|t| t.name.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            if let Some(group) = track_groups
+                .iter_mut()
+                .find(|(id, _, _)| *id == clip.track_id)
+            {
                 group.2.push(*clip);
             } else {
                 track_groups.push((clip.track_id.clone(), track_name, vec![*clip]));
@@ -2275,7 +2274,7 @@ async fn burn_subtitle_and_mix_audio(
     args.push(output_path.to_string_lossy().to_string());
 
     check_cancel(cancel_flag)?;
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = crate::tools::command(crate::tools::NativeTool::Ffmpeg);
     cmd.args(&args);
     let output = run_with_timeout_and_cancel(&mut cmd, 1800, cancel_flag).await?;
     if !output.status.success() {
@@ -2320,7 +2319,7 @@ async fn burn_subtitle_and_mix_audio(
         retry_args.push("+faststart".to_string());
         retry_args.push(output_path.to_string_lossy().to_string());
         check_cancel(cancel_flag)?;
-        let mut retry_cmd = Command::new("ffmpeg");
+        let mut retry_cmd = crate::tools::command(crate::tools::NativeTool::Ffmpeg);
         retry_cmd.args(&retry_args);
         let retry_output = run_with_timeout_and_cancel(&mut retry_cmd, 1800, cancel_flag).await?;
         if !retry_output.status.success() {
@@ -2478,14 +2477,13 @@ fn generate_ass_subtitles(
         let escaped = if karaoke_enabled {
             if let Some(words) = clip.words.as_ref() {
                 if !words.is_empty() {
-                    let karaoke_text = build_karaoke_text(words, clip.start_on_track, clip.duration);
+                    let karaoke_text =
+                        build_karaoke_text(words, clip.start_on_track, clip.duration);
                     // 双语模式：text = "翻译\n原文"
                     // 第一行显示翻译（无高亮），第二行显示原文（karaoke 高亮）
                     if let Some(newline_pos) = text.find('\n') {
                         let translated = &text[..newline_pos];
-                        let escaped_translated = translated
-                            .replace('{', "\\{")
-                            .replace('}', "\\}");
+                        let escaped_translated = translated.replace('{', "\\{").replace('}', "\\}");
                         format!("{}\\N{}", escaped_translated, karaoke_text)
                     } else {
                         karaoke_text
@@ -2551,9 +2549,8 @@ fn generate_ass_subtitles(
         let sx = style.map(|s| s.scale_x).unwrap_or(100.0);
         let sy = style.map(|s| s.scale_y).unwrap_or(100.0);
         let rot = style.map(|s| s.rotation).unwrap_or(0.0);
-        let transform_tag = format!(
-            "{{\\pos({pos_x:.1},{pos_y:.1})\\fscx{sx:.0}\\fscy{sy:.0}\\frz{rot:.0}}}",
-        );
+        let transform_tag =
+            format!("{{\\pos({pos_x:.1},{pos_y:.1})\\fscx{sx:.0}\\fscy{sy:.0}\\frz{rot:.0}}}",);
         ass.push_str(&format!(
             "Dialogue: {layer},{start},{end},{style_name},,0,0,0,,{fade_tag}{transform_tag}{escaped}\n"
         ));
@@ -2715,7 +2712,7 @@ pub async fn render_audio_only(
         // 用户没指定 .mp3 后缀，强制改
         output.with_extension("mp3")
     };
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = crate::tools::command(crate::tools::NativeTool::Ffmpeg);
     cmd.args([
         "-y",
         "-i",
@@ -2795,7 +2792,7 @@ async fn merge_audio_clips(
         } else {
             atempo_filter
         };
-        let extract = Command::new("ffmpeg")
+        let extract = crate::tools::command(crate::tools::NativeTool::Ffmpeg)
             .args([
                 "-y",
                 "-ss",
@@ -2867,7 +2864,7 @@ async fn merge_audio_clips(
         };
         let fade_out_start = (dur - fade_out).max(0.0);
         let vol = clip.volume.max(0.0); // 线性增益，0=静音
-        // 降噪：noise_reduction 0-100 映射到 afftdn nr 0-25dB（剪映默认强度适中，避免过降噪损伤人声）
+                                        // 降噪：noise_reduction 0-100 映射到 afftdn nr 0-25dB（剪映默认强度适中，避免过降噪损伤人声）
         let nr_db = (clip.noise_reduction / 100.0 * 25.0).clamp(0.0, 25.0);
         let nr_filter = if nr_db > 0.01 {
             format!(",afftdn=nr={nr_db:.2}:nf=-25")
@@ -2910,7 +2907,10 @@ async fn merge_audio_clips(
     args.push("pcm_s16le".to_string());
     args.push(output.to_string_lossy().to_string());
 
-    let mix_output = Command::new("ffmpeg").args(&args).output().await?;
+    let mix_output = crate::tools::command(crate::tools::NativeTool::Ffmpeg)
+        .args(&args)
+        .output()
+        .await?;
     if !mix_output.status.success() {
         anyhow::bail!(
             "音频合并失败：{}",
@@ -3186,6 +3186,11 @@ fn rotation_filter(rotation: f64) -> String {
     }
 }
 
+fn ffconcat_file_entry(path: &Path) -> String {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    format!("file '{}'\n", normalized.replace('\'', "'\\''"))
+}
+
 fn escape_filter_path(path: &str) -> String {
     path.replace('\'', "'\\''")
 }
@@ -3215,6 +3220,12 @@ fn xfade_filter_name(name: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ffconcat_entries_normalize_windows_separators() {
+        let entry = super::ffconcat_file_entry(std::path::Path::new(r"C:\Media Files\clip.mp4"));
+        assert_eq!(entry, "file 'C:/Media Files/clip.mp4'\n");
+    }
+
     use super::*;
     use crate::models::{MediaSource, Project, RenderConfig, Track, TrackKind};
     use crate::source_window::SourceWindowPart;
@@ -3238,18 +3249,21 @@ mod tests {
             brightness: 0.0,
             contrast: 0.0,
             saturation: 0.0,
-        temperature: 0.0,
-        tint: 0.0,
+            temperature: 0.0,
+            tint: 0.0,
             transform: None,
             keyframes: None,
             mask: None,
-        visual_effects: None,
-        reverse: false,
+            visual_effects: None,
+            reverse: false,
             visual_query: None,
             crop: None,
             text: None,
             subtitle_style: None,
             words: None,
+            subtitle_group_id: None,
+            subtitle_role: None,
+            subtitle_language: None,
             transition_in: None,
             transition_out: None,
         }
@@ -3282,8 +3296,8 @@ mod tests {
             order,
             muted: false,
             locked: false,
-        hidden: false,
-        height: 0,
+            hidden: false,
+            height: 0,
         }
     }
 
@@ -3386,9 +3400,8 @@ mod tests {
 
         assert_eq!(label, "[src3]");
         assert!(filter.contains("[3:v]split=2[src3in0][src3in1]"));
-        assert!(filter.contains(
-            "[src3in0]trim=start=0.000000:end=1.000000,setpts=PTS-STARTPTS[src3part0]"
-        ));
+        assert!(filter
+            .contains("[src3in0]trim=start=0.000000:end=1.000000,setpts=PTS-STARTPTS[src3part0]"));
         assert!(filter.contains(
             "[src3in1]trim=start=2.000000:end=4.000000,setpts=0.500000*(PTS-STARTPTS)[src3part1]"
         ));
@@ -3414,8 +3427,8 @@ mod tests {
             },
         ];
 
-        let (filter, _) = compile_multi_part_source_filter(0, &parts)
-            .expect("reverse parts must compile");
+        let (filter, _) =
+            compile_multi_part_source_filter(0, &parts).expect("reverse parts must compile");
 
         let first = filter
             .find("trim=start=3.000000:end=4.000000,reverse")
@@ -3425,5 +3438,4 @@ mod tests {
             .expect("second reverse part missing");
         assert!(first < second);
     }
-
 }

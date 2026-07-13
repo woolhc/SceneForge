@@ -1,9 +1,8 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::OnceLock;
 
 use serde::Deserialize;
 use serde_json::json;
-use tokio::process::Command;
 
 use crate::models::{AppSettings, SubtitleCue, WordCue};
 
@@ -139,47 +138,6 @@ fn parse_timestamp(s: &str) -> f64 {
     h * 3600.0 + m * 60.0 + sec + millis
 }
 
-/// 解析 whisper 可执行文件路径：
-/// - 若是绝对路径或含分隔符，直接用（Windows 自动补 .exe）
-/// - 若只是命令名（如 "whisper-cli"），在 PATH 里查找
-/// 返回 (实际可执行路径, 是否找到)
-fn resolve_whisper_bin(bin: &str) -> (String, bool) {
-    let trimmed = bin.trim();
-    if trimmed.is_empty() {
-        return (String::new(), false);
-    }
-    // 含路径分隔符 → 当作路径处理
-    let is_path = trimmed.contains('/') || trimmed.contains('\\');
-    if is_path {
-        // Windows: 若无 .exe 后缀且文件不存在，尝试补 .exe
-        let p = PathBuf::from(trimmed);
-        if p.exists() {
-            return (trimmed.to_string(), true);
-        }
-        if cfg!(target_os = "windows") && !trimmed.to_lowercase().ends_with(".exe") {
-            let with_exe = format!("{}.exe", trimmed);
-            if PathBuf::from(&with_exe).exists() {
-                return (with_exe, true);
-            }
-        }
-        return (trimmed.to_string(), false);
-    }
-    // 只是命令名 → 用 which 查找 PATH
-    match which::which(trimmed) {
-        Ok(path) => (path.to_string_lossy().to_string(), true),
-        Err(_) => {
-            // Windows 兜底：尝试补 .exe
-            if cfg!(target_os = "windows") {
-                let with_exe = format!("{}.exe", trimmed);
-                if which::which(&with_exe).is_ok() {
-                    return (with_exe, true);
-                }
-            }
-            (trimmed.to_string(), false)
-        }
-    }
-}
-
 /// 跨平台 whisper 安装指引
 fn whisper_install_hint() -> String {
     if cfg!(target_os = "macos") {
@@ -194,32 +152,31 @@ fn whisper_install_hint() -> String {
 /// 调用 whisper-cli 识别音频，返回带时间戳的原始片段。
 pub async fn transcribe_audio(
     settings: &AppSettings,
-    _cache_dir: &Path,
+    cache_dir: &Path,
     audio_path: &Path,
 ) -> anyhow::Result<Vec<SubtitleCue>> {
-    let model = settings.whisper_model.trim();
-    if model.is_empty() {
-        anyhow::bail!(
-            "请先在设置中配置 whisper 模型路径（.bin 文件）。\n{}",
-            whisper_install_hint()
-        );
-    }
-    if !PathBuf::from(model).exists() {
-        anyhow::bail!(
-            "whisper 模型文件不存在：{}\n请下载模型（如 ggml-large-v3.bin）后在设置里填写正确路径。\n{}",
-            model,
-            whisper_install_hint()
-        );
-    }
+    let app_data_dir = cache_dir.parent().unwrap_or(cache_dir);
+    let model_path = crate::tools::resolve_whisper_model(&settings.whisper_model, app_data_dir)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "找不到 whisper 模型。请将模型放入 {} 或在设置中指定 .bin 文件。\n{}",
+                app_data_dir.join("models").display(),
+                whisper_install_hint()
+            )
+        })?;
+    let model = model_path.to_string_lossy().to_string();
 
-    let (whisper_bin, found) = resolve_whisper_bin(&settings.whisper_bin);
-    if !found {
+    let whisper = crate::tools::resolve(
+        crate::tools::NativeTool::Whisper,
+        Some(&settings.whisper_bin),
+    );
+    if !whisper.available {
         anyhow::bail!(
-            "找不到 whisper 可执行程序：{}\n{}\n请在设置里填写 whisper-cli 的完整路径。",
-            settings.whisper_bin,
+            "找不到 whisper 可执行程序。应用包未包含 sidecar，系统 PATH 也不可用。\n{}",
             whisper_install_hint()
         );
     }
+    let whisper_bin = whisper.path.to_string_lossy().to_string();
 
     // 输出前缀（whisper 会生成 <prefix>.json）
     // 注意：whisper-cli 的 -of 参数对含空格的路径解析有 bug（会打印帮助并静默退出），
@@ -231,10 +188,13 @@ pub async fn transcribe_audio(
     // whisper-cli -ml 1 -oj：max-len=1 强制每段一个词/字 → 得到词级时间戳
     // offsets.from/to 是毫秒整数，比 timestamps 字符串精度更高
     // 注意：whisper.cpp 1.7+ 移除了 --no-print-progress，改用 -np（--no-prints）
-    let mut cmd = Command::new(&whisper_bin);
+    let mut cmd = crate::tools::command_with_config(
+        crate::tools::NativeTool::Whisper,
+        Some(&settings.whisper_bin),
+    );
     cmd.args([
         "-m",
-        model,
+        &model,
         "-f",
         &audio_path.to_string_lossy(),
         "-ml",
@@ -306,32 +266,45 @@ pub async fn transcribe_to_sentences(
         return Ok((vec![], 0.0, String::new()));
     }
 
-    // cues 已经是按可读性分组的字幕块，每个含 words。
-    // 进一步合并成"句子"：遇到句末标点（。！？.!?）或较大停顿（>0.8s）就断句。
     let sentence_enders = ['。', '！', '？', '!', '?', '.'];
     let mut sentences: Vec<crate::models::TimedSentence> = Vec::new();
     let mut current_start: Option<f64> = None;
     let mut current_end: f64 = 0.0;
     let mut current_text = String::new();
+    let mut current_words: Vec<WordCue> = Vec::new();
     let mut last_word_end: Option<f64> = None;
 
+    let flush_sentence = |sentences: &mut Vec<crate::models::TimedSentence>,
+                          current_start: &mut Option<f64>,
+                          current_end: f64,
+                          current_text: &mut String,
+                          current_words: &mut Vec<WordCue>| {
+        let text = current_text.trim().to_string();
+        if let (Some(start), false) = (*current_start, text.is_empty()) {
+            sentences.push(crate::models::TimedSentence {
+                start,
+                end: current_end,
+                text,
+                words: std::mem::take(current_words),
+            });
+        }
+        *current_start = None;
+        current_text.clear();
+        current_words.clear();
+    };
+
     for cue in &cues {
-        // M13: 大停顿表示上一句已结束，必须在追加当前 cue 之前切分；
-        // 否则停顿后的第一段会被错误并入上一句。
-        let big_gap = last_word_end.map(|e| cue.start - e > 0.8).unwrap_or(false);
+        let big_gap = last_word_end
+            .map(|end| cue.start - end > 0.8)
+            .unwrap_or(false);
         if big_gap {
-            let text = current_text.trim().to_string();
-            if !text.is_empty() {
-                if let Some(s) = current_start {
-                    sentences.push(crate::models::TimedSentence {
-                        start: s,
-                        end: current_end,
-                        text,
-                    });
-                }
-            }
-            current_start = None;
-            current_text.clear();
+            flush_sentence(
+                &mut sentences,
+                &mut current_start,
+                current_end,
+                &mut current_text,
+                &mut current_words,
+            );
         }
 
         if current_start.is_none() {
@@ -339,47 +312,40 @@ pub async fn transcribe_to_sentences(
         }
         current_end = cue.end;
         current_text.push_str(&cue.text);
+        current_words.extend(cue.words.iter().cloned());
 
-        // 判断是否该断句：cue 文本以句末标点结尾。
         let ends_with_sentence = cue
             .text
             .chars()
             .last()
-            .map(|c| sentence_enders.contains(&c))
+            .map(|character| sentence_enders.contains(&character))
             .unwrap_or(false);
-
         if ends_with_sentence {
-            let text = current_text.trim().to_string();
-            if !text.is_empty() {
-                if let Some(s) = current_start {
-                    sentences.push(crate::models::TimedSentence {
-                        start: s,
-                        end: current_end,
-                        text,
-                    });
-                }
-            }
-            current_start = None;
-            current_text.clear();
+            flush_sentence(
+                &mut sentences,
+                &mut current_start,
+                current_end,
+                &mut current_text,
+                &mut current_words,
+            );
         }
         last_word_end = Some(cue.end);
     }
-    // 收尾
-    if let Some(s) = current_start {
-        let text = current_text.trim().to_string();
-        if !text.is_empty() {
-            sentences.push(crate::models::TimedSentence {
-                start: s,
-                end: current_end,
-                text,
-            });
-        }
+
+    if current_start.is_some() {
+        flush_sentence(
+            &mut sentences,
+            &mut current_start,
+            current_end,
+            &mut current_text,
+            &mut current_words,
+        );
     }
 
-    let total_duration = sentences.last().map(|s| s.end).unwrap_or(0.0);
+    let total_duration = sentences.last().map(|sentence| sentence.end).unwrap_or(0.0);
     let full_text = sentences
         .iter()
-        .map(|s| s.text.as_str())
+        .map(|sentence| sentence.text.as_str())
         .collect::<Vec<_>>()
         .join("");
 
@@ -498,11 +464,23 @@ fn join_words_with_smart_separator(words: &[WordCue]) -> String {
     let mut out = String::new();
     for (i, w) in words.iter().enumerate() {
         if i > 0 {
-            let prev_last = words[i - 1].text.chars().last();
+            let previous_text = &words[i - 1].text;
+            let prev_last = previous_text.chars().last();
             let this_first = w.text.chars().next();
-            let need_space = matches!((prev_last, this_first),
+            let alphanumeric_boundary = matches!((prev_last, this_first),
                 (Some(a), Some(b)) if a.is_ascii_alphanumeric() && b.is_ascii_alphanumeric());
-            if need_space {
+            let punctuation_boundary = matches!((prev_last, this_first),
+                (Some(a), Some(b)) if matches!(a, ',' | ';' | ':' | '!' | '?') && b.is_ascii_alphanumeric());
+            let decimal_like = previous_text.ends_with('.')
+                && previous_text
+                    .trim_end_matches('.')
+                    .chars()
+                    .all(|c| c.is_ascii_digit())
+                && this_first.is_some_and(|c| c.is_ascii_digit());
+            let sentence_boundary = prev_last == Some('.')
+                && this_first.is_some_and(|c| c.is_ascii_alphanumeric())
+                && !decimal_like;
+            if alphanumeric_boundary || punctuation_boundary || sentence_boundary {
                 out.push(' ');
             }
         }
@@ -517,6 +495,8 @@ fn join_words_with_smart_separator(words: &[WordCue]) -> String {
 pub async fn translate_subtitles(
     settings: &AppSettings,
     cues: &[SubtitleCue],
+    mode: &str,
+    context: &str,
 ) -> anyhow::Result<Vec<SubtitleCue>> {
     let api_key = settings.deepseek_api_key.trim();
     if api_key.is_empty() || cues.is_empty() {
@@ -530,16 +510,19 @@ pub async fn translate_subtitles(
         .map(|(i, c)| json!({ "index": i, "text": c.text }))
         .collect();
 
-    let system_prompt = "你是专业字幕翻译。把每条原文翻译成中文，保留原文含义，适合短视频观看。只返回 JSON。";
+    let system_prompt =
+        "你是专业字幕翻译。把每条原文翻译成中文，保留原文含义，适合短视频观看。只返回 JSON。";
     let user_prompt = format!(
         r#"请翻译以下字幕数组，每条 text 翻译成中文填入 translated 字段。
 严格按 index 顺序返回，不改原文，不改时间戳。
+项目上下文：{context}
 
 只返回 JSON 对象：{{"translations":[{{"index":0,"translated":"中文翻译"}}]}}
 
 原文：
 {}"#,
-        serde_json::to_string_pretty(&input).unwrap_or_default()
+        serde_json::to_string_pretty(&input).unwrap_or_default(),
+        context = context.chars().take(2000).collect::<String>()
     );
 
     let client = crate::ffmpeg::http_client();
@@ -564,8 +547,8 @@ pub async fn translate_subtitles(
         anyhow::bail!("DeepSeek 翻译失败：{}", body);
     }
 
-    let parsed: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| anyhow::anyhow!("DeepSeek 返回解析失败：{e}"))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| anyhow::anyhow!("DeepSeek 返回解析失败：{e}"))?;
     let content = parsed["choices"][0]["message"]["content"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("DeepSeek 返回为空"))?;
@@ -577,12 +560,82 @@ pub async fn translate_subtitles(
             cue.translated = Some(t.clone());
         }
     }
+    if mode == "precise" {
+        return Ok(result);
+    }
+    adapt_translations(settings, &result, mode, context)
+        .await
+        .or(Ok(result))
+}
+
+async fn adapt_translations(
+    settings: &AppSettings,
+    cues: &[SubtitleCue],
+    mode: &str,
+    context: &str,
+) -> anyhow::Result<Vec<SubtitleCue>> {
+    let input: Vec<serde_json::Value> = cues
+        .iter()
+        .enumerate()
+        .map(|(index, cue)| {
+            json!({
+                "index": index,
+                "source": cue.text,
+                "direct": cue.translated,
+                "duration": (cue.end - cue.start).max(0.2)
+            })
+        })
+        .collect();
+    let instruction = if mode == "short_form" {
+        "在不改变核心事实的前提下积极压缩重复口语和低信息修饰，使字幕短促有力。"
+    } else {
+        "把直译调整为自然、简洁、适合短视频阅读的中文；只做轻度压缩，不改变事实。"
+    };
+    let prompt = format!(
+        r#"你是专业字幕语言编辑。以下每条包含原文、直译和可用时长。
+{instruction}
+保持 index 和条目数量完全一致；术语结合项目上下文保持统一；不要输出解释。
+项目上下文：{context}
+只返回 JSON：{{"translations":[{{"index":0,"translated":"自然适配后的字幕"}}]}}
+输入：{input}"#,
+        instruction = instruction,
+        context = context.chars().take(2000).collect::<String>(),
+        input = serde_json::to_string(&input)?
+    );
+    let response = crate::ffmpeg::http_client()
+        .post("https://api.deepseek.com/chat/completions")
+        .bearer_auth(settings.deepseek_api_key.trim())
+        .json(&json!({
+            "model": "deepseek-v4-flash",
+            "messages": [
+                {"role":"system","content":"你是字幕自然度与长度适配编辑器，只返回 JSON。"},
+                {"role":"user","content":prompt}
+            ],
+            "response_format":{"type":"json_object"},
+            "temperature":0.2
+        }))
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        anyhow::bail!("DeepSeek 字幕适配失败：HTTP {}", status.as_u16());
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&body)?;
+    let content = parsed["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("DeepSeek 字幕适配返回为空"))?;
+    let translations = parse_translations(content)?;
+    let mut result = cues.to_vec();
+    for (index, cue) in result.iter_mut().enumerate() {
+        if let Some(value) = translations.get(&index) {
+            cue.translated = Some(value.clone());
+        }
+    }
     Ok(result)
 }
 
-fn parse_translations(
-    content: &str,
-) -> anyhow::Result<std::collections::HashMap<usize, String>> {
+fn parse_translations(content: &str) -> anyhow::Result<std::collections::HashMap<usize, String>> {
     let text = content.trim();
     let text = text
         .strip_prefix("```json")
@@ -590,8 +643,8 @@ fn parse_translations(
         .unwrap_or(text)
         .trim_end_matches('`')
         .trim();
-    let parsed: serde_json::Value = serde_json::from_str(text)
-        .map_err(|e| anyhow::anyhow!("翻译结果解析失败：{e}"))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| anyhow::anyhow!("翻译结果解析失败：{e}"))?;
     let arr = parsed["translations"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("翻译结果缺少 translations 数组"))?;
@@ -645,6 +698,8 @@ pub async fn refine_subtitles(
     settings: &AppSettings,
     cues: &[SubtitleCue],
     translate: bool,
+    mode: &str,
+    context: &str,
 ) -> anyhow::Result<Vec<SubtitleCue>> {
     // 第一步：规则分段（保留 whisper words，双语也走规则，不走 AI 重排）
     // segment_subtitles_rules 内部"有 words 直接返回"分支会保留 words 不破坏对应关系
@@ -652,7 +707,7 @@ pub async fn refine_subtitles(
 
     // 第二步：翻译（单独流程，不改 start/end/words，避免 AI 幻觉时间戳）
     if translate && !settings.deepseek_api_key.trim().is_empty() {
-        result = match translate_subtitles(settings, &result).await {
+        result = match translate_subtitles(settings, &result, mode, context).await {
             Ok(translated) => translated,
             Err(_) => result, // 翻译失败回退到不翻译，原文仍可用
         };
@@ -696,13 +751,10 @@ pub fn segment_subtitles_rules(cues: &[SubtitleCue]) -> Vec<SubtitleCue> {
     let full_text: String = cues.iter().map(|c| c.text.as_str()).collect();
     let profile = profile_for(&full_text);
 
-    // 如果原始 cues 已带词级时间戳（whisper -ml 1 模式），直接透传。
-    // 词级 cues 已经在 words_to_cues 里按可读性分组过，再过一遍规则会破坏 word↔cue 对应关系。
-    // 但仍需规范化间隔，避免连续排列导致字幕与音频不对齐。
+    // 如果原始 cues 已带词级时间戳，说明前端 AI/Layout Engine 已完成最终分组。
+    // 必须原样透传 start/end/words；再次截断会让 cue.end 早于最后一个 word.end。
     if cues.iter().any(|c| !c.words.is_empty()) {
-        let mut result = cues.to_vec();
-        ensure_min_gap(&mut result, MIN_GAP);
-        return result;
+        return cues.to_vec();
     }
 
     // Pass 1: 合并太短的段（间隔 < MERGE_GAP 且合并后不超限）
@@ -865,3 +917,51 @@ fn split_text_by_punctuation(text: &str, max_chars: usize) -> Vec<String> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{join_words_with_smart_separator, segment_subtitles_rules};
+    use crate::models::{SubtitleCue, WordCue};
+
+    fn word(text: &str, start: f64, end: f64) -> WordCue {
+        WordCue {
+            text: text.to_string(),
+            start,
+            end,
+            confidence: Some(1.0),
+        }
+    }
+
+    #[test]
+    fn english_punctuation_keeps_natural_spacing() {
+        let words = vec![
+            word("words", 0.0, 0.2),
+            word(",", 0.2, 0.25),
+            word("but", 0.25, 0.5),
+        ];
+        assert_eq!(join_words_with_smart_separator(&words), "words, but");
+        let decimal = vec![word("3.", 0.0, 0.2), word("14", 0.2, 0.4)];
+        assert_eq!(join_words_with_smart_separator(&decimal), "3.14");
+    }
+
+    #[test]
+    fn word_timed_cues_preserve_timing() {
+        let cue = SubtitleCue {
+            start: 0.0,
+            end: 1.0,
+            text: "hello".to_string(),
+            translated: None,
+            words: vec![word("hello", 0.0, 1.0)],
+        };
+        let next = SubtitleCue {
+            start: 1.02,
+            end: 2.0,
+            text: "world".to_string(),
+            translated: None,
+            words: vec![word("world", 1.02, 2.0)],
+        };
+        let result = segment_subtitles_rules(&[cue.clone(), next.clone()]);
+        assert_eq!(result[0].end, cue.end);
+        assert_eq!(result[1].start, next.start);
+        assert_eq!(result[0].words[0].end, 1.0);
+    }
+}

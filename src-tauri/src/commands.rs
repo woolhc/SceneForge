@@ -7,11 +7,12 @@ use crate::asr;
 use crate::ffmpeg;
 use crate::models::{
     AppInfo, AppSettings, CacheAssetRequest, Clip, CreateProjectRequest, CreateVoiceProfileRequest,
-    FfmpegStatus, FilmstripRequest, GenerateAudioRequest, ImportMediaRequest,
-    ImportVoiceProfileRequest, MediaSource, PexelsSearchRequest, Project, ProjectSummary,
-    RenderProjectRequest, RenderResult, ReplaceVoiceSampleRequest, SegmentScriptRequest,
-    SegmentScriptResult, ThumbnailRequest, Track, TrackKind, UpdateVoiceProfileRequest,
-    VoicePreviewRequest, VoicePreviewResult, VoiceProfile, WordCue,
+    FfmpegStatus, FilmstripRequest, GenerateAudioRequest, GenerateNarrationRequest,
+    GenerateNarrationResult, ImportMediaRequest, ImportVoiceProfileRequest, MediaSource,
+    PexelsSearchRequest, Project, ProjectSummary, RenderProjectRequest, RenderResult,
+    ReplaceVoiceSampleRequest, SegmentScriptRequest, SegmentScriptResult, ThumbnailRequest, Track,
+    TrackKind, UpdateVoiceProfileRequest, VoicePreviewRequest, VoicePreviewResult, VoiceProfile,
+    WordCue,
 };
 use crate::pexels;
 use crate::storage;
@@ -33,11 +34,7 @@ pub struct PipelineError {
 }
 
 /// 生成结构化错误 JSON 字符串（前端 parsePipelineError 解析）
-pub fn map_pipeline_error<E: std::fmt::Display>(
-    err: E,
-    code: &str,
-    retryable: bool,
-) -> String {
+pub fn map_pipeline_error<E: std::fmt::Display>(err: E, code: &str, retryable: bool) -> String {
     let message = err.to_string();
     let pipeline_err = PipelineError {
         code: code.to_string(),
@@ -338,6 +335,67 @@ pub async fn preview_voice_profile(
 // ============================================================================
 
 #[tauri::command]
+pub async fn generate_narration(
+    state: State<'_, AppState>,
+    request: GenerateNarrationRequest,
+) -> Result<GenerateNarrationResult, String> {
+    let (settings, mut project, voice) = {
+        let conn = state.db.lock().map_err(map_error)?;
+        let settings = storage::load_settings(&conn).map_err(map_error)?;
+        let project = storage::get_project(&conn, &request.project_id).map_err(map_error)?;
+        let voice_id = request
+            .voice_id
+            .clone()
+            .or_else(|| settings.default_voice_id.clone());
+        let voice = match voice_id {
+            Some(id) if !id.trim().is_empty() => storage::get_voice_profile(&conn, &id).ok(),
+            _ => None,
+        };
+        (settings, project, voice)
+    };
+
+    let audio_dir = state.paths.projects_dir.join(&project.id).join("audio");
+    let source_id = format!("tts-narration-{}", chrono::Utc::now().timestamp_millis());
+    let stem = sanitize_file_stem(&source_id);
+    let (audio_path, duration) =
+        tts::synthesize_full_narration(&settings, &audio_dir, voice.as_ref(), &request.text, &stem)
+            .await
+            .map_err(map_error)?;
+
+    let audio_source = MediaSource {
+        id: source_id.clone(),
+        kind: "audio".to_string(),
+        title: "完整旁白".to_string(),
+        url: None,
+        local_path: Some(audio_path.to_string_lossy().to_string()),
+        proxy_path: None,
+        proxy_status: Some("none".to_string()),
+        proxy_width: None,
+        proxy_height: None,
+        thumbnail_url: None,
+        width: 0,
+        height: 0,
+        duration,
+        source: "tts".to_string(),
+    };
+    project.media.push(audio_source);
+
+    let conn = state.db.lock().map_err(map_error)?;
+    let saved = storage::save_project(&conn, &project).map_err(map_error)?;
+    let source = saved
+        .media
+        .iter()
+        .find(|item| item.id == source_id)
+        .ok_or_else(|| "旁白素材保存失败".to_string())?;
+
+    Ok(GenerateNarrationResult {
+        audio_path: source.local_path.clone().unwrap_or_default(),
+        duration: source.duration,
+        source_id,
+    })
+}
+
+#[tauri::command]
 pub async fn segment_script(
     state: State<'_, AppState>,
     request: SegmentScriptRequest,
@@ -430,8 +488,6 @@ pub async fn generate_audio(
         };
         (settings, project, voice)
     };
-    let voice = voice.ok_or_else(|| "请先在设置中上传克隆音色，并设为默认音色".to_string())?;
-
     // 收集要处理的配音 clip
     let voiceover_clips: Vec<String> = project
         .clips
@@ -471,16 +527,10 @@ pub async fn generate_audio(
             continue;
         }
         let stem = sanitize_file_stem(&clip.id);
-        let (audio_path, real_duration) = tts::synthesize_segment_audio(
-            &settings,
-            &state.paths.cache_dir,
-            &audio_dir,
-            &voice,
-            &text,
-            &stem,
-        )
-        .await
-        .map_err(|error| format!("片段「{}」配音失败：{}", clip_id, error))?;
+        let (audio_path, real_duration) =
+            tts::synthesize_segment_audio(&settings, &audio_dir, voice.as_ref(), &text, &stem)
+                .await
+                .map_err(|error| format!("片段「{}」配音失败：{}", clip_id, error))?;
 
         // 用真实时长对齐该 clip，并把同一 MediaSource（TTS 音频）登记到素材库
         let source_id = format!("tts-{}", clip_id);
@@ -644,8 +694,8 @@ pub async fn detach_audio(
             order: latest.tracks.iter().map(|t| t.order).max().unwrap_or(0) + 1,
             muted: false,
             locked: false,
-        hidden: false,
-        height: 0,
+            hidden: false,
+            height: 0,
         };
         let tid = new_track.id.clone();
         latest.tracks.push(new_track);
@@ -678,6 +728,9 @@ pub async fn detach_audio(
         text: None,
         subtitle_style: None,
         words: None,
+        subtitle_group_id: None,
+        subtitle_role: None,
+        subtitle_language: None,
         transition_in: None,
         crop: None,
         transition_out: None,
@@ -803,8 +856,8 @@ pub async fn separate_vocals(
             order: latest.tracks.iter().map(|t| t.order).max().unwrap_or(0) + 1,
             muted: false,
             locked: false,
-        hidden: false,
-        height: 0,
+            hidden: false,
+            height: 0,
         });
         tid
     };
@@ -833,17 +886,20 @@ pub async fn separate_vocals(
             brightness: 0.0,
             contrast: 0.0,
             saturation: 0.0,
-        temperature: 0.0,
-        tint: 0.0,
+            temperature: 0.0,
+            tint: 0.0,
             transform: None,
             visual_query: None,
             text: None,
             subtitle_style: None,
             words: None,
+            subtitle_group_id: None,
+            subtitle_role: None,
+            subtitle_language: None,
             keyframes: None,
             mask: None,
-        visual_effects: None,
-        reverse: false,
+            visual_effects: None,
+            reverse: false,
             transition_in: None,
             crop: None,
             transition_out: None,
@@ -947,7 +1003,7 @@ pub async fn generate_subtitles(
         chrono::Utc::now().timestamp_millis()
     ));
     // 用 filter_complex concat：每个 input 用 -ss/-t 限制读取区间
-    let mut merge_cmd = tokio::process::Command::new("ffmpeg");
+    let mut merge_cmd = crate::tools::command(crate::tools::NativeTool::Ffmpeg);
     merge_cmd.args(["-y"]);
     let mut input_count = 0usize;
     for clip in &audio_clips {
@@ -981,9 +1037,7 @@ pub async fn generate_subtitles(
     }
     // 去掉末尾分号
     let filter_trim = filter.trim_end_matches(';');
-    let filter_full = format!(
-        "{filter_trim};{concat_labels}concat=n={input_count}:v=0:a=1[out]"
-    );
+    let filter_full = format!("{filter_trim};{concat_labels}concat=n={input_count}:v=0:a=1[out]");
     merge_cmd.args(["-filter_complex", &filter_full]);
     merge_cmd.args(["-map", "[out]"]);
     merge_cmd.args([
@@ -1012,9 +1066,15 @@ pub async fn generate_subtitles(
         .map_err(map_error)?;
 
     // DeepSeek 整理 + 可选翻译
-    let refined = asr::refine_subtitles(&settings, &raw_cues, request.translate)
-        .await
-        .map_err(map_error)?;
+    let refined = asr::refine_subtitles(
+        &settings,
+        &raw_cues,
+        request.translate,
+        "natural",
+        &project.script,
+    )
+    .await
+    .map_err(map_error)?;
     let _ = tokio::fs::remove_file(&merged_path).await;
 
     // T1.10 修复：ASR/AI 完成后重读最新 project，只定向替换字幕轨，避免覆盖用户并发编辑。
@@ -1041,7 +1101,9 @@ pub async fn generate_subtitles(
     // 清理旧字幕 clip（双轨清两条，单轨清一条）
     match (&zh_track_id, &en_track_id) {
         (Some(zh), Some(en)) => {
-            latest.clips.retain(|c| c.track_id != *zh && c.track_id != *en);
+            latest
+                .clips
+                .retain(|c| c.track_id != *zh && c.track_id != *en);
         }
         (_, Some(en)) => {
             latest.clips.retain(|c| c.track_id != *en);
@@ -1061,8 +1123,8 @@ pub async fn generate_subtitles(
         accumulated += clip_audio_duration;
     }
     // 单条配音从头开始且无间隙时，映射退化为恒等（cue.start == timeline_start）
-    let single_clip_aligned = audio_clips.len() == 1
-        && (audio_clips[0].start_on_track - 0.0).abs() < 0.01;
+    let single_clip_aligned =
+        audio_clips.len() == 1 && (audio_clips[0].start_on_track - 0.0).abs() < 0.01;
 
     for cue in &refined {
         let duration = (cue.end - cue.start).max(0.3);
@@ -1137,8 +1199,8 @@ pub async fn generate_subtitles(
                         brightness: 0.0,
                         contrast: 0.0,
                         saturation: 0.0,
-                    temperature: 0.0,
-                    tint: 0.0,
+                        temperature: 0.0,
+                        tint: 0.0,
                         transform: None,
                         visual_query: None,
                         crop: None,
@@ -1149,10 +1211,13 @@ pub async fn generate_subtitles(
                             Some(s)
                         },
                         words: zh_words,
+                        subtitle_group_id: None,
+                        subtitle_role: None,
+                        subtitle_language: None,
                         keyframes: None,
                         mask: None,
-                    visual_effects: None,
-                    reverse: false,
+                        visual_effects: None,
+                        reverse: false,
                         transition_in: None,
                         transition_out: None,
                     });
@@ -1190,6 +1255,9 @@ pub async fn generate_subtitles(
                         Some(s)
                     },
                     words,
+                    subtitle_group_id: None,
+                    subtitle_role: None,
+                    subtitle_language: None,
                     keyframes: None,
                     mask: None,
                     visual_effects: None,
@@ -1227,6 +1295,9 @@ pub async fn generate_subtitles(
                     text: Some(cue.text.clone()),
                     subtitle_style: None,
                     words,
+                    subtitle_group_id: None,
+                    subtitle_role: None,
+                    subtitle_language: None,
                     keyframes: None,
                     mask: None,
                     visual_effects: None,
@@ -1375,8 +1446,8 @@ pub async fn import_srt(
             order: latest.tracks.iter().map(|t| t.order).min().unwrap_or(0),
             muted: false,
             locked: false,
-        hidden: false,
-        height: 0,
+            hidden: false,
+            height: 0,
         });
         tid
     };
@@ -1404,18 +1475,21 @@ pub async fn import_srt(
             brightness: 0.0,
             contrast: 0.0,
             saturation: 0.0,
-        temperature: 0.0,
-        tint: 0.0,
+            temperature: 0.0,
+            tint: 0.0,
             transform: None,
             visual_query: None,
             crop: None,
             text: Some(cue.text.clone()),
             subtitle_style: None,
             words: None,
+            subtitle_group_id: None,
+            subtitle_role: None,
+            subtitle_language: None,
             keyframes: None,
             mask: None,
-        visual_effects: None,
-        reverse: false,
+            visual_effects: None,
+            reverse: false,
             transition_in: None,
             transition_out: None,
         });
@@ -1612,7 +1686,7 @@ fn infer_kind(path: &std::path::Path, width: u32, height: u32) -> String {
 
 /// 读取图片的宽高（用 ffprobe）
 async fn probe_image_dimensions(path: &std::path::Path) -> anyhow::Result<(u32, u32)> {
-    let mut cmd = tokio::process::Command::new("ffprobe");
+    let mut cmd = crate::tools::command(crate::tools::NativeTool::Ffprobe);
     cmd.args([
         "-v",
         "error",
@@ -1644,7 +1718,7 @@ async fn probe_image_dimensions(path: &std::path::Path) -> anyhow::Result<(u32, 
 }
 
 async fn probe_media_duration(path: &std::path::Path) -> anyhow::Result<f64> {
-    let mut cmd = tokio::process::Command::new("ffprobe");
+    let mut cmd = crate::tools::command(crate::tools::NativeTool::Ffprobe);
     cmd.args([
         "-v",
         "error",
@@ -1663,7 +1737,7 @@ async fn probe_media_duration(path: &std::path::Path) -> anyhow::Result<f64> {
 }
 
 async fn probe_video_resolution(path: &std::path::Path) -> anyhow::Result<(u32, u32)> {
-    let mut cmd = tokio::process::Command::new("ffprobe");
+    let mut cmd = crate::tools::command(crate::tools::NativeTool::Ffprobe);
     cmd.args([
         "-v",
         "error",
@@ -1744,6 +1818,252 @@ pub async fn transcribe_to_sentences(
         total_duration,
         full_text,
     })
+}
+
+/// 保存可追溯字幕中间产物到项目目录。
+#[tauri::command]
+pub async fn save_subtitle_artifact(
+    state: State<'_, AppState>,
+    request: crate::models::SaveSubtitleArtifactRequest,
+) -> Result<String, String> {
+    let artifact_dir = state
+        .paths
+        .projects_dir
+        .join(&request.project_id)
+        .join("artifacts");
+    tokio::fs::create_dir_all(&artifact_dir)
+        .await
+        .map_err(map_error)?;
+    let path = artifact_dir.join("subtitle-latest.json");
+    let content = serde_json::to_vec_pretty(&request.artifact).map_err(map_error)?;
+    tokio::fs::write(&path, content).await.map_err(map_error)?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// 只转写项目配音轨，返回词级时间戳；不创建或修改字幕轨。
+#[tauri::command]
+pub async fn transcribe_project_narration(
+    state: State<'_, AppState>,
+    request: crate::models::TranscribeProjectNarrationRequest,
+) -> Result<crate::models::TimedSentencesResult, String> {
+    let (settings, project) = {
+        let conn = state.db.lock().map_err(map_error)?;
+        (
+            storage::load_settings(&conn).map_err(map_error)?,
+            storage::get_project(&conn, &request.project_id).map_err(map_error)?,
+        )
+    };
+
+    let voiceover_track_ids: Vec<String> = project
+        .tracks
+        .iter()
+        .filter(|track| track.kind == TrackKind::Voiceover)
+        .map(|track| track.id.clone())
+        .collect();
+    let mut audio_clips: Vec<&Clip> = project
+        .clips
+        .iter()
+        .filter(|clip| voiceover_track_ids.contains(&clip.track_id))
+        .collect();
+    audio_clips.sort_by(|left, right| {
+        left.start_on_track
+            .partial_cmp(&right.start_on_track)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if audio_clips.is_empty() {
+        return Err("配音轨上没有音频，请先生成或导入旁白".to_string());
+    }
+
+    let merged_path = state.paths.cache_dir.join(format!(
+        "asr-project-{}.wav",
+        chrono::Utc::now().timestamp_millis()
+    ));
+    let mut merge_cmd = crate::tools::command(crate::tools::NativeTool::Ffmpeg);
+    merge_cmd.arg("-y");
+    let mut included_clips: Vec<&Clip> = Vec::new();
+    for clip in &audio_clips {
+        let source = clip
+            .source_id
+            .as_ref()
+            .and_then(|source_id| project.media.iter().find(|media| media.id == *source_id));
+        let Some(source) = source else { continue };
+        let Some(local_path) = &source.local_path else {
+            continue;
+        };
+        let duration = (clip.source_out - clip.source_in).max(0.1);
+        merge_cmd.args([
+            "-ss",
+            &format!("{:.3}", clip.source_in),
+            "-t",
+            &format!("{duration:.3}"),
+            "-i",
+            local_path,
+        ]);
+        included_clips.push(clip);
+    }
+    if included_clips.is_empty() {
+        return Err("配音音频文件不存在，请先生成或重新导入旁白".to_string());
+    }
+
+    let mut filter_parts = String::new();
+    let labels = (0..included_clips.len())
+        .map(|index| format!("[a{index}]"))
+        .collect::<String>();
+    for index in 0..included_clips.len() {
+        filter_parts.push_str(&format!("[{index}:a]asetpts=PTS-STARTPTS[a{index}];"));
+    }
+    let filter = format!(
+        "{};{}concat=n={}:v=0:a=1[out]",
+        filter_parts.trim_end_matches(';'),
+        labels,
+        included_clips.len()
+    );
+    merge_cmd.args(["-filter_complex", &filter, "-map", "[out]"]);
+    merge_cmd.args([
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        "-c:a",
+        "pcm_s16le",
+        &merged_path.to_string_lossy(),
+    ]);
+    let merge_output = ffmpeg::run_with_timeout(&mut merge_cmd, 1800)
+        .await
+        .map_err(map_error)?;
+    if !merge_output.status.success() {
+        let _ = tokio::fs::remove_file(&merged_path).await;
+        return Err(format!(
+            "合并配音音频失败：{}",
+            String::from_utf8_lossy(&merge_output.stderr).trim()
+        ));
+    }
+
+    let raw_cues = asr::transcribe_audio(&settings, &state.paths.cache_dir, &merged_path)
+        .await
+        .map_err(map_error);
+    let _ = tokio::fs::remove_file(&merged_path).await;
+    let raw_cues = raw_cues?;
+
+    let mut mappings: Vec<(f64, f64, f64)> = Vec::new();
+    let mut accumulated = 0.0;
+    for clip in &included_clips {
+        let duration = (clip.source_out - clip.source_in).max(0.1);
+        mappings.push((accumulated, duration, clip.start_on_track));
+        accumulated += duration;
+    }
+    let single_aligned = included_clips.len() == 1 && included_clips[0].start_on_track.abs() < 0.01;
+
+    let sentences = raw_cues
+        .into_iter()
+        .map(|cue| {
+            let timeline_start = if single_aligned {
+                cue.start
+            } else {
+                mappings
+                    .iter()
+                    .find(|(offset, duration, _)| {
+                        cue.start >= *offset && cue.start < *offset + *duration
+                    })
+                    .map(|(offset, _, timeline)| timeline + (cue.start - offset))
+                    .unwrap_or(cue.start)
+            };
+            let delta = timeline_start - cue.start;
+            crate::models::TimedSentence {
+                start: timeline_start,
+                end: cue.end + delta,
+                text: cue.text,
+                words: cue
+                    .words
+                    .into_iter()
+                    .map(|word| crate::models::WordCue {
+                        start: word.start + delta,
+                        end: word.end + delta,
+                        text: word.text,
+                        confidence: word.confidence,
+                    })
+                    .collect(),
+            }
+        })
+        .collect::<Vec<_>>();
+    if sentences.is_empty() {
+        return Err("音频识别结果为空，请检查旁白音频或 Whisper 配置".to_string());
+    }
+    let total_duration = sentences
+        .iter()
+        .map(|sentence| sentence.end)
+        .fold(0.0_f64, f64::max);
+    let full_text = sentences
+        .iter()
+        .map(|sentence| sentence.text.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+    Ok(crate::models::TimedSentencesResult {
+        sentences,
+        total_duration,
+        full_text,
+    })
+}
+
+/// 从单次 Whisper transcript 整理字幕并可选翻译，不再重复识别音频。
+#[tauri::command]
+pub async fn refine_transcript(
+    state: State<'_, AppState>,
+    request: crate::models::RefineTranscriptRequest,
+) -> Result<Vec<crate::models::SubtitleCue>, String> {
+    let settings = {
+        let conn = state.db.lock().map_err(map_error)?;
+        storage::load_settings(&conn).map_err(map_error)?
+    };
+    let cues: Vec<crate::models::SubtitleCue> = request
+        .sentences
+        .into_iter()
+        .map(|sentence| crate::models::SubtitleCue {
+            start: sentence.start,
+            end: sentence.end,
+            text: sentence.text,
+            translated: None,
+            words: sentence.words,
+        })
+        .collect();
+    asr::refine_subtitles(
+        &settings,
+        &cues,
+        request.translate,
+        &request.mode,
+        &request.context,
+    )
+    .await
+    .map_err(map_error)
+}
+
+#[tauri::command]
+pub async fn analyze_subtitle_language_context(
+    state: State<'_, AppState>,
+    request: crate::models::SubtitleLanguageContextRequest,
+) -> Result<crate::models::SubtitleLanguageContextResult, String> {
+    let settings = {
+        let conn = state.db.lock().map_err(map_error)?;
+        storage::load_settings(&conn).map_err(map_error)?
+    };
+    ai::analyze_subtitle_language_context(&settings, request)
+        .await
+        .map_err(map_error)
+}
+
+/// 使用 DeepSeek 为词级字幕提供受限的语义断点建议。
+#[tauri::command]
+pub async fn advise_subtitle_breaks(
+    state: State<'_, AppState>,
+    request: crate::models::SubtitleBreakAdviceRequest,
+) -> Result<crate::models::SubtitleBreakAdviceResult, String> {
+    let settings = {
+        let conn = state.db.lock().map_err(map_error)?;
+        storage::load_settings(&conn).map_err(map_error)?
+    };
+    ai::advise_subtitle_breaks(&settings, request)
+        .await
+        .map_err(map_error)
 }
 
 /// 音频模式：给 whisper 识别的句子补充画面关键词/情绪（不改时间，不改数量顺序）。

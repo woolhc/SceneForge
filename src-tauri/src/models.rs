@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub struct AppInfo {
     pub app_data_dir: String,
     pub cache_dir: String,
+    pub models_dir: String,
     pub database_path: String,
 }
 
@@ -31,6 +32,16 @@ pub struct AppSettings {
     pub deepseek_api_key: String,
     pub pexels_api_key: String,
     pub tts_base_url: String,
+    #[serde(default)]
+    pub fish_audio_api_key: String,
+    #[serde(default = "default_fish_audio_model")]
+    pub fish_audio_model: String,
+    #[serde(default)]
+    pub fish_audio_reference_id: String,
+    #[serde(default = "default_fish_audio_format")]
+    pub fish_audio_format: String,
+    #[serde(default = "default_fish_audio_sample_rate")]
+    pub fish_audio_sample_rate: u32,
     pub default_ratio: String,
     pub default_voice_id: Option<String>,
     pub render_preset: String,
@@ -53,18 +64,19 @@ fn default_whisper_bin() -> String {
 }
 
 fn default_whisper_model() -> String {
-    // macOS brew: /opt/homebrew/share/whisper-cpp/
-    // Windows: 用户自行下载，常见放 Documents 或程序同目录
-    if cfg!(target_os = "windows") {
-        // Windows 无默认安装路径，留空让用户填
-        String::new()
-    } else if cfg!(target_os = "macos") {
-        // 默认用 medium-q5_0 量化模型（514MB，中文质量优秀，比 large-v3 小 6 倍）
-        "/opt/homebrew/share/whisper-cpp/ggml-medium-q5_0.bin".to_string()
-    } else {
-        // Linux
-        "/usr/local/share/whisper-cpp/ggml-medium-q5_0.bin".to_string()
-    }
+    String::new()
+}
+
+fn default_fish_audio_model() -> String {
+    "s1".to_string()
+}
+
+fn default_fish_audio_format() -> String {
+    "mp3".to_string()
+}
+
+fn default_fish_audio_sample_rate() -> u32 {
+    44_100
 }
 
 /// 单个词/字符的时间戳（用于逐字高亮卡拉OK字幕）
@@ -101,6 +113,11 @@ impl Default for AppSettings {
             deepseek_api_key: String::new(),
             pexels_api_key: String::new(),
             tts_base_url: "https://ttsttstts.cas-air.cn".to_string(),
+            fish_audio_api_key: String::new(),
+            fish_audio_model: default_fish_audio_model(),
+            fish_audio_reference_id: String::new(),
+            fish_audio_format: default_fish_audio_format(),
+            fish_audio_sample_rate: default_fish_audio_sample_rate(),
             default_ratio: "9:16".to_string(),
             default_voice_id: None,
             render_preset: "preview-fast".to_string(),
@@ -635,6 +652,15 @@ pub struct Clip {
     /// 字幕逐词时间戳 —— 字幕 clip 用（用于逐字高亮；None 表示无词级数据）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub words: Option<Vec<WordCue>>,
+    /// 双语字幕配对 ID。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle_group_id: Option<String>,
+    /// source | target
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle_role: Option<String>,
+    /// 字幕语言标识。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle_language: Option<String>,
     /// 入场转场：兼容旧 string，也支持 { name, duration }
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transition_in: Option<ClipTransition>,
@@ -847,6 +873,23 @@ pub struct GenerateAudioRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GenerateNarrationRequest {
+    pub project_id: String,
+    pub text: String,
+    #[serde(default)]
+    pub voice_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateNarrationResult {
+    pub audio_path: String,
+    pub duration: f64,
+    pub source_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RenderProjectRequest {
     pub project_id: String,
     pub preview: bool,
@@ -919,6 +962,8 @@ pub struct TimedSentence {
     pub start: f64,
     pub end: f64,
     pub text: String,
+    #[serde(default)]
+    pub words: Vec<WordCue>,
 }
 
 /// 音频模式：用 whisper 识别音频，返回句子级（带真实时间戳）的结果。
@@ -937,6 +982,123 @@ pub struct TimedSentencesResult {
 pub struct EnrichSegmentsRequest {
     pub sentences: Vec<TimedSentence>,
     pub ratio: String,
+    #[serde(default)]
+    pub material_direction: String,
+}
+
+/// 只转写项目配音轨，不直接创建字幕。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscribeProjectNarrationRequest {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveSubtitleArtifactRequest {
+    pub project_id: String,
+    pub artifact: serde_json::Value,
+}
+
+/// 从已经完成的单次 Whisper transcript 整理/翻译字幕，不再重新执行 ASR。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefineTranscriptRequest {
+    pub sentences: Vec<TimedSentence>,
+    #[serde(default)]
+    pub translate: bool,
+    #[serde(default = "default_generation_subtitle_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub context: String,
+}
+
+fn default_generation_subtitle_mode() -> String {
+    "natural".to_string()
+}
+
+/// 全局字幕语言上下文分析。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleLanguageContextRequest {
+    pub project_title: String,
+    pub script: String,
+    pub transcript: String,
+    #[serde(default = "default_generation_subtitle_mode")]
+    pub mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleLanguageTerm {
+    pub source: String,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleLanguageContextResult {
+    pub summary: String,
+    pub content_type: String,
+    pub tone: String,
+    pub terms: Vec<SubtitleLanguageTerm>,
+}
+
+/// AI 字幕语义断句：词文本是唯一原文，时间与版式约束仅用于提高语义分组质量。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleBreakWordTiming {
+    pub text: String,
+    pub start: f64,
+    pub end: f64,
+    #[serde(default)]
+    pub gap_after: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleBreakConstraints {
+    pub ratio: String,
+    pub max_lines: usize,
+    pub preferred_chars_per_line: usize,
+    pub max_chars_per_cue: usize,
+    pub min_duration: f64,
+    pub preferred_duration: f64,
+    pub max_duration: f64,
+    pub preferred_cps: f64,
+    pub max_cps: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleBreakAdviceRequest {
+    pub words: Vec<String>,
+    #[serde(default)]
+    pub word_timings: Vec<SubtitleBreakWordTiming>,
+    #[serde(default)]
+    pub constraints: Option<SubtitleBreakConstraints>,
+    #[serde(default)]
+    pub context: String,
+    #[serde(default = "default_generation_subtitle_mode")]
+    pub mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleProtectedRange {
+    pub start_word_index: usize,
+    pub end_word_index: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleBreakAdviceResult {
+    pub preferred_break_after_indices: Vec<usize>,
+    pub protected_ranges: Vec<SubtitleProtectedRange>,
+    pub confidence: f64,
 }
 
 // ============================================================================

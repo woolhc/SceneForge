@@ -10,7 +10,10 @@ import type {
   ProjectSummary,
   RenderResult,
   SegmentScriptResult,
+  SubtitleBreakAdviceResult,
+  SubtitleLanguageContext,
   TrackKind,
+  GenerateNarrationResult,
   VoicePreviewResult,
   VoiceProfile,
 } from "./types";
@@ -39,11 +42,16 @@ const defaultSettings: AppSettings = {
   deepseekApiKey: "",
   pexelsApiKey: "",
   ttsBaseUrl: "https://ttsttstts.cas-air.cn",
+  fishAudioApiKey: "",
+  fishAudioModel: "s1",
+  fishAudioReferenceId: "",
+  fishAudioFormat: "mp3",
+  fishAudioSampleRate: 44100,
   defaultRatio: "9:16",
   defaultVoiceId: null,
   renderPreset: "preview-fast",
   whisperBin: _isWin ? "whisper-cli.exe" : "whisper-cli",
-  whisperModel: _isMac ? "/opt/homebrew/share/whisper-cpp/ggml-large-v3.bin" : "",
+  whisperModel: "",
 };
 
 function now() {
@@ -239,6 +247,7 @@ async function webFallback<T>(command: string, args?: Record<string, unknown>): 
     return {
       appDataDir: "浏览器预览模式",
       cacheDir: "localStorage",
+      modelsDir: "localStorage",
       databasePath: "localStorage",
     } as T;
   }
@@ -261,7 +270,7 @@ async function webFallback<T>(command: string, args?: Record<string, unknown>): 
   }
 
   if (command === "save_settings") {
-    state.settings = args?.settings as AppSettings;
+    state.settings = { ...defaultSettings, ...(args?.settings as AppSettings) };
     writeWebState(state);
     return state.settings as T;
   }
@@ -545,6 +554,72 @@ async function webFallback<T>(command: string, args?: Record<string, unknown>): 
     return project as T;
   }
 
+  if (command === "generate_narration") {
+    const request = args?.request as { projectId: string; text: string };
+    const project = state.projects.find((item) => item.id === request.projectId);
+    if (!project) throw new Error("Project not found");
+    const duration = Math.max(2.6, Math.min(180, request.text.trim().length / 5.2));
+    const sourceId = uid("tts-narration");
+    const source: MediaSource = {
+      id: sourceId,
+      kind: "audio",
+      title: "完整旁白",
+      url: null,
+      localPath: `web://${sourceId}.mp3`,
+      proxyPath: null,
+      proxyStatus: "none",
+      proxyWidth: null,
+      proxyHeight: null,
+      thumbnailUrl: null,
+      width: 0,
+      height: 0,
+      duration,
+      source: "tts",
+    };
+    project.media = project.media.some((item) => item.id === source.id)
+      ? project.media
+      : [...project.media, source];
+    project.updatedAt = now();
+    writeWebState(state);
+    return { audioPath: source.localPath, duration, sourceId } as T;
+  }
+
+  if (command === "save_subtitle_artifact") {
+    const request = args?.request as { projectId: string; artifact: unknown };
+    localStorage.setItem(`sceneforge-subtitle-artifact:${request.projectId}`, JSON.stringify(request.artifact));
+    return `web://subtitle-artifact/${request.projectId}.json` as T;
+  }
+
+  if (command === "transcribe_project_narration") {
+    throw new Error("浏览器模式无法读取项目旁白音频，请在桌面客户端中使用识别字幕");
+  }
+
+  if (command === "analyze_subtitle_language_context") {
+    const request = args?.request as { projectTitle: string; script: string; transcript: string };
+    return {
+      summary: request.script || request.transcript.slice(0, 240),
+      contentType: "other",
+      tone: "natural",
+      terms: [],
+    } as T;
+  }
+
+  if (command === "advise_subtitle_breaks") {
+    throw new Error("浏览器模式不支持 AI 字幕语义断句");
+  }
+
+  if (command === "refine_transcript") {
+    const request = args?.request as {
+      sentences: { start: number; end: number; text: string; words?: unknown[] }[];
+      translate: boolean;
+    };
+    return request.sentences.map((sentence) => ({
+      ...sentence,
+      translated: request.translate ? `译：${sentence.text}` : null,
+      words: sentence.words ?? [],
+    })) as T;
+  }
+
   if (
     command === "detach_audio" ||
     command === "separate_vocals" ||
@@ -682,6 +757,8 @@ export const desktopApi = {
     call<[number, number][]>("generate_waveform", { request: { sourcePath } }),
   generateAudio: (request: { projectId: string; clipId?: string | null; voiceId?: string | null }) =>
     call<Project>("generate_audio", { request }),
+  generateNarration: (request: { projectId: string; text: string; voiceId?: string | null }) =>
+    call<GenerateNarrationResult>("generate_narration", { request }),
   detachAudio: (request: { projectId: string; clipId: string }) =>
     call<Project>("detach_audio", { request }),
   separateVocals: (request: { projectId: string; clipId: string }) =>
@@ -694,14 +771,41 @@ export const desktopApi = {
     call<string>("transcribe_to_text", { audioPath }),
   /** 音频模式：识别音频返回句子级时间戳（驱动分镜编排） */
   transcribeToSentences: (audioPath: string) =>
-    call<{ sentences: { start: number; end: number; text: string }[]; totalDuration: number; fullText: string }>(
+    call<{ sentences: { start: number; end: number; text: string; words?: import("./types").WordCue[] }[]; totalDuration: number; fullText: string }>(
       "transcribe_to_sentences",
       { audioPath },
     ),
+  analyzeSubtitleLanguageContext: (request: {
+    projectTitle: string;
+    script: string;
+    transcript: string;
+    mode: import("./types").SubtitleGenerationMode;
+  }) => call<SubtitleLanguageContext>("analyze_subtitle_language_context", { request }),
+  /** AI 仅返回已有 word index 的语义断点建议；失败时由调用方回退规则引擎。 */
+  adviseSubtitleBreaks: (request: {
+    words: string[];
+    wordTimings?: import("./types").SubtitleBreakWordTiming[];
+    constraints?: import("./types").SubtitleBreakConstraints;
+    context?: string;
+    mode?: import("./types").SubtitleGenerationMode;
+  }) => call<SubtitleBreakAdviceResult>("advise_subtitle_breaks", { request }),
+  saveSubtitleArtifact: (projectId: string, artifact: unknown) =>
+    call<string>("save_subtitle_artifact", { request: { projectId, artifact } }),
+  /** 转写项目配音轨，只返回 transcript，不直接创建旧式字幕。 */
+  transcribeProjectNarration: (projectId: string) =>
+    call<import("./types").TimedSentencesResult>("transcribe_project_narration", { request: { projectId } }),
+  /** 从已有 transcript 整理/翻译字幕，不再重复执行 Whisper。 */
+  refineTranscript: (request: {
+    sentences: { start: number; end: number; text: string; words?: import("./types").WordCue[] }[];
+    translate: boolean;
+    mode?: import("./types").SubtitleGenerationMode;
+    context?: string;
+  }) => call<Array<{ start: number; end: number; text: string; translated?: string | null; words?: import("./types").WordCue[] }>>("refine_transcript", { request }),
   /** 音频模式：给 whisper 句子配画面关键词（不改时间/数量/顺序） */
   enrichSegments: (request: {
     sentences: { start: number; end: number; text: string }[];
     ratio: string;
+    materialDirection?: string;
   }) => call<AiSegment[]>("enrich_segments", { request }),
   renderProject: (request: { projectId: string; preview: boolean; outputPath?: string | null }) =>
     call<RenderResult>("render_project", { request }),

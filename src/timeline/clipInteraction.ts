@@ -15,6 +15,8 @@ export type DragState = {
   peers: Clip[];
   /** 当前播放头位置（用于吸附） */
   playhead?: number;
+  /** 是否已经超过防误触像素阈值并正式进入拖拽。 */
+  activated?: boolean;
   /** 拖拽过程中最后一次计算的 patch（endDrag 时用它 commit=true） */
   lastPatch?: Partial<Clip>;
 };
@@ -22,6 +24,16 @@ export type DragState = {
 /** 像素 → 秒换算 */
 export function pxToSeconds(deltaPx: number, pxPerSecond: number) {
   return deltaPx / pxPerSecond;
+}
+
+export const POINTER_DRAG_THRESHOLD_PX = 5;
+
+export function hasExceededPointerDragThreshold(startX: number, currentX: number, threshold = POINTER_DRAG_THRESHOLD_PX) {
+  return Math.abs(currentX - startX) >= threshold;
+}
+
+export function shouldStartTimelinePan(button: number, altKey: boolean) {
+  return button === 1 || (button === 0 && altKey);
 }
 
 /** 吸附阈值（像素）—— M5: 不再固定秒数，按 8px 像素阈值换算 */

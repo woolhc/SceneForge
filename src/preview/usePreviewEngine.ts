@@ -11,6 +11,7 @@ export function usePreviewEngine(
   active: boolean = true,
 ) {
  const engineRef = useRef<PreviewRenderer | null>(null);
+ const lastUiStateRef = useRef<EngineState | null>(null);
  // 缓存最新的 project，引擎创建后立即同步
  const pendingProjectRef = useRef<Project | null>(null);
   /** 缓存双缓冲切换回调，引擎创建后应用 */
@@ -19,13 +20,18 @@ export function usePreviewEngine(
   // T2.1: 引擎 tick 直接写入 zustand store（不经过 React setState），
   // 只有订阅了对应字段的组件才会重渲染，避免整棵树 60fps 全量更新
   const onTick = useCallback((state: EngineState) => {
-    usePlaybackStore.getState().tick({
-      currentTime: state.currentTime,
-      playing: state.playing,
-      activeVideoClip: state.activeVideoClip,
-      activeOverlayClips: state.activeOverlayClips,
-      activeSubtitleClips: state.activeSubtitleClips,
-    });
+    // 播放时 UI 时钟最多 30fps；视频/音频引擎仍按 RAF 独立运行，不牺牲播放精度。
+    const currentTime = state.playing ? Math.floor(state.currentTime * 30) / 30 : state.currentTime;
+    const previous = lastUiStateRef.current;
+    if (previous
+      && previous.currentTime === currentTime
+      && previous.playing === state.playing
+      && previous.activeVideoClip === state.activeVideoClip
+      && previous.activeOverlayClips === state.activeOverlayClips
+      && previous.activeSubtitleClips === state.activeSubtitleClips) return;
+    const uiState = { ...state, currentTime };
+    lastUiStateRef.current = uiState;
+    usePlaybackStore.getState().tick(uiState);
   }, []);
 
   // active 变化时创建/销毁引擎
@@ -37,6 +43,7 @@ export function usePreviewEngine(
         engineRef.current = null;
       }
       // 重置 store（避免残留状态）
+      lastUiStateRef.current = null;
       usePlaybackStore.getState().tick({
         currentTime: 0,
         playing: false,

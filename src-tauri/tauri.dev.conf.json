@@ -1,0 +1,8 @@
+{
+  "bundle": {
+    "externalBin": []
+  },
+  "build": {
+    "beforeDevCommand": "npm run dev"
+  }
+}

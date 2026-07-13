@@ -38,14 +38,18 @@ import type {
   Project,
   ProjectSummary,
   SubtitleStyle,
+  SubtitleGenerationMode,
+  SubtitleLanguageContext,
   Track,
   TrackKind,
+  TimedSentencesResult,
   VoiceProfile,
 } from "./types";
 import { DEFAULT_SUBTITLE_STYLE, DEFAULT_TRANSFORM, DEFAULT_CROP, videoWidthForProject } from "./types";
 import type { AiSegment } from "./types";
 import { FONT_OPTIONS } from "./fonts";
 import { SubtitleOverlay } from "./preview/SubtitleOverlay";
+import { quantizeSubtitleClock, subtitleNeedsLiveClock } from "./preview/subtitleClock";
 import { ContextMenu } from "./timeline/ContextMenu";
 import { ExportDialog } from "./panels/ExportDialog";
 import { HomeScreen } from "./panels/HomeScreen";
@@ -75,6 +79,19 @@ import {
   toggleTrackMuted,
 } from "./editor/timelineActions";
 import { runGeneratePipeline, type GeneratePipelineInput } from "./editor/pipeline";
+import { selectAssetCandidate, type AssetSelectionResult } from "./editor/assetSelection";
+import { buildTranscriptSubtitleProject, prepareTranscriptSubtitles } from "./editor/subtitleFromTranscript";
+import { requestSubtitleSemanticAdvice } from "./editor/subtitles/semanticAdvice";
+import { saveSubtitleArtifact } from "./editor/subtitles/artifacts";
+import { subtitleLayoutProfile } from "./editor/subtitles/profiles";
+import {
+  buildGenerationReport,
+  createGenerationSession,
+  recordGenerationError,
+  saveGenerationSession,
+  updateGenerationSession,
+  type GenerationSession,
+} from "./editor/generationSession";
 import { makeTransition, transitionDuration, transitionName } from "./editor/transitions";
 import { projectOutputDuration } from "./editor/projectDuration";
 import {
@@ -97,6 +114,7 @@ import {
 } from "./editor/keyframes";
 import { Ruler } from "./timeline/Ruler";
 import { TimelineTrack } from "./timeline/TimelineTrack";
+import { shouldStartTimelinePan } from "./timeline/clipInteraction";
 import { realignTimeline } from "./timeline/realignTimeline";
 import { MediaPanel } from "./panels/MediaPanel";
 import { TextPanel } from "./panels/TextPanel";
@@ -183,10 +201,12 @@ function PlayheadLine({ totalDuration }: { totalDuration: number }) {
 }
 
 function StageSubtitleLayer({ excludeClipId, fontScale }: { excludeClipId?: string; fontScale: number }) {
-  const currentTime = usePlaybackStore((s) => s.currentTime);
   const subClips = usePlaybackStore((s) => s.activeSubtitleClips);
   // 选中字幕编辑时，由 SubtitleOverlay 渲染该 clip，这里跳过避免重复
   const visible = subClips.filter((c) => c.id !== excludeClipId && c.text && c.text.trim());
+  const needsLiveClock = visible.some(subtitleNeedsLiveClock);
+  // 静态字幕不订阅逐帧时钟；动态字幕也只以 20fps 更新 React，CSS 动画仍由浏览器流畅执行。
+  const currentTime = usePlaybackStore((s) => needsLiveClock ? quantizeSubtitleClock(s.currentTime) : 0);
   if (visible.length === 0) return null;
   return (
     <>
@@ -309,24 +329,12 @@ function SubtitleItem({ clip, currentTime, fontScale }: {
   );
 }
 
-// 跨平台检测：Windows / macOS / Linux
-const isWindows =
-  typeof navigator !== "undefined" &&
-  (navigator.platform?.toLowerCase().includes("win") ||
-    navigator.userAgent?.toLowerCase().includes("win"));
-const isMac =
-  typeof navigator !== "undefined" &&
-  (navigator.platform?.toLowerCase().includes("mac") ||
-    navigator.userAgent?.toLowerCase().includes("mac"));
-const whisperInstallHint = isWindows
-  ? "Windows：从 github.com/ggerganov/whisper.cpp/releases 下载 whisper-bin-x64.zip 解压，模型从 huggingface.co/ggerganov/whisper.cpp 下载（如 ggml-large-v3.bin）"
-  : isMac
-    ? "macOS：终端运行 brew install whisper-cpp，模型在 /opt/homebrew/share/whisper-cpp/"
-    : "Linux：apt install whisper-cpp 或源码编译，模型放 /usr/local/share/whisper-cpp/";
-const whisperDefaultBin = isWindows ? "whisper-cli.exe" : "whisper-cli";
-const whisperDefaultModel = isMac
-  ? "/opt/homebrew/share/whisper-cpp/ggml-large-v3.bin"
-  : "";
+// 安装包内置 whisper-cli；模型体积较大，存放在跨平台应用数据目录。
+const whisperDefaultBin = typeof navigator !== "undefined"
+  && (navigator.platform?.toLowerCase().includes("win") || navigator.userAgent?.toLowerCase().includes("win"))
+  ? "whisper-cli.exe"
+  : "whisper-cli";
+const whisperDefaultModel = "";
 
 function newClipId() {
   return `clip_${Math.random().toString(16).slice(2)}_${Date.now()}`;
@@ -490,6 +498,11 @@ export function App() {
     deepseekApiKey: "",
     pexelsApiKey: "",
     ttsBaseUrl: "https://ttsttstts.cas-air.cn",
+    fishAudioApiKey: "",
+    fishAudioModel: "s1",
+    fishAudioReferenceId: "",
+    fishAudioFormat: "mp3",
+    fishAudioSampleRate: 44100,
     defaultRatio: "9:16",
     defaultVoiceId: null,
     renderPreset: "preview-fast",
@@ -506,9 +519,9 @@ export function App() {
   const [status, setStatus] = useState("准备就绪");
   const [voiceProfiles, setVoiceProfiles] = useState<VoiceProfile[]>([]);
   const [selectedVoiceId, setSelectedVoiceId] = useState<string>("");
-  const [newVoiceName, setNewVoiceName] = useState("我的克隆音色");
+  const [newVoiceName, setNewVoiceName] = useState("Fish 音色");
   const [newVoiceReferenceText, setNewVoiceReferenceText] = useState("");
-  const [voicePreviewText, setVoicePreviewText] = useState("这是一段克隆音色试听，用来检查声音是否自然。");
+  const [voicePreviewText, setVoicePreviewText] = useState("这是一段 Fish Audio 试听，用来检查声音是否自然。");
   const [voicePreviewUrl, setVoicePreviewUrl] = useState<string | null>(null);
   const [voiceNameDrafts, setVoiceNameDrafts] = useState<Record<string, string>>({});
   const [voiceReferenceDrafts, setVoiceReferenceDrafts] = useState<Record<string, string>>({});
@@ -569,6 +582,7 @@ export function App() {
   const startPipeline = usePipelineStore((s) => s.startPipeline);
   const updatePipelineStep = usePipelineStore((s) => s.updateStep);
   const failRunningPipelineStep = usePipelineStore((s) => s.failRunningStep);
+  const completePipeline = usePipelineStore((s) => s.completePipeline);
   const resetPipeline = usePipelineStore((s) => s.resetPipeline);
   // EDL 预览（AI 分段后先让用户确认/编辑，再执行编排）
   const [edlSegments, setEdlSegments] = useState<AiSegment[] | null>(null);
@@ -1096,8 +1110,8 @@ export function App() {
 
   async function handleGenerateProjectAudio() {
     if (!project) return;
-    if (!selectedVoiceId) {
-      setStatus("请先选择配音音色；没有音色时请先在设置中上传克隆音色");
+    if (!selectedVoiceId && !settings.fishAudioReferenceId) {
+      setStatus("请先选择 Fish 音色，或在设置中配置 Fish Audio Reference ID");
       setShowSettings(true);
       return;
     }
@@ -1129,31 +1143,160 @@ export function App() {
     }
   }
 
-  /** 识别字幕：合并配音 → whisper ASR → AI 整理（可选翻译）→ 生成字幕 clip */
-  async function handleRecognizeSubtitles(translate: boolean) {
-    if (!project) return;
-    setBusy("subtitles");
-    setStatus(translate ? "正在识别字幕并翻译..." : "正在识别字幕...");
-    const snapshot = projectRef.current;
-    try {
-      await desktopApi.saveProject(project);
-      const next = await desktopApi.generateSubtitles({
-        projectId: project.id,
-        translate,
+  async function buildOptimizedSubtitles(
+    currentProject: Project,
+    sentences: TimedSentencesResult["sentences"],
+    translate: boolean,
+    mode: SubtitleGenerationMode = "natural",
+  ): Promise<{ project: Project; issueCount: number }> {
+    const transcriptWords = sentences.flatMap((sentence) => sentence.words ?? []);
+    const rawTranscriptText = sentences.map((sentence) => sentence.text).join("");
+    let analyzedContext: SubtitleLanguageContext = {
+      summary: currentProject.script || rawTranscriptText.slice(0, 500),
+      contentType: "other",
+      tone: "natural",
+      terms: [],
+    };
+    if (settings.deepseekApiKey) {
+      try {
+        analyzedContext = await desktopApi.analyzeSubtitleLanguageContext({
+          projectTitle: currentProject.title,
+          script: currentProject.script,
+          transcript: rawTranscriptText,
+          mode,
+        });
+      } catch {
+        setStatus("全局语言分析不可用，继续使用项目原文上下文");
+      }
+    }
+    const languageContext = JSON.stringify(analyzedContext);
+    const layoutProfile = subtitleLayoutProfile(currentProject, translate);
+    const canUseSemanticAi = Boolean(settings.deepseekApiKey)
+      && transcriptWords.length >= 8
+      && sentences.every((sentence) => Boolean(sentence.words?.length));
+    const semanticAdvice = canUseSemanticAi
+      ? await requestSubtitleSemanticAdvice(
+          transcriptWords,
+          (words) => desktopApi.adviseSubtitleBreaks({
+            words: words.map((word) => word.text),
+            wordTimings: words.map((word, index) => ({
+              text: word.text,
+              start: word.start,
+              end: word.end,
+              gapAfter: Math.max(0, (words[index + 1]?.start ?? word.end) - word.end),
+            })),
+            constraints: {
+              ratio: layoutProfile.ratio,
+              maxLines: layoutProfile.maxLines,
+              preferredCharsPerLine: layoutProfile.preferredCharsPerLine,
+              maxCharsPerCue: layoutProfile.maxCharsPerCue,
+              minDuration: layoutProfile.minDuration,
+              preferredDuration: layoutProfile.preferredDuration,
+              maxDuration: layoutProfile.maxDuration,
+              preferredCps: layoutProfile.preferredCps,
+              maxCps: layoutProfile.maxCps,
+            },
+            context: languageContext,
+            mode,
+          }),
+        )
+      : null;
+    if (semanticAdvice?.successfulChunkCount) {
+      const fallbackText = semanticAdvice.failedChunkCount > 0
+        ? `，${semanticAdvice.failedChunkCount} 批已规则回退`
+        : "";
+      setStatus(`AI 语义断句完成：${semanticAdvice.successfulChunkCount}/${semanticAdvice.requestedChunkCount} 批${fallbackText}`);
+    } else if (canUseSemanticAi) {
+      setStatus("AI 语义断句不可用，已自动回退规则引擎");
+    }
+    const segmentedTranscript = prepareTranscriptSubtitles(
+      currentProject,
+      sentences,
+      translate,
+      semanticAdvice ?? undefined,
+    );
+    const transcript = translate
+      ? await desktopApi.refineTranscript({
+          sentences: segmentedTranscript,
+          translate: true,
+          mode,
+          context: languageContext,
+        })
+      : segmentedTranscript;
+    const subtitleBuild = buildTranscriptSubtitleProject(currentProject, transcript, translate);
+    const saved = await desktopApi.saveProject(subtitleBuild.project);
+    if (subtitleBuild.issueCount > 0) {
+      pushToast({
+        type: "warning",
+        message: `字幕排版完成，${subtitleBuild.issueCount} 个质量提示可在字幕中检查`,
+        duration: 8000,
       });
-      persistWithSnapshot(next, snapshot, `生成字幕（${translate ? "双语" : "单语"}）`);
+    }
+    try {
+      await saveSubtitleArtifact({
+        version: 1,
+        projectId: currentProject.id,
+      generatedAt: new Date().toISOString(),
+      mode,
+      bilingual: translate,
+      languageContext: analyzedContext,
+      rawTranscript: sentences,
+      sourceCues: segmentedTranscript,
+      translatedCues: transcript,
+      ai: {
+        requestedChunks: semanticAdvice?.requestedChunkCount ?? 0,
+        successfulChunks: semanticAdvice?.successfulChunkCount ?? 0,
+        failedChunks: semanticAdvice?.failedChunkCount ?? 0,
+        failureCategories: semanticAdvice?.failureCategories ?? [],
+        confidence: semanticAdvice?.confidence ?? 0,
+        preferredBreakCount: semanticAdvice?.preferredBreakAfterIndices.size ?? 0,
+        strongBreakCount: semanticAdvice?.strongBreakAfterIndices.size ?? 0,
+        protectedRangeCount: semanticAdvice?.protectedRanges.length ?? 0,
+      },
+      output: {
+        groupCount: subtitleBuild.groupCount,
+        sourceClipCount: subtitleBuild.sourceClipCount,
+        targetClipCount: subtitleBuild.targetClipCount,
+        qualityIssues: subtitleBuild.issues,
+      },
+      });
+    } catch {
+      pushToast({ type: "warning", message: "字幕已生成，但中间产物保存失败" });
+    }
+    if (translate && subtitleBuild.targetClipCount < subtitleBuild.sourceClipCount) {
+      pushToast({ type: "warning", message: `翻译字幕不完整：${subtitleBuild.targetClipCount}/${subtitleBuild.sourceClipCount}` });
+    }
+    return { project: saved, issueCount: subtitleBuild.issueCount };
+  }
+
+  /** 识别字幕：项目旁白单次 Whisper → AI 语义断句 → Layout Engine → 可选翻译。 */
+  async function handleRecognizeSubtitles(options: { translate: boolean; mode: SubtitleGenerationMode }) {
+    const { translate, mode } = options;
+    const currentProject = projectRef.current;
+    if (!currentProject) return;
+    setBusy("subtitles");
+    setStatus(translate ? "正在识别旁白并生成双语字幕..." : "正在识别旁白并智能排版字幕...");
+    const snapshot = currentProject;
+    try {
+      await desktopApi.saveProject(currentProject);
+      const transcript = await desktopApi.transcribeProjectNarration(currentProject.id);
+      setStatus(`旁白识别完成：${transcript.sentences.length} 个原始块，正在智能断句...`);
+      const result = await buildOptimizedSubtitles(currentProject, transcript.sentences, translate, mode);
+      const next = result.project;
+      projectRef.current = next;
+      persistWithSnapshot(next, snapshot, `智能识别字幕（${translate ? "双语" : "单语"}）`);
       await refreshProjects(next.id);
-      const subCount = next.clips.filter((c) =>
-        next.tracks.some((t) => t.kind === "subtitle" && t.id === c.trackId),
+      const subCount = next.clips.filter((clip) =>
+        next.tracks.some((track) => track.kind === "subtitle" && track.id === clip.trackId),
       ).length;
-      setStatus(`字幕识别完成，生成 ${subCount} 条字幕`);
+      setStatus(`字幕识别完成：${subCount} 条，质量提示 ${result.issueCount} 个`);
     } catch (error) {
       const parsed = parsePipelineError(error);
       setStatus(parsed.message);
       pushToast({
         type: "error",
         message: `字幕识别失败：${parsed.message}`,
-        action: parsed.retryable ? { label: "重试", onClick: () => void handleRecognizeSubtitles(translate) } : undefined,
+        action: parsed.retryable ? { label: "重试", onClick: () => void handleRecognizeSubtitles({ translate, mode }) } : undefined,
       });
     } finally {
       setBusy(null);
@@ -1291,8 +1434,8 @@ export function App() {
 
   async function handleGenerateClipAudio() {
     if (!project || !selectedClip) return;
-    if (!selectedVoiceId) {
-      setStatus("请先选择配音音色；没有音色时请先在设置中上传克隆音色");
+    if (!selectedVoiceId && !settings.fishAudioReferenceId) {
+      setStatus("请先选择 Fish 音色，或在设置中配置 Fish Audio Reference ID");
       setShowSettings(true);
       return;
     }
@@ -1341,49 +1484,175 @@ export function App() {
 
   /**
    * 一键生成流水线：
-   * 模式 2（文案）：文案 → AI分段+配素材 → TTS配音 → 字幕识别
-   * 模式 1（音频）：whisper 句级识别 → AI 配关键词（保留真实时间）→ (已有音频) → 字幕识别
+   * 文案模式：文案 → Fish Audio 整篇旁白 → whisper 句级识别 → AI 配关键词 → 自动配素材 → 字幕识别
+   * 音频模式：导入音频 → whisper 句级识别 → AI 配关键词 → 自动配素材 → 字幕识别
    */
   async function handleGeneratePipeline(input: GeneratePipelineInput) {
-    const isAudioMode = !!input.audioPath;
+    const sourceType = input.audioPath ? "audio" as const : "script" as const;
+    let pipelineProject: Project | null = null;
+
+    const persistSession = (session: GenerationSession) => {
+      saveGenerationSession(session);
+      return session;
+    };
+
     await runGeneratePipeline(input, {
       startPipeline,
       updateStep: updatePipelineStep,
-      createProject: async () => {
-        const proj = await desktopApi.createProject({ title: "一键生成", ratio: input.ratio });
-        const withScript = { ...proj, script: input.script };
-        await desktopApi.saveProject(withScript);
-        setProject(withScript);
+      createSession: async () => {
+        const project = await desktopApi.createProject({ title: "一键生成", ratio: input.ratio });
+        const saved = await desktopApi.saveProject({ ...project, script: input.script });
+        pipelineProject = saved;
+        projectRef.current = saved;
+        setProject(saved);
         setSelectedClipId(null);
         resetEditorMode();
         setView("editor");
+        return persistSession(createGenerationSession(saved.id, sourceType));
       },
-      segmentAndBindAssets: async () => {
-        if (isAudioMode && input.audioPath) {
-          await handleAudioSegmentPipeline(input.audioPath, input.ratio);
-        } else {
-          await handleSegmentScript({ skipEdl: true });
+      prepareNarration: async (session) => {
+        const current = pipelineProject;
+        if (!current) throw new Error("一键生成项目创建失败");
+        if (input.audioPath) {
+          setStatus("正在准备主旁白音频...");
+          const audioSource = await desktopApi.importMedia(input.audioPath);
+          const saved = await desktopApi.saveProject({
+            ...current,
+            media: current.media.some((item) => item.id === audioSource.id)
+              ? current.media
+              : [...current.media, audioSource],
+          });
+          pipelineProject = saved;
+          projectRef.current = saved;
+          setProject(saved);
+          return persistSession(updateGenerationSession(session, {
+            stage: "narration_ready",
+            narrationSourceId: audioSource.id,
+            audioPath: audioSource.localPath || input.audioPath,
+            narration: {
+              sourceId: audioSource.id,
+              audioPath: audioSource.localPath || input.audioPath,
+              duration: audioSource.duration,
+              origin: "audio",
+            },
+          }));
         }
+
+        setStatus("正在用 Fish Audio 生成完整旁白...");
+        const narration = await desktopApi.generateNarration({
+          projectId: current.id,
+          text: input.script,
+          voiceId: input.voiceId || null,
+        });
+        const saved = await desktopApi.getProject(current.id);
+        pipelineProject = saved;
+        projectRef.current = saved;
+        setProject(saved);
+        return persistSession(updateGenerationSession(session, {
+          stage: "narration_ready",
+          narrationSourceId: narration.sourceId,
+          audioPath: narration.audioPath,
+          narration: { ...narration, origin: "script" },
+        }));
       },
-      prepareAudio: async () => {
-        if (!input.voiceId) return;
-        setSelectedVoiceId(input.voiceId);
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        await handleGenerateProjectAudio();
+      transcribeNarration: async (session) => {
+        if (!session.audioPath) throw new Error("主旁白音频未准备完成");
+        setStatus("正在用 Whisper 单次转写主旁白...");
+        const transcript = await desktopApi.transcribeToSentences(session.audioPath);
+        const current = pipelineProject;
+        if (!current) throw new Error("生成项目丢失");
+        const saved = await desktopApi.saveProject({ ...current, script: transcript.fullText || current.script });
+        pipelineProject = saved;
+        projectRef.current = saved;
+        setProject(saved);
+        setStatus(`转写完成：${transcript.sentences.length} 句，共 ${transcript.totalDuration.toFixed(1)}s`);
+        return persistSession(updateGenerationSession(session, { stage: "transcribed", transcript }));
       },
-      recognizeSubtitles: async () => {
-        await handleRecognizeSubtitles(input.translate);
+      enrichAndBuildTimeline: async (session) => {
+        if (!session.transcript || !session.narrationSourceId || !session.audioPath) {
+          throw new Error("生成会话缺少旁白或转写结果");
+        }
+        setStatus("正在用 AI 富化分镜并构建真实时间线...");
+        const segments = await desktopApi.enrichSegments({
+          sentences: session.transcript.sentences,
+          ratio: input.ratio,
+          materialDirection: input.materialDirection || "auto",
+        });
+        const current = pipelineProject;
+        if (!current) throw new Error("生成项目丢失");
+        const saved = await buildAudioDrivenTimeline(
+          current,
+          session.narrationSourceId,
+          session.transcript,
+          segments,
+          input.ratio,
+        );
+        pipelineProject = saved;
+        return persistSession(updateGenerationSession(session, { stage: "timeline_ready", segments }));
       },
-      complete: () => {
-        setStatus("一键生成完成！请在编辑器中检查并导出");
-        setTimeout(() => {
-          resetPipeline();
-          setShowGenerate(false);
-        }, 1500);
+      selectAssets: async (session) => {
+        const current = pipelineProject;
+        if (!current) throw new Error("生成项目丢失");
+        const videoTrackIds = new Set(current.tracks.filter((track) => track.kind === "video").map((track) => track.id));
+        const videoClips = current.clips.filter((clip) => videoTrackIds.has(clip.trackId));
+        const usedAssetIds = new Set<string>();
+        const results: AssetSelectionResult[] = [];
+        let completed = 0;
+        // 绑定操作顺序执行，避免多个 saveProject 竞争导致后完成的旧快照覆盖新素材。
+        for (const [index, clip] of videoClips.entries()) {
+          const segment = session.segments[index];
+          const query = clip.visualQuery || segment?.visualQuery || segment?.text?.slice(0, 24) || "nature landscape";
+          const result = await searchScoreAndBindAsset(current.id, clip.id, query, current.ratio, clip.duration, {
+            materialDirection: input.materialDirection,
+            usedAssetIds,
+            minimumConfidence: 0.52,
+          });
+          if (result.selected) usedAssetIds.add(result.selected.id);
+          results.push(result);
+          completed += 1;
+          setStatus(`正在评分匹配素材：${completed}/${videoClips.length}`);
+        }
+        pipelineProject = projectRef.current?.id === current.id ? projectRef.current : current;
+        return persistSession(updateGenerationSession(session, { stage: "assets_selected", assetResults: results }));
       },
-      fail: (message) => {
-        failRunningPipelineStep(message);
-        setStatus(`生成失败：${message}`);
+      createSubtitles: async (session) => {
+        if (!session.transcript) throw new Error("缺少转写结果，无法生成字幕");
+        const current = pipelineProject;
+        if (!current) throw new Error("生成项目丢失");
+        setStatus("正在从同一份转写结果生成字幕...");
+        const subtitleResult = await buildOptimizedSubtitles(
+          current,
+          session.transcript.sentences,
+          input.translate,
+          "natural",
+        );
+        const saved = subtitleResult.project;
+        pipelineProject = saved;
+        projectRef.current = saved;
+        setProject(saved);
+        await refreshProjects(saved.id);
+        return persistSession(updateGenerationSession(session, {
+          stage: "subtitles_ready",
+          subtitleIssueCount: subtitleResult.issueCount,
+        }));
+      },
+      complete: (session) => {
+        const report = buildGenerationReport(session);
+        const completed = persistSession(updateGenerationSession(session, { stage: "completed", report }));
+        setStatus(`一键生成完成：${report.segmentCount} 个分镜，素材 ${report.matchedAssetCount}/${report.segmentCount}，低置信度 ${report.lowConfidenceSegmentCount}`);
+        pushToast({
+          type: report.lowConfidenceSegmentCount > 0 ? "warning" : "success",
+          message: `生成报告：旁白 ${report.narrationDuration.toFixed(1)}s · 分镜 ${report.segmentCount} · 素材 ${report.matchedAssetCount} · 待人工 ${report.lowConfidenceSegmentCount} · 字幕提示 ${report.subtitleIssueCount}`,
+          duration: 10000,
+        });
+        void completed;
+        completePipeline(report);
+      },
+      fail: (session, message) => {
+        const parsed = parsePipelineError(message);
+        if (session) persistSession(recordGenerationError(session, session.stage, parsed.message, parsed.retryable));
+        failRunningPipelineStep(parsed.message);
+        setStatus(`生成失败：${parsed.message}`);
       },
     });
   }
@@ -1418,50 +1687,34 @@ export function App() {
   }
 
   /**
-   * 音频模式分镜流水线（由 handleGeneratePipeline 调用）：
+   * 音频驱动分镜流水线（由导入音频和 Fish Audio 完整旁白共用）：
    * 1. whisper 句级识别 → 拿到带真实时间戳的句子
    * 2. DeepSeek 富化（配画面关键词/情绪，不改时间数量顺序）
    * 3. 编排成轨道 clip（用真实 start/end，不用估算时长累加）
-   * 4. 把原始音频导入到配音轨（作为整条配音）
+   * 4. 把音频源放到配音轨（作为整条配音）
    * 5. 自动绑素材
    */
-  async function handleAudioSegmentPipeline(audioPath: string, ratio: string) {
-    // 用 projectRef.current 获取最新 project（createProject 步骤的 setProject 可能还没反映到闭包）
-    const currentProject = projectRef.current;
-    if (!currentProject) return;
-    setStatus("正在用 whisper 识别音频（句子级时间戳）...");
-    // Step 1: whisper 句级识别
-    const result = await desktopApi.transcribeToSentences(audioPath);
-    setStatus(`音频识别完成：${result.sentences.length} 句，共 ${result.totalDuration.toFixed(1)}s`);
-
-    // Step 2: AI 富化（配关键词，保留真实时间）
-    setStatus("正在用 AI 为每句配画面关键词...");
-    const segments = await desktopApi.enrichSegments({
-      sentences: result.sentences,
-      ratio,
-    });
-
-    // Step 3: 编排成轨道 clip（arrangeSegmentsToClips 会用 seg.start/end 真实时间）
-    const clips = arrangeSegmentsToClips(segments, currentProject.tracks);
-
-    // Step 4: 把原始音频导入素材库 + 作为整条配音放到配音轨
-    // 音频模式下配音就是这一条完整音频，不需要按句子分段（分段会重叠）
-    const audioSource = await desktopApi.importMedia(audioPath);
-    const voiceoverTrackId = pickPrimaryTrack(currentProject.tracks, "voiceover");
-    // 去掉 arrangeSegmentsToClips 创建的分段配音 clip
-    let finalClips = voiceoverTrackId
-      ? clips.filter((c) => c.trackId !== voiceoverTrackId)
+  async function buildAudioDrivenTimeline(
+    baseProject: Project,
+    narrationSourceId: string,
+    transcript: TimedSentencesResult,
+    segments: AiSegment[],
+    ratio: string,
+  ): Promise<Project> {
+    const clips = arrangeSegmentsToClips(segments, baseProject.tracks);
+    const voiceoverTrackId = pickPrimaryTrack(baseProject.tracks, "voiceover");
+    const withoutSegmentVoiceover = voiceoverTrackId
+      ? clips.filter((clip) => clip.trackId !== voiceoverTrackId)
       : clips;
     if (voiceoverTrackId) {
-      // 只放一个完整音频 clip（从 0 到音频总时长）
-      finalClips.push({
+      withoutSegmentVoiceover.push({
         id: newClipId(),
         trackId: voiceoverTrackId,
-        sourceId: audioSource.id,
+        sourceId: narrationSourceId,
         startOnTrack: 0,
-        duration: result.totalDuration,
+        duration: transcript.totalDuration,
         sourceIn: 0,
-        sourceOut: result.totalDuration,
+        sourceOut: transcript.totalDuration,
         speed: 1,
         volume: 1,
         fadeIn: 0,
@@ -1469,54 +1722,21 @@ export function App() {
         brightness: 0,
         contrast: 0,
         saturation: 0,
-        text: undefined,
         transitionIn: null,
         transitionOut: null,
       });
     }
-
-    const nextProject: Project = {
-      ...currentProject,
-      ratio, // 显式用传入的 ratio，避免 createProject 闭包 project 旧值覆盖
-      clips: finalClips,
-      media: currentProject.media.some((m) => m.id === audioSource.id)
-        ? currentProject.media
-        : [...currentProject.media, audioSource],
-      // 音频模式：把识别出的完整文案也存到 script（供字幕识别复用）
-      script: result.fullText || currentProject.script,
-    };
-    const saved = await desktopApi.saveProject(nextProject);
+    const saved = await desktopApi.saveProject({
+      ...baseProject,
+      ratio,
+      script: transcript.fullText || baseProject.script,
+      clips: withoutSegmentVoiceover,
+    });
+    projectRef.current = saved;
     setProject(saved);
     setSelectedClipId(saved.clips[0]?.id || null);
     await refreshProjects(saved.id);
-
-    // Step 5: 为视频 clip 并发绑素材（限流 3 避免触发 Pexels API 限流）
-    const videoTrackIds = saved.tracks.filter((t) => t.kind === "video").map((t) => t.id);
-    const videoClips = saved.clips.filter((c) => videoTrackIds.includes(c.trackId));
-    const limit = pLimit(3);
-    let boundCount = 0;
-    let doneCount = 0;
-    const tasks = videoClips.map((clip) =>
-      limit(async () => {
-        const segPeer = segments.find((s) => Math.abs((s.start ?? -1) - clip.startOnTrack) < 0.5);
-        const query =
-          clip.visualQuery ||
-          segPeer?.visualQuery ||
-          segPeer?.text?.slice(0, 24) ||
-          "nature landscape";
-        const ok = await searchAndBindAsset(saved.id, clip.id, query, saved.ratio, clip.duration);
-        doneCount += 1;
-        if (ok) boundCount += 1;
-        setStatus(`正在匹配素材：${doneCount}/${videoClips.length}（成功 ${boundCount}）`);
-      }),
-    );
-    const results = await Promise.allSettled(tasks);
-    const failed = results.filter((r) => r.status === "rejected").length;
-    if (failed > 0) {
-      pushToast({ type: "warning", message: `${failed} 段素材匹配失败` });
-    }
-    detectAssetDuplication(saved);
-    setStatus(`音频分镜完成：${segments.length} 句，已匹配 ${boundCount}/${videoClips.length} 段素材`);
+    return saved;
   }
 
   /**
@@ -1578,6 +1798,48 @@ export function App() {
 
   /** 为指定视频 clip 搜素材并绑定。
    *  自动编排流程用：优先选时长 >= targetDuration 的素材，都不够长时取最长的（降级）。 */
+  async function searchScoreAndBindAsset(
+    projectId: string,
+    clipId: string,
+    query: string,
+    ratio: string,
+    targetDuration: number | undefined,
+    options?: {
+      materialDirection?: string;
+      usedAssetIds?: ReadonlySet<string>;
+      minimumConfidence?: number;
+    },
+  ): Promise<AssetSelectionResult> {
+    try {
+      const assets = await desktopApi.searchPexelsVideos({ query, ratio, perPage: 8 });
+      setAssetCandidates((previous) => ({ ...previous, [clipId]: assets }));
+      const result = selectAssetCandidate(assets, {
+        clipId,
+        query,
+        ratio,
+        targetDuration,
+        materialDirection: options?.materialDirection,
+        usedAssetIds: options?.usedAssetIds,
+        minimumConfidence: options?.minimumConfidence,
+      });
+      if (result.selected) {
+        await bindAssetToClip(projectId, clipId, result.selected);
+      }
+      return result;
+    } catch (error) {
+      return {
+        clipId,
+        query,
+        candidates: [],
+        selected: null,
+        confidence: 0,
+        requiresManualSelection: true,
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  /** 为指定视频 clip 搜素材并绑定。手动/旧流程保持宽松阈值；一键生成使用评分阈值。 */
   async function searchAndBindAsset(
     projectId: string,
     clipId: string,
@@ -1585,35 +1847,13 @@ export function App() {
     ratio?: string,
     targetDuration?: number,
   ): Promise<boolean> {
-    try {
-      // 优先用传入的 ratio（最新值），否则用 projectRef.current?.ratio
-      const effectiveRatio = ratio || projectRef.current?.ratio || "9:16";
-      const assets = await desktopApi.searchPexelsVideos({ query, ratio: effectiveRatio, perPage: 6 });
-      setAssetCandidates((previous) => ({ ...previous, [clipId]: assets }));
-      const picked = pickAssetByDuration(assets, targetDuration);
-      if (picked) {
-        await bindAssetToClip(projectId, clipId, picked);
-        return true;
-      }
-    } catch {
-      // 单个失败不阻塞整体流程
-    }
-    return false;
+    const effectiveRatio = ratio || projectRef.current?.ratio || "9:16";
+    const result = await searchScoreAndBindAsset(projectId, clipId, query, effectiveRatio, targetDuration, {
+      minimumConfidence: 0,
+    });
+    return Boolean(result.selected);
   }
 
-  /** 按 targetDuration 挑选素材：
-   *  - 无 targetDuration 或非正值：取第一个（相关度最高）
-   *  - 优先取第一个时长 >= targetDuration 的（保持 Pexels 相关度排序）
-   *  - 都不够长时降级取时长最长的视频（避免完全无素材） */
-  function pickAssetByDuration(assets: MediaSource[], targetDuration?: number): MediaSource | null {
-    if (assets.length === 0) return null;
-    if (!targetDuration || targetDuration <= 0) return assets[0];
-    const longEnough = assets.find((a) => a.kind === "image" || a.duration >= targetDuration);
-    if (longEnough) return longEnough;
-    const videos = assets.filter((a) => a.kind === "video");
-    if (videos.length === 0) return assets[0];
-    return videos.reduce((max, a) => (a.duration > max.duration ? a : max), videos[0]);
-  }
 
   async function bindAssetToClip(projectId: string, clipId: string, asset: MediaSource) {
     // 基于最新 project，避免并发绑定相互覆盖（AI 分段后会并发触发多个绑定）
@@ -1644,6 +1884,7 @@ export function App() {
           : clip,
       ),
     };
+    projectRef.current = nextProject;
     setProject(nextProject);
     setSelectedClipId(clipId);
     await desktopApi.saveProject(nextProject);
@@ -1766,7 +2007,7 @@ export function App() {
       setSelectedVoiceId(voice.id);
       setVoiceProfiles(voices);
       syncVoiceDrafts(voices);
-      setNewVoiceName("我的克隆音色");
+      setNewVoiceName("Fish 音色");
       setNewVoiceReferenceText("");
       setStatus(`已上传音色：${voice.name}`);
     } catch (error) {
@@ -1862,7 +2103,8 @@ export function App() {
 
   function handleTimelinePointerDown(event: React.PointerEvent<HTMLDivElement>) {
     const target = event.target as HTMLElement;
-    if (target.closest("button, input")) return;
+    if (target.closest("button, input") || !shouldStartTimelinePan(event.button, event.altKey)) return;
+    event.preventDefault();
     const element = timelineScrollRef.current;
     if (!element) return;
     timelineDrag.current = { active: true, x: event.clientX, left: element.scrollLeft };
@@ -1876,9 +2118,10 @@ export function App() {
   }
 
   function handleTimelinePointerUp(event: React.PointerEvent<HTMLDivElement>) {
+    if (!timelineDrag.current.active) return;
     const element = timelineScrollRef.current;
     timelineDrag.current.active = false;
-    element?.releasePointerCapture(event.pointerId);
+    if (element?.hasPointerCapture(event.pointerId)) element.releasePointerCapture(event.pointerId);
   }
 
   function handleTimelineWheel(event: React.WheelEvent<HTMLDivElement>) {
@@ -3622,7 +3865,7 @@ export function App() {
               updateSelectedClip({ speed: -Math.abs(selectedClip.speed) });
               setStatus("倒放（渲染时生效）");
             },
-            onAddSubtitle: () => handleRecognizeSubtitles(false),
+            onAddSubtitle: () => handleRecognizeSubtitles({ translate: false, mode: "natural" }),
             onEditText: () => {
               // 字幕"编辑文字"：进入字幕编辑模式（textarea 直接改 text）
               setSelectedClipId(contextMenu.clip.id);
@@ -3646,6 +3889,8 @@ export function App() {
         voiceProfiles={voiceProfiles}
         hasDeepSeekKey={!!settings.deepseekApiKey}
         hasPexelsKey={!!settings.pexelsApiKey}
+        hasFishAudioKey={!!settings.fishAudioApiKey}
+        hasFishAudioVoice={!!settings.fishAudioReferenceId}
         pipeline={pipeline}
         onStart={(input) => handleGeneratePipeline(input)}
         onError={(msg) => setStatus(msg)}
@@ -3972,10 +4217,48 @@ export function App() {
                 />
               </label>
               <label>
-                TTS 地址
+                Fish Audio API Key
                 <input
-                  value={settings.ttsBaseUrl}
-                  onChange={(event) => setSettings({ ...settings, ttsBaseUrl: event.target.value })}
+                  type="password"
+                  value={settings.fishAudioApiKey || ""}
+                  onChange={(event) => setSettings({ ...settings, fishAudioApiKey: event.target.value })}
+                  placeholder="Bearer token"
+                />
+              </label>
+              <label>
+                Fish 模型
+                <input
+                  value={settings.fishAudioModel || "s1"}
+                  onChange={(event) => setSettings({ ...settings, fishAudioModel: event.target.value })}
+                  placeholder="s1"
+                />
+              </label>
+              <label>
+                Fish Reference ID
+                <input
+                  value={settings.fishAudioReferenceId || ""}
+                  onChange={(event) => setSettings({ ...settings, fishAudioReferenceId: event.target.value })}
+                  placeholder="Fish Audio voice/reference id"
+                />
+              </label>
+              <label>
+                Fish 输出格式
+                <select
+                  value={settings.fishAudioFormat || "mp3"}
+                  onChange={(event) => setSettings({ ...settings, fishAudioFormat: event.target.value })}
+                >
+                  <option value="mp3">MP3</option>
+                  <option value="wav">WAV</option>
+                  <option value="aac">AAC</option>
+                  <option value="opus">OPUS</option>
+                </select>
+              </label>
+              <label>
+                Fish 采样率
+                <input
+                  type="number"
+                  value={settings.fishAudioSampleRate || 44100}
+                  onChange={(event) => setSettings({ ...settings, fishAudioSampleRate: Number(event.target.value) || 44100 })}
                 />
               </label>
               <label>
@@ -4000,7 +4283,7 @@ export function App() {
                 </select>
               </label>
               <label>
-                Whisper 命令
+                Whisper 命令（通常无需修改）
                 <input
                   value={settings.whisperBin || whisperDefaultBin}
                   onChange={(event) => setSettings({ ...settings, whisperBin: event.target.value })}
@@ -4012,7 +4295,7 @@ export function App() {
                 <input
                   value={settings.whisperModel || ""}
                   onChange={(event) => setSettings({ ...settings, whisperModel: event.target.value })}
-                  placeholder={whisperDefaultModel || "C:\\path\\to\\ggml-large-v3.bin"}
+                  placeholder={appInfo?.modelsDir ? `${appInfo.modelsDir}/ggml-medium-q5_0.bin` : "留空则自动扫描应用 models 目录"}
                 />
               </label>
             </div>
@@ -4022,7 +4305,7 @@ export function App() {
               导出设置（分辨率/帧率/码率）已移至「导出」弹窗，点击顶栏「导出」按钮即可设置。
             </p>
             <p className="settings-hint">
-              音色管理在「音频」Tab。Whisper 安装：{whisperInstallHint}
+              Fish Audio 用于配音生成；桌面安装包已内置 FFmpeg、FFprobe 和 whisper-cli。Whisper 模型请放入 {appInfo?.modelsDir || "应用数据 models 目录"}，或在上方指定路径。
             </p>
             <div className="modal-actions">
               <button onClick={() => setShowSettings(false)}>取消</button>

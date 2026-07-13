@@ -17,6 +17,7 @@ pub struct AppPaths {
     pub cache_dir: PathBuf,
     pub projects_dir: PathBuf,
     pub voices_dir: PathBuf,
+    pub models_dir: PathBuf,
     pub database_path: PathBuf,
 }
 
@@ -37,9 +38,11 @@ impl AppState {
         let cache_dir = base_dir.join("cache");
         let projects_dir = base_dir.join("projects");
         let voices_dir = base_dir.join("voices");
+        let models_dir = base_dir.join("models");
         fs::create_dir_all(&cache_dir)?;
         fs::create_dir_all(&projects_dir)?;
         fs::create_dir_all(&voices_dir)?;
+        fs::create_dir_all(&models_dir)?;
 
         let database_path = base_dir.join("scenescript.sqlite3");
         let conn = Connection::open(&database_path)?;
@@ -52,6 +55,7 @@ impl AppState {
                 cache_dir,
                 projects_dir,
                 voices_dir,
+                models_dir,
                 database_path,
             },
             render_lock: tokio::sync::Mutex::new(()),
@@ -63,6 +67,7 @@ impl AppState {
         AppInfo {
             app_data_dir: self.paths.app_data_dir.to_string_lossy().to_string(),
             cache_dir: self.paths.cache_dir.to_string_lossy().to_string(),
+            models_dir: self.paths.models_dir.to_string_lossy().to_string(),
             database_path: self.paths.database_path.to_string_lossy().to_string(),
         }
     }

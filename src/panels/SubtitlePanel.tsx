@@ -1,6 +1,6 @@
 import { Bot, Captions, FileText, Loader2, Sparkles, Type } from "lucide-react";
 import { useEffect, useState } from "react";
-import type { SubtitleStyle } from "../types";
+import type { SubtitleGenerationMode, SubtitleStyle } from "../types";
 import { FONT_OPTIONS, preloadAllFonts } from "../fonts";
 import { SUBTITLE_PRESETS } from "../editor/subtitlePresets";
 
@@ -14,7 +14,7 @@ export function SubtitlePanel({
   onSubtitleStyleChange,
 }: {
   busy: string | null;
-  onRecognizeSubtitles: (translate: boolean) => void;
+  onRecognizeSubtitles: (options: { translate: boolean; mode: SubtitleGenerationMode }) => void;
   onAddManualSubtitle: () => void;
   onImportSrt: () => void;
   subtitleStyle: SubtitleStyle;
@@ -22,6 +22,7 @@ export function SubtitlePanel({
 }) {
   const recognizing = busy === "subtitles";
   const [translate, setTranslate] = useState(true);
+  const [subtitleMode, setSubtitleMode] = useState<SubtitleGenerationMode>("natural");
 
   // 首次渲染时预加载所有 Google Fonts（字体下拉能正确预览）
   useEffect(() => {
@@ -39,6 +40,17 @@ export function SubtitlePanel({
           <Bot size={13} />
           基于配音音频，用 whisper 识别文字并带时间戳，AI 自动整理断句。需先生成配音。
         </p>
+        <label className="style-field">
+          字幕生成模式
+          <select
+            value={subtitleMode}
+            onChange={(event) => setSubtitleMode(event.target.value as SubtitleGenerationMode)}
+          >
+            <option value="precise">精准原文 — 只纠错、补标点和断句</option>
+            <option value="natural">自然字幕 — 适度优化口语和翻译表达</option>
+            <option value="short_form">短视频精简 — 压缩重复表达</option>
+          </select>
+        </label>
         <label className="translate-toggle">
           <input
             type="checkbox"
@@ -50,7 +62,7 @@ export function SubtitlePanel({
         <button
           className="panel-primary-action"
           disabled={recognizing}
-          onClick={() => onRecognizeSubtitles(translate)}
+          onClick={() => onRecognizeSubtitles({ translate, mode: subtitleMode })}
         >
           {recognizing ? <Loader2 className="spin" size={15} /> : <Captions size={15} />}
           {recognizing ? "识别中..." : "识别字幕"}

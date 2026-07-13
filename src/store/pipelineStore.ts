@@ -9,10 +9,11 @@ interface PipelineStore {
   startPipeline: (steps: PipelineState["steps"]) => void;
   updateStep: (index: number, status: PipelineStepStatus) => void;
   failRunningStep: (message: string) => void;
+  completePipeline: (report: NonNullable<PipelineState["report"]>) => void;
   resetPipeline: () => void;
 }
 
-const idlePipeline: PipelineState = { active: false, steps: [], error: null };
+const idlePipeline: PipelineState = { active: false, steps: [], error: null, report: null };
 
 export const usePipelineStore = create<PipelineStore>((set, get) => ({
   pipeline: idlePipeline,
@@ -20,7 +21,7 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
     set((state) => ({
       pipeline: typeof pipeline === "function" ? pipeline(state.pipeline) : pipeline,
     })),
-  startPipeline: (steps) => set({ pipeline: { active: true, steps, error: null } }),
+  startPipeline: (steps) => set({ pipeline: { active: true, steps, error: null, report: null } }),
   updateStep: (index, status) =>
     set((state) => ({
       pipeline: {
@@ -41,5 +42,8 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
       },
     });
   },
+  completePipeline: (report) => set((state) => ({
+    pipeline: { ...state.pipeline, active: true, error: null, report },
+  })),
   resetPipeline: () => set({ pipeline: idlePipeline }),
 }));

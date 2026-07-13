@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://127.0.0.1:3100",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run prepare:sidecars && npm run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -20,7 +20,7 @@
         "dragDropEnabled": false
       }
     ],
-   "security": {
+    "security": {
       "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data: blob: https://images.pexels.com; media-src 'self' asset: http://asset.localhost blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; connect-src 'self' http://127.0.0.1:* http://localhost:* ipc: http://ipc.localhost",
       "assetProtocol": {
         "enable": true,
@@ -35,6 +35,11 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all"
+    "targets": "all",
+    "externalBin": [
+      "binaries/ffmpeg",
+      "binaries/ffprobe",
+      "binaries/whisper-cli"
+    ]
   }
 }

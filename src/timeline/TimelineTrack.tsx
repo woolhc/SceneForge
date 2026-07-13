@@ -5,6 +5,7 @@ import { desktopApi } from "../tauri";
 import { usePlaybackStore } from "../store/playbackStore";
 import {
   computeDraggedClip,
+  hasExceededPointerDragThreshold,
   pxToSeconds,
   type DragHandle,
   type DragState,
@@ -64,6 +65,7 @@ function TimelineTrackInner({
     startX: number;
     currentX: number;
     additive: boolean;
+    activated: boolean;
   } | null>(null);
   const pxPerSecond = totalDuration > 0 ? timelineWidth / totalDuration : 1;
   const [dragOver, setDragOver] = useState(false);
@@ -87,6 +89,7 @@ function TimelineTrackInner({
       peers,
       // T2.2: playhead 从 store 按需读（拖拽时才用），避免每帧 prop 变化导致重渲染
       playhead: usePlaybackStore.getState().currentTime,
+      activated: false,
     };
     (event.currentTarget as HTMLDivElement).setPointerCapture(event.pointerId);
   }
@@ -94,6 +97,10 @@ function TimelineTrackInner({
   function moveDrag(event: React.PointerEvent<HTMLDivElement>) {
     const drag = dragRef.current;
     if (!drag) return;
+    if (!drag.activated) {
+      if (!hasExceededPointerDragThreshold(drag.startX, event.clientX)) return;
+      drag.activated = true;
+    }
     const deltaSeconds = pxToSeconds(event.clientX - drag.startX, pxPerSecond);
     const clip = clips.find((c) => c.id === drag.clipId);
     if (!clip) return;
@@ -125,23 +132,24 @@ function TimelineTrackInner({
   function startBoxSelect(event: React.PointerEvent<HTMLDivElement>) {
     if (locked || event.button !== 0 || event.target !== event.currentTarget) return;
     event.preventDefault();
-    const rect = event.currentTarget.getBoundingClientRect();
+    event.stopPropagation();
     boxRef.current = {
       pointerId: event.pointerId,
       startX: event.clientX,
       currentX: event.clientX,
       additive: event.metaKey || event.ctrlKey || event.shiftKey,
+      activated: false,
     };
     event.currentTarget.setPointerCapture(event.pointerId);
-    setBoxSelection({
-      left: Math.max(0, event.clientX - rect.left),
-      width: 0,
-    });
   }
 
   function moveBoxSelect(event: React.PointerEvent<HTMLDivElement>) {
     const box = boxRef.current;
     if (!box || box.pointerId !== event.pointerId) return;
+    if (!box.activated) {
+      if (!hasExceededPointerDragThreshold(box.startX, event.clientX)) return;
+      box.activated = true;
+    }
     const rect = event.currentTarget.getBoundingClientRect();
     box.currentX = event.clientX;
     const x0 = Math.max(0, Math.min(box.startX - rect.left, rect.width));
@@ -156,12 +164,16 @@ function TimelineTrackInner({
     const box = boxRef.current;
     if (!box || box.pointerId !== event.pointerId) return;
     event.currentTarget.releasePointerCapture(event.pointerId);
-    const start = timeFromClientX(Math.min(box.startX, box.currentX), event.currentTarget);
-    const end = timeFromClientX(Math.max(box.startX, box.currentX), event.currentTarget);
-    const ids = clips
-      .filter((clip) => clip.startOnTrack < end && clip.startOnTrack + clip.duration > start)
-      .map((clip) => clip.id);
-    onBoxSelect(ids, box.additive);
+    if (box.activated) {
+      const start = timeFromClientX(Math.min(box.startX, box.currentX), event.currentTarget);
+      const end = timeFromClientX(Math.max(box.startX, box.currentX), event.currentTarget);
+      const ids = clips
+        .filter((clip) => clip.startOnTrack < end && clip.startOnTrack + clip.duration > start)
+        .map((clip) => clip.id);
+      onBoxSelect(ids, box.additive);
+    } else {
+      onBoxSelect([], box.additive);
+    }
     boxRef.current = null;
     setBoxSelection(null);
   }
