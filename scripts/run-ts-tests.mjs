@@ -1,7 +1,7 @@
 import { readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, relative } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { build } from "esbuild";
 
 async function collectTests(directory) {
@@ -15,7 +15,7 @@ async function collectTests(directory) {
   return tests;
 }
 
-const root = new URL("..", import.meta.url).pathname;
+const root = fileURLToPath(new URL("..", import.meta.url));
 const tests = (await collectTests(join(root, "tests"))).sort();
 if (tests.length === 0) throw new Error("no TypeScript tests found");
 
