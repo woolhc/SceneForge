@@ -203,13 +203,12 @@ pub fn command_with_config(tool: NativeTool, configured: Option<&str>) -> Comman
     Command::new(resolve(tool, configured).path)
 }
 
-pub fn whisper_model_candidates(configured: &str, app_data_dir: &Path) -> Vec<PathBuf> {
+pub fn whisper_model_candidates_in_dir(configured: &str, models_dir: &Path) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let configured = configured.trim();
     if !configured.is_empty() {
         candidates.push(PathBuf::from(configured));
     }
-    let models_dir = app_data_dir.join("models");
     for name in [
         "ggml-large-v3.bin",
         "ggml-medium-q5_0.bin",
@@ -234,18 +233,29 @@ pub fn whisper_model_candidates(configured: &str, app_data_dir: &Path) -> Vec<Pa
     candidates
 }
 
-pub fn resolve_whisper_model(configured: &str, app_data_dir: &Path) -> Option<PathBuf> {
-    whisper_model_candidates(configured, app_data_dir)
-        .into_iter()
-        .find(|path| {
-            std::fs::symlink_metadata(path)
-                .map(|metadata| {
-                    metadata.file_type().is_file()
-                        && !metadata.file_type().is_symlink()
-                        && metadata.len() >= 1_000_000
-                })
-                .unwrap_or(false)
+#[cfg(test)]
+pub fn whisper_model_candidates(configured: &str, app_data_dir: &Path) -> Vec<PathBuf> {
+    whisper_model_candidates_in_dir(configured, &app_data_dir.join("models"))
+}
+
+fn is_valid_model_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|metadata| {
+            metadata.file_type().is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.len() >= 1_000_000
         })
+        .unwrap_or(false)
+}
+
+pub fn resolve_whisper_model_in_dir(configured: &str, models_dir: &Path) -> Option<PathBuf> {
+    whisper_model_candidates_in_dir(configured, models_dir)
+        .into_iter()
+        .find(|path| is_valid_model_file(path))
+}
+
+pub fn resolve_whisper_model(configured: &str, app_data_dir: &Path) -> Option<PathBuf> {
+    resolve_whisper_model_in_dir(configured, &app_data_dir.join("models"))
 }
 
 #[cfg(test)]

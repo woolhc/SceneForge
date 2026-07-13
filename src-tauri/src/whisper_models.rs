@@ -102,7 +102,7 @@ pub fn get_status(
     downloading: bool,
 ) -> WhisperModelStatus {
     let model = recommended_model();
-    let resolved = tools::resolve_whisper_model(&settings.whisper_model, models_dir);
+    let resolved = tools::resolve_whisper_model_in_dir(&settings.whisper_model, models_dir);
     let managed_path = managed_model_path(models_dir);
     let partial_path = partial_model_path(models_dir);
     let managed_size = std::fs::metadata(&managed_path)
@@ -427,6 +427,10 @@ mod tests {
         std::fs::write(managed_model_path(&dir), vec![0_u8; 1_000_001]).unwrap();
         let complete = get_status(&dir, &settings, false);
         assert!(complete.available);
+        assert_eq!(
+            complete.resolved_path.as_deref(),
+            Some(managed_model_path(&dir).to_string_lossy().as_ref()),
+        );
         assert!(!complete.partial_download);
         assert_eq!(complete.selected_model_id.as_deref(), Some("medium-q5"));
         std::fs::remove_dir_all(dir).unwrap();
