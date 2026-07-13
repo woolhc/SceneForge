@@ -18,10 +18,10 @@ const RECOMMENDED_MODEL_FILE: &str = "ggml-medium-q5_0.bin";
 const RECOMMENDED_MODEL_SIZE: u64 = 539_212_467;
 const RECOMMENDED_MODEL_SHA256: &str =
     "19fea4b380c3a618ec4723c3eef2eb785ffba0d0538cf43f8f235e7b3b34220f";
-const RECOMMENDED_MODEL_URL: &str =
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium-q5_0.bin?download=true";
-const RECOMMENDED_MODEL_BACKUP_URL: &str =
+const RECOMMENDED_MODEL_CN_URL: &str =
     "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-medium-q5_0.bin";
+const RECOMMENDED_MODEL_OFFICIAL_URL: &str =
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium-q5_0.bin?download=true";
 const DOWNLOAD_EVENT: &str = "whisper-model-download-progress";
 
 #[derive(Debug, Clone, Serialize)]
@@ -327,7 +327,7 @@ pub async fn download_recommended_model(
         .timeout(Duration::from_secs(60 * 60))
         .build()?;
     let mut last_error = None;
-    for url in [RECOMMENDED_MODEL_URL, RECOMMENDED_MODEL_BACKUP_URL] {
+    for url in [RECOMMENDED_MODEL_CN_URL, RECOMMENDED_MODEL_OFFICIAL_URL] {
         match download_from_url(&client, app_handle, url, &partial_path, cancel).await {
             Ok(()) => {
                 let downloaded = std::fs::metadata(&partial_path)
