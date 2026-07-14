@@ -387,6 +387,62 @@ pub async fn ensure_media_local(cache_dir: &Path, source: &MediaSource) -> anyho
     Ok(output_path)
 }
 
+pub fn reconcile_project_media_cache(project: &mut Project, cache_dir: &Path) -> bool {
+    let mut changed = false;
+    for source in &mut project.media {
+        let media_path = deterministic_media_cache_path(cache_dir, source);
+        if is_non_empty_file(&media_path)
+            && !path_option_points_to_non_empty_file(source.local_path.as_deref())
+        {
+            source.local_path = Some(media_path.to_string_lossy().to_string());
+            changed = true;
+        }
+
+        if source.kind == "video" {
+            let proxy_path = cache_dir
+                .join("proxies")
+                .join(format!("{}-proxy-v2.mp4", source.id));
+            let proxy_file_exists = is_non_empty_file(&proxy_path);
+            let proxy_path_string = proxy_path.to_string_lossy().to_string();
+            if proxy_file_exists
+                && !path_option_points_to_non_empty_file(source.proxy_path.as_deref())
+            {
+                source.proxy_path = Some(proxy_path.to_string_lossy().to_string());
+                changed = true;
+            }
+            if proxy_file_exists
+                && source.proxy_path.as_deref() == Some(proxy_path_string.as_str())
+                && source.proxy_status.as_deref() != Some("ready")
+            {
+                source.proxy_status = Some("ready".to_string());
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn deterministic_media_cache_path(cache_dir: &Path, source: &MediaSource) -> PathBuf {
+    let ext = source
+        .url
+        .as_deref()
+        .and_then(url_ext)
+        .unwrap_or_else(|| "mp4".to_string());
+    cache_dir
+        .join("media")
+        .join(format!("{}.{}", sanitize_file_stem(&source.id), ext))
+}
+
+fn path_option_points_to_non_empty_file(path: Option<&str>) -> bool {
+    path.map(Path::new).map(is_non_empty_file).unwrap_or(false)
+}
+
+fn is_non_empty_file(path: &Path) -> bool {
+    path.metadata()
+        .map(|metadata| metadata.is_file() && metadata.len() > 0)
+        .unwrap_or(false)
+}
+
 /// 从视频文件提取音轨，返回 wav 路径
 pub async fn extract_audio_from_video(
     cache_dir: &Path,
@@ -3337,6 +3393,95 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
         }
+    }
+
+    fn cache_test_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "scene-cache-recover-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create cache dir");
+        dir
+    }
+
+    #[test]
+    fn reconcile_project_media_cache_recovers_non_empty_disk_files() {
+        let cache_dir = cache_test_dir();
+        let media_dir = cache_dir.join("media");
+        let proxy_dir = cache_dir.join("proxies");
+        std::fs::create_dir_all(&media_dir).expect("create media dir");
+        std::fs::create_dir_all(&proxy_dir).expect("create proxy dir");
+        let media_path = media_dir.join("source_1.mov");
+        let proxy_path = proxy_dir.join("source 1-proxy-v2.mp4");
+        std::fs::write(&media_path, b"media").expect("write media");
+        std::fs::write(&proxy_path, b"proxy").expect("write proxy");
+
+        let mut project = project_for(Vec::new());
+        project.media = vec![MediaSource {
+            id: "source 1".to_string(),
+            kind: "video".to_string(),
+            title: "source".to_string(),
+            url: Some("https://example.com/path/source.mov?download=1".to_string()),
+            local_path: None,
+            proxy_path: None,
+            proxy_status: Some("none".to_string()),
+            proxy_width: None,
+            proxy_height: None,
+            thumbnail_url: None,
+            width: 1920,
+            height: 1080,
+            duration: 10.0,
+            source: "pexels".to_string(),
+        }];
+
+        assert!(reconcile_project_media_cache(&mut project, &cache_dir));
+        let source = project.media.first().expect("media source");
+        assert_eq!(
+            source.local_path,
+            Some(media_path.to_string_lossy().to_string())
+        );
+        assert_eq!(
+            source.proxy_path,
+            Some(proxy_path.to_string_lossy().to_string())
+        );
+        assert_eq!(source.proxy_status.as_deref(), Some("ready"));
+    }
+
+    #[test]
+    fn reconcile_project_media_cache_ignores_empty_disk_files() {
+        let cache_dir = cache_test_dir();
+        let media_dir = cache_dir.join("media");
+        let proxy_dir = cache_dir.join("proxies");
+        std::fs::create_dir_all(&media_dir).expect("create media dir");
+        std::fs::create_dir_all(&proxy_dir).expect("create proxy dir");
+        std::fs::write(media_dir.join("source_1.mp4"), b"").expect("write empty media");
+        std::fs::write(proxy_dir.join("source 1-proxy-v2.mp4"), b"").expect("write empty proxy");
+
+        let mut project = project_for(Vec::new());
+        project.media = vec![MediaSource {
+            id: "source 1".to_string(),
+            kind: "video".to_string(),
+            title: "source".to_string(),
+            url: None,
+            local_path: None,
+            proxy_path: None,
+            proxy_status: Some("none".to_string()),
+            proxy_width: None,
+            proxy_height: None,
+            thumbnail_url: None,
+            width: 1920,
+            height: 1080,
+            duration: 10.0,
+            source: "pexels".to_string(),
+        }];
+
+        assert!(!reconcile_project_media_cache(&mut project, &cache_dir));
+        let source = project.media.first().expect("media source");
+        assert_eq!(source.local_path, None);
+        assert_eq!(source.proxy_path, None);
+        assert_eq!(source.proxy_status.as_deref(), Some("none"));
     }
 
     #[test]

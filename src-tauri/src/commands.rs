@@ -359,7 +359,11 @@ pub fn create_project(
 #[tauri::command]
 pub fn get_project(state: State<'_, AppState>, id: String) -> Result<Project, String> {
     let conn = state.db.lock().map_err(map_error)?;
-    storage::get_project(&conn, &id).map_err(map_error)
+    let mut project = storage::get_project(&conn, &id).map_err(map_error)?;
+    if ffmpeg::reconcile_project_media_cache(&mut project, &state.paths.cache_dir) {
+        project = storage::save_project(&conn, &project).map_err(map_error)?;
+    }
+    Ok(project)
 }
 
 #[tauri::command]
@@ -2297,6 +2301,17 @@ pub async fn render_project(
                     "render-progress",
                     serde_json::json!({ "progress": 100, "message": "音频导出完成" }),
                 );
+                {
+                    let conn = state.db.lock().map_err(map_error)?;
+                    let mut latest =
+                        storage::get_project(&conn, &request.project_id).map_err(map_error)?;
+                    if request.preview {
+                        latest.preview_path = Some(path.to_string_lossy().to_string());
+                    } else {
+                        latest.final_path = Some(path.to_string_lossy().to_string());
+                    }
+                    storage::save_project(&conn, &latest).map_err(map_error)?;
+                }
                 return Ok(RenderResult {
                     preview_path: path.to_string_lossy().to_string(),
                     command: "render-audio-only".to_string(),
@@ -2357,7 +2372,10 @@ pub async fn render_project(
         render_output
     };
 
-    let mut next_project = project;
+    let mut next_project = {
+        let conn = state.db.lock().map_err(map_error)?;
+        storage::get_project(&conn, &request.project_id).map_err(map_error)?
+    };
     if request.preview {
         next_project.preview_path = Some(final_output_path.to_string_lossy().to_string());
     } else {

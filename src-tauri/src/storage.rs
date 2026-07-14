@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use chrono::Utc;
@@ -221,6 +221,7 @@ pub fn create_project(conn: &Connection, request: CreateProjectRequest) -> anyho
 
 pub fn save_project(conn: &Connection, project: &Project) -> anyhow::Result<Project> {
     let mut next = project.clone();
+    preserve_existing_media_cache_metadata(conn, &mut next)?;
     next.updated_at = Utc::now().to_rfc3339();
     if next.created_at.is_empty() {
         next.created_at = next.updated_at.clone();
@@ -247,6 +248,53 @@ pub fn save_project(conn: &Connection, project: &Project) -> anyhow::Result<Proj
         ],
     )?;
     Ok(next)
+}
+
+fn preserve_existing_media_cache_metadata(
+    conn: &Connection,
+    project: &mut Project,
+) -> anyhow::Result<()> {
+    let existing = match get_project(conn, &project.id) {
+        Ok(existing) => existing,
+        Err(error)
+            if matches!(
+                error.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::QueryReturnedNoRows)
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+
+    for source in &mut project.media {
+        let Some(existing_source) = existing.media.iter().find(|item| item.id == source.id) else {
+            continue;
+        };
+
+        if source.local_path.is_none()
+            && path_points_to_non_empty_file(existing_source.local_path.as_deref())
+        {
+            source.local_path = existing_source.local_path.clone();
+        }
+
+        if source.proxy_path.is_none()
+            && path_points_to_non_empty_file(existing_source.proxy_path.as_deref())
+        {
+            source.proxy_path = existing_source.proxy_path.clone();
+            source.proxy_status = existing_source.proxy_status.clone();
+            source.proxy_width = existing_source.proxy_width;
+            source.proxy_height = existing_source.proxy_height;
+        }
+    }
+
+    Ok(())
+}
+
+fn path_points_to_non_empty_file(path: Option<&str>) -> bool {
+    path.and_then(|value| Path::new(value).metadata().ok())
+        .map(|metadata| metadata.is_file() && metadata.len() > 0)
+        .unwrap_or(false)
 }
 
 pub fn get_project(conn: &Connection, id: &str) -> anyhow::Result<Project> {
@@ -449,6 +497,141 @@ pub fn delete_voice_profile(conn: &Connection, id: &str) -> anyhow::Result<()> {
     }
     conn.execute("DELETE FROM voice_profiles WHERE id = ?1", params![id])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::MediaSource;
+
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        initialize_schema(&conn).expect("initialize schema");
+        conn
+    }
+
+    fn project_with_media(media: Vec<MediaSource>) -> Project {
+        Project {
+            id: "project-1".to_string(),
+            title: "Project".to_string(),
+            script: String::new(),
+            ratio: "16:9".to_string(),
+            fps: 30,
+            media,
+            tracks: Vec::new(),
+            clips: Vec::new(),
+            render_config: RenderConfig::default(),
+            chapters: Vec::new(),
+            cover_time: None,
+            preview_path: None,
+            final_path: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn media_source(
+        id: &str,
+        local_path: Option<String>,
+        proxy_path: Option<String>,
+    ) -> MediaSource {
+        MediaSource {
+            id: id.to_string(),
+            kind: "video".to_string(),
+            title: id.to_string(),
+            url: Some("https://example.com/video.mp4".to_string()),
+            local_path,
+            proxy_path,
+            proxy_status: Some("ready".to_string()),
+            proxy_width: Some(640),
+            proxy_height: Some(360),
+            thumbnail_url: None,
+            width: 1920,
+            height: 1080,
+            duration: 5.0,
+            source: "pexels".to_string(),
+        }
+    }
+
+    fn write_temp_file(name: &str, bytes: &[u8]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("scene-cache-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join(name);
+        fs::write(&path, bytes).expect("write temp file");
+        path
+    }
+
+    #[test]
+    fn save_project_preserves_non_empty_existing_cache_metadata() {
+        let conn = test_conn();
+        let local_path = write_temp_file("local.mp4", b"video");
+        let proxy_path = write_temp_file("proxy.mp4", b"proxy");
+        let original = project_with_media(vec![media_source(
+            "media-1",
+            Some(local_path.to_string_lossy().to_string()),
+            Some(proxy_path.to_string_lossy().to_string()),
+        )]);
+        save_project(&conn, &original).expect("save original");
+
+        let stale = project_with_media(vec![media_source("media-1", None, None)]);
+        let saved = save_project(&conn, &stale).expect("save stale snapshot");
+
+        let source = saved.media.first().expect("media source");
+        assert_eq!(
+            source.local_path,
+            Some(local_path.to_string_lossy().to_string())
+        );
+        assert_eq!(
+            source.proxy_path,
+            Some(proxy_path.to_string_lossy().to_string())
+        );
+        assert_eq!(source.proxy_status.as_deref(), Some("ready"));
+        assert_eq!(source.proxy_width, Some(640));
+        assert_eq!(source.proxy_height, Some(360));
+    }
+
+    #[test]
+    fn save_project_propagates_corrupt_existing_payload() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO projects (id, title, ratio, payload_json, created_at, updated_at, clip_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params!["project-1", "Corrupt", "16:9", "{not-json", "now", "now", 0],
+        )
+        .expect("insert corrupt project");
+
+        let error = save_project(&conn, &project_with_media(Vec::new()))
+            .expect_err("corrupt existing payload must block overwrite");
+        assert!(error.downcast_ref::<serde_json::Error>().is_some());
+
+        let raw: String = conn
+            .query_row(
+                "SELECT payload_json FROM projects WHERE id = ?1",
+                params!["project-1"],
+                |row| row.get(0),
+            )
+            .expect("read original payload");
+        assert_eq!(raw, "{not-json");
+    }
+
+    #[test]
+    fn save_project_does_not_preserve_empty_existing_cache_files() {
+        let conn = test_conn();
+        let empty_local_path = write_temp_file("empty-local.mp4", b"");
+        let empty_proxy_path = write_temp_file("empty-proxy.mp4", b"");
+        let original = project_with_media(vec![media_source(
+            "media-1",
+            Some(empty_local_path.to_string_lossy().to_string()),
+            Some(empty_proxy_path.to_string_lossy().to_string()),
+        )]);
+        save_project(&conn, &original).expect("save original");
+
+        let stale = project_with_media(vec![media_source("media-1", None, None)]);
+        let saved = save_project(&conn, &stale).expect("save stale snapshot");
+
+        let source = saved.media.first().expect("media source");
+        assert_eq!(source.local_path, None);
+        assert_eq!(source.proxy_path, None);
+    }
 }
 
 /// 任务 checkpoint：记录 pipeline 某步骤的状态，失败后可恢复

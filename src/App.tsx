@@ -79,6 +79,7 @@ import {
   toggleTrackMuted,
 } from "./editor/timelineActions";
 import { runGeneratePipeline, type GeneratePipelineInput } from "./editor/pipeline";
+import { mergeCachedMediaSource } from "./editor/mediaCache";
 import { selectAssetCandidate, type AssetSelectionResult } from "./editor/assetSelection";
 import { buildTranscriptSubtitleProject, prepareTranscriptSubtitles } from "./editor/subtitleFromTranscript";
 import { requestSubtitleSemanticAdvice } from "./editor/subtitles/semanticAdvice";
@@ -662,7 +663,7 @@ export function App() {
     setStatus,
   });
 
-  useProxyBackfill({ project, setProject, setAssetCachingIds, setStatus });
+  useProxyBackfill({ project, projectRef, setProject, setAssetCachingIds, setStatus });
 
   // 实时预览引擎：接管中央预览的 <video>，按时间线同步画面/配音/字幕
   // T2.1: engineState 移到 zustand store，按字段订阅避免 60fps 全树重渲染
@@ -2109,12 +2110,11 @@ export function App() {
       // 基于 projectRef（最新值）只更新 media 字段，绝不覆盖用户正在编辑的 script 等字段
       const latest = projectRef.current;
       if (!latest || latest.id !== projectId) return;
-      const next: Project = {
-        ...latest,
-        media: latest.media.some((m) => m.id === cached.id)
-          ? latest.media.map((m) => (m.id === cached.id ? cached : m))
-          : [...latest.media, cached],
-      };
+      const next = mergeCachedMediaSource(latest, cached);
+      // Background cache completions can resolve in the same event-loop turn.
+      // Advance the ref before React commits so the next completion merges on
+      // top of this one instead of rebuilding from a stale snapshot.
+      projectRef.current = next;
       setProject(next);
       await desktopApi.saveProject(next);
       setAssetCandidates((previous) => ({
