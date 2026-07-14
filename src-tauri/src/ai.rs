@@ -26,6 +26,35 @@ struct AiSegmentPayload {
     segments: Vec<AiSegment>,
 }
 
+const ENRICH_BATCH_SIZE: usize = 24;
+
+#[derive(Debug, Deserialize)]
+struct EnrichPayload {
+    #[serde(default)]
+    segments: Vec<EnrichItem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnrichItem {
+    #[serde(default)]
+    index: Option<usize>,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    visual_query: String,
+    #[serde(default)]
+    visual_query_zh: String,
+    #[serde(default)]
+    mood: String,
+    #[serde(default = "default_enrich_material_strategy")]
+    material_strategy: String,
+}
+
+fn default_enrich_material_strategy() -> String {
+    "auto_search".to_string()
+}
+
 fn parse_json_content<T: DeserializeOwned>(content: &str) -> anyhow::Result<T> {
     let trimmed = content.trim();
     let unwrapped = trimmed
@@ -166,37 +195,38 @@ pub async fn enrich_segments(
         anyhow::bail!("没有可富化的句子");
     }
 
-    // 构造输入：带 index 的句子列表（让 AI 知道顺序，但不允许合并/拆分）
-    let input: Vec<serde_json::Value> = request
-        .sentences
-        .iter()
-        .enumerate()
-        .map(|(i, s)| json!({ "index": i, "start": s.start, "end": s.end, "text": s.text }))
-        .collect();
-
-    let system_prompt = "你是短视频剪辑助手。我会给你一组已经切好的句子（每句带时间戳）。你的任务是为每句配一个画面搜索词，但绝对不能改变句子的数量、顺序、时间。只返回 JSON。";
+    let client = crate::ffmpeg::http_client();
     let material_direction = describe_material_direction(&request.material_direction);
-    let user_prompt = format!(
-        r#"项目比例：{ratio}
+    let mut enriched_items = Vec::with_capacity(request.sentences.len());
+
+    // Long transcripts previously asked DeepSeek to echo every sentence, timestamp,
+    // and text in one large JSON document. Batch the request and return only fields
+    // the application actually consumes, reducing truncation and quote-escaping risk.
+    for (batch_index, sentences) in request.sentences.chunks(ENRICH_BATCH_SIZE).enumerate() {
+        let offset = batch_index * ENRICH_BATCH_SIZE;
+        let input: Vec<serde_json::Value> = sentences
+            .iter()
+            .enumerate()
+            .map(|(local_index, sentence)| {
+                json!({
+                    "index": offset + local_index,
+                    "text": sentence.text,
+                })
+            })
+            .collect();
+        let input_json = serde_json::to_string_pretty(&input)?;
+        let prompt = format!(
+            r#"项目比例：{ratio}
 素材方向：{material_direction}
 
-下面是 {n} 句已切好的旁白（按时间顺序，带真实时间戳）。请为每一句配画面关键词。
+请为下面 {batch_count} 句旁白分别生成画面搜索信息。输入 index 必须原样返回。
+不要回填 start、end 或 text；不要输出输入原文，避免重复和转义错误。
 
-严格约束：
-- 输出必须正好 {n} 段，顺序与输入一一对应。
-- start / end 必须原样回填，不得修改。
-- text 必须原样回填，不得改写。
-- 不要合并句子，不要拆分句子，不要增删句子。
-- 如果素材方向不是 AI 自动判断，请让 visualQuery 明显贴合该方向，但仍需尊重每句文案语义。
-
-返回 JSON：
+只返回 JSON：
 {{
   "segments": [
     {{
       "index": 0,
-      "start": 0.0,
-      "end": 3.5,
-      "text": "原样回填的句子",
       "title": "不超过10字的标题",
       "visualQuery": "英文 Pexels 关键词",
       "visualQueryZh": "中文关键词",
@@ -206,111 +236,134 @@ pub async fn enrich_segments(
   ]
 }}
 
+要求：
+- 输出必须正好 {batch_count} 项，顺序与输入一致。
+- index 必须使用输入中的原始数值。
+- visualQuery 必须是适合 Pexels 搜索的简洁英文词组。
+- materialStrategy 只能是 auto_search、manual 或 color_card。
+- 如果素材方向不是 AI 自动判断，关键词应明显贴合该方向，但仍需尊重句子语义。
+
 句子：
-{input}"#,
-        ratio = request.ratio,
-        material_direction = material_direction,
-        n = request.sentences.len(),
-        input = serde_json::to_string_pretty(&input).unwrap_or_default()
-    );
+{input_json}"#,
+            ratio = request.ratio,
+            material_direction = material_direction,
+            batch_count = sentences.len(),
+            input_json = input_json,
+        );
 
-    let client = crate::ffmpeg::http_client();
-    let response = client
-        .post("https://api.deepseek.com/chat/completions")
-        .bearer_auth(api_key)
-        .json(&json!({
-            "model": "deepseek-chat",
-            "messages": [
-                { "role": "system", "content": system_prompt },
-                { "role": "user", "content": user_prompt }
-            ],
-            "response_format": { "type": "json_object" },
-            "temperature": 0.3
-        }))
-        .send()
-        .await?;
+        let mut last_error = None;
+        let mut parsed_batch = None;
+        for attempt in 0..2 {
+            let response = client
+                .post("https://api.deepseek.com/chat/completions")
+                .bearer_auth(api_key)
+                .json(&json!({
+                    "model": "deepseek-chat",
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "你是短视频剪辑助手。只为给定句子生成画面搜索元数据，只返回严格 JSON，不要 Markdown，不要重复输入原文。"
+                        },
+                        { "role": "user", "content": prompt }
+                    ],
+                    "response_format": { "type": "json_object" },
+                    "temperature": if attempt == 0 { 0.1 } else { 0.0 }
+                }))
+                .send()
+                .await?;
 
-    let status = response.status();
-    let body = response.text().await?;
-    if !status.is_success() {
-        anyhow::bail!("DeepSeek 富化失败：HTTP {}", status.as_u16());
+            let status = response.status();
+            let body = response.text().await?;
+            if !status.is_success() {
+                anyhow::bail!("DeepSeek 富化失败：HTTP {}", status.as_u16());
+            }
+
+            let deepseek: DeepSeekResponse = serde_json::from_str(&body)
+                .map_err(|error| anyhow::anyhow!("DeepSeek 富化响应解析失败：{error}"))?;
+            let content = deepseek
+                .choices
+                .first()
+                .map(|choice| choice.message.content.trim())
+                .filter(|content| !content.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("DeepSeek 返回为空"))?;
+
+            match parse_json_content::<EnrichPayload>(content) {
+                Ok(payload) if !payload.segments.is_empty() => {
+                    parsed_batch = Some(payload.segments);
+                    break;
+                }
+                Ok(_) => {
+                    last_error = Some(anyhow::anyhow!("DeepSeek 富化返回的 segments 为空"));
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        let mut items = parsed_batch.ok_or_else(|| {
+            let start = offset + 1;
+            let end = offset + sentences.len();
+            anyhow::anyhow!(
+                "DeepSeek 富化第 {start}-{end} 句 JSON 解析失败：{}",
+                last_error
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "未知错误".to_string())
+            )
+        })?;
+
+        // Some models return local batch indexes despite the prompt. Normalize only
+        // missing/out-of-range indexes by position while preserving valid global ones.
+        for (local_index, item) in items.iter_mut().enumerate() {
+            let expected_index = offset + local_index;
+            let in_batch = item
+                .index
+                .map(|index| index >= offset && index < offset + sentences.len())
+                .unwrap_or(false);
+            if !in_batch {
+                item.index = Some(expected_index);
+            }
+        }
+        enriched_items.extend(items);
     }
 
-    let deepseek: DeepSeekResponse = serde_json::from_str(&body)?;
-    let content = deepseek
-        .choices
-        .first()
-        .map(|c| c.message.content.trim())
-        .filter(|c| !c.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("DeepSeek 返回为空"))?;
+    let by_index: std::collections::HashMap<usize, &EnrichItem> = enriched_items
+        .iter()
+        .filter_map(|item| item.index.map(|index| (index, item)))
+        .collect();
 
-    // 解析：用原文句子作为权威来源，AI 输出按 index 匹配
-    #[derive(Deserialize)]
-    struct EnrichPayload {
-        #[serde(default)]
-        segments: Vec<EnrichItem>,
-    }
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct EnrichItem {
-        #[serde(default)]
-        index: Option<usize>,
-        #[serde(default)]
-        title: String,
-        #[serde(default)]
-        visual_query: String,
-        #[serde(default)]
-        visual_query_zh: String,
-        #[serde(default)]
-        mood: String,
-        #[serde(default = "default_material_strategy")]
-        material_strategy: String,
-    }
-    fn default_material_strategy() -> String {
-        "auto_search".to_string()
-    }
-
-    let payload: EnrichPayload = serde_json::from_str(content)
-        .map_err(|e| anyhow::anyhow!("DeepSeek 富化 JSON 解析失败：{e}"))?;
-
-    // 用原文句子的时间/text 作为权威，AI 字段按 index 对齐
-    let mut by_index: std::collections::HashMap<usize, &EnrichItem> =
-        std::collections::HashMap::new();
-    for item in &payload.segments {
-        let idx = item.index.unwrap_or(0);
-        by_index.insert(idx, item);
-    }
-
-    let result: Vec<AiSegment> = request
+    // Original Whisper sentences remain authoritative for timing and text.
+    let result = request
         .sentences
         .iter()
         .enumerate()
-        .map(|(i, s)| {
-            let enrich = by_index.get(&i).copied();
-            let fallback = payload.segments.get(i);
-            let item = enrich.or(fallback);
-            let duration = (s.end - s.start).max(0.5);
+        .map(|(index, sentence)| {
+            let item = by_index.get(&index).copied();
+            let duration = (sentence.end - sentence.start).max(0.5);
             AiSegment {
                 title: item
-                    .map(|x| x.title.clone())
-                    .filter(|t| !t.is_empty())
-                    .unwrap_or_else(|| s.text.chars().take(10).collect()),
-                text: s.text.clone(),
+                    .map(|value| value.title.clone())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| sentence.text.chars().take(10).collect()),
+                text: sentence.text.clone(),
                 visual_query: item
-                    .map(|x| x.visual_query.clone())
-                    .filter(|t| !t.is_empty())
+                    .map(|value| value.visual_query.clone())
+                    .filter(|value| !value.is_empty())
                     .unwrap_or_else(|| "nature landscape".to_string()),
-                visual_query_zh: item.map(|x| x.visual_query_zh.clone()).unwrap_or_default(),
+                visual_query_zh: item
+                    .map(|value| value.visual_query_zh.clone())
+                    .unwrap_or_default(),
                 mood: item
-                    .map(|x| x.mood.clone())
-                    .filter(|t| !t.is_empty())
+                    .map(|value| value.mood.clone())
+                    .filter(|value| !value.is_empty())
                     .unwrap_or_else(|| "neutral".to_string()),
                 estimated_duration: duration,
                 material_strategy: item
-                    .map(|x| x.material_strategy.clone())
+                    .map(|value| value.material_strategy.clone())
                     .unwrap_or_else(|| "auto_search".to_string()),
-                start: s.start,
-                end: s.end,
+                start: sentence.start,
+                end: sentence.end,
             }
         })
         .collect();
@@ -614,7 +667,7 @@ pub async fn analyze_subtitle_language_context(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_json_content, SubtitleBreakAdvicePayload};
+    use super::{parse_json_content, EnrichPayload, SubtitleBreakAdvicePayload};
 
     #[test]
     fn subtitle_break_payload_accepts_pair_ranges() {
@@ -624,6 +677,17 @@ mod tests {
         .expect("pair protected range should parse");
         assert_eq!(payload.preferred_break_after_indices, vec![6]);
         assert_eq!(payload.protected_ranges.len(), 1);
+    }
+
+    #[test]
+    fn enrich_payload_accepts_minimal_fenced_json() {
+        let payload: EnrichPayload = parse_json_content(
+            "```json\n{\"segments\":[{\"index\":24,\"title\":\"标题\",\"visualQuery\":\"city street\",\"visualQueryZh\":\"城市\",\"mood\":\"urban\",\"materialStrategy\":\"auto_search\"}]}\n```",
+        )
+        .expect("minimal enrich payload should parse");
+        assert_eq!(payload.segments.len(), 1);
+        assert_eq!(payload.segments[0].index, Some(24));
+        assert_eq!(payload.segments[0].visual_query, "city street");
     }
 
     #[test]
