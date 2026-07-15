@@ -85,6 +85,7 @@ import { buildTranscriptSubtitleProject, prepareTranscriptSubtitles } from "./ed
 import { requestSubtitleSemanticAdvice } from "./editor/subtitles/semanticAdvice";
 import { saveSubtitleArtifact } from "./editor/subtitles/artifacts";
 import { subtitleLayoutProfile } from "./editor/subtitles/profiles";
+import { applySubtitleCuePatch, type SubtitleCuePatch } from "./editor/subtitles/document";
 import { normalizeSubtitleStyle, resolveSubtitleAnchor } from "./editor/subtitles/styleContract";
 import {
   buildGenerationReport,
@@ -124,6 +125,7 @@ import { AudioPanel } from "./panels/AudioPanel";
 import { TransitionPanel } from "./panels/TransitionPanel";
 import { ProjectMenu } from "./panels/ProjectMenu";
 import { SubtitlePanel } from "./panels/SubtitlePanel";
+import { SubtitleWorkbench } from "./editor/subtitles/SubtitleWorkbench";
 import { EffectsPanel } from "./panels/EffectsPanel";
 import { ToolRail } from "./editor/ToolRail";
 import { ToolPanel } from "./editor/ToolPanel";
@@ -2334,6 +2336,23 @@ export function App() {
    * commit=true（默认）：持久化 + 压入撤销栈。
    * commit=false：只更新本地 state（滑块拖动中用），配合后续 commit=true 提交。
    */
+  function handleSubtitleWorkbenchSelect(cueId: string) {
+    const cue = project?.clips.find((clip) => clip.id === cueId);
+    if (!cue) return;
+    selectClip(cueId, false, false);
+    seek(cue.startOnTrack);
+  }
+
+  function handleSubtitleWorkbenchPatch(cueId: string, patch: SubtitleCuePatch) {
+    if (!project) return;
+    const next = applySubtitleCuePatch(project, cueId, patch);
+    if (next === project) {
+      setStatus("字幕所在轨道已锁定，无法修改");
+      return;
+    }
+    void persist(next, "已更新字幕");
+  }
+
   function updateSelectedClip(patch: Partial<Clip>, commit: boolean = true) {
     if (!project || !selectedClip) return;
     // 交互式编辑开始（首次非 commit 调用）→ 记录操作前快照
@@ -3024,14 +3043,22 @@ export function App() {
               />
             )}
             {activeToolTab === "subtitle" && (
-              <SubtitlePanel
-                busy={busy}
-                onRecognizeSubtitles={handleRecognizeSubtitles}
-                onAddManualSubtitle={handleAddManualSubtitle}
-                onImportSrt={handleImportSrt}
-                subtitleStyle={subtitleStyleDraft}
-                onSubtitleStyleChange={setSubtitleStyleDraft}
-              />
+              <>
+                <SubtitlePanel
+                  busy={busy}
+                  onRecognizeSubtitles={handleRecognizeSubtitles}
+                  onAddManualSubtitle={handleAddManualSubtitle}
+                  onImportSrt={handleImportSrt}
+                  subtitleStyle={subtitleStyleDraft}
+                  onSubtitleStyleChange={setSubtitleStyleDraft}
+                />
+                <SubtitleWorkbench
+                  project={project}
+                  selectedCueId={selectedClipTrack?.kind === "subtitle" ? selectedClip?.id ?? null : null}
+                  onSelectCue={handleSubtitleWorkbenchSelect}
+                  onPatchCue={handleSubtitleWorkbenchPatch}
+                />
+              </>
             )}
             {activeToolTab === "audio" && (
               <AudioPanel

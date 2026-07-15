@@ -139,9 +139,11 @@ export function applySubtitleCuePatch(
     text: patch.text ?? clip.text,
     subtitleStyle: nextStyle,
     words: patch.words ? [...patch.words] : clip.words,
-    subtitleGroupId: patch.groupId ?? clip.subtitleGroupId,
-    subtitleRole: patch.role ?? clip.subtitleRole,
-    subtitleLanguage: patch.language ?? clip.subtitleLanguage,
+    subtitleGroupId:
+      "groupId" in patch ? (patch.groupId ?? null) : clip.subtitleGroupId,
+    subtitleRole: "role" in patch ? (patch.role ?? null) : clip.subtitleRole,
+    subtitleLanguage:
+      "language" in patch ? (patch.language ?? null) : clip.subtitleLanguage,
   };
 
   return {

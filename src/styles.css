@@ -4794,3 +4794,132 @@ textarea {
 .whisper-model-card p {
   font-size: 12px;
 }
+
+/* Phase 2: 字幕工作台 */
+.subtitle-workbench {
+  min-height: 0;
+}
+
+.subtitle-workbench .text-section-title em {
+  margin-left: auto;
+  color: var(--text-dim);
+  font-style: normal;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.subtitle-workbench-search {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0 8px;
+  color: var(--text-dim);
+  background: rgba(0, 0, 0, 0.14);
+}
+
+.subtitle-workbench-search input {
+  min-width: 0;
+  flex: 1;
+  border: 0;
+  outline: 0;
+  padding: 7px 0;
+  color: var(--text);
+  background: transparent;
+  font-size: 12px;
+}
+
+.subtitle-workbench-list {
+  display: grid;
+  gap: 6px;
+  max-height: 360px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.subtitle-workbench-row {
+  display: grid;
+  grid-template-columns: minmax(70px, 0.75fr) minmax(102px, 1fr) minmax(0, 2.2fr);
+  gap: 6px;
+  align-items: start;
+  padding: 7px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: rgba(0, 0, 0, 0.12);
+}
+
+.subtitle-workbench-row.selected {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.subtitle-workbench-row.locked {
+  opacity: 0.62;
+}
+
+.subtitle-workbench-jump {
+  display: grid;
+  gap: 3px;
+  padding: 1px 0;
+  border: 0;
+  color: var(--text);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.subtitle-workbench-jump span {
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+}
+
+.subtitle-workbench-jump small,
+.subtitle-workbench-meta {
+  color: var(--text-dim);
+  font-size: 10px;
+}
+
+.subtitle-workbench-timing {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--text-dim);
+}
+
+.subtitle-workbench-timing input {
+  width: 47%;
+  min-width: 0;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  background: rgba(0, 0, 0, 0.22);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.subtitle-workbench-row textarea {
+  width: 100%;
+  min-height: 42px;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 5px 6px;
+  color: var(--text);
+  background: rgba(0, 0, 0, 0.2);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.subtitle-workbench-row textarea:focus,
+.subtitle-workbench-timing input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.subtitle-workbench-meta {
+  grid-column: 3;
+}

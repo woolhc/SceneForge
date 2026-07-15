@@ -141,6 +141,7 @@ const patched = applySubtitleCuePatch(project, "source-1", {
   end: -0.5,
   text: "Edited",
   style: { position: "custom", x: 25, y: 70 },
+  groupId: null,
 });
 const patchedCue = patched.clips.find((clip) => clip.id === "source-1")!;
 assert.equal(patchedCue.startOnTrack, 0);
@@ -148,6 +149,11 @@ assert.equal(patchedCue.duration, 0.2);
 assert.equal(patchedCue.text, "Edited");
 assert.equal(patchedCue.subtitleStyle?.position, "custom");
 assert.equal(patchedCue.subtitleStyle?.x, 25);
+assert.equal(
+  patchedCue.subtitleGroupId,
+  null,
+  "explicit null must clear optional metadata",
+);
 assert.equal(project.clips[1].text, "Hello world", "patch must be immutable");
 
 assert.equal(
