@@ -85,6 +85,7 @@ import { buildTranscriptSubtitleProject, prepareTranscriptSubtitles } from "./ed
 import { requestSubtitleSemanticAdvice } from "./editor/subtitles/semanticAdvice";
 import { saveSubtitleArtifact } from "./editor/subtitles/artifacts";
 import { subtitleLayoutProfile } from "./editor/subtitles/profiles";
+import { normalizeSubtitleStyle, resolveSubtitleAnchor } from "./editor/subtitles/styleContract";
 import {
   buildGenerationReport,
   createGenerationSession,
@@ -234,13 +235,8 @@ function SubtitleItem({ clip, currentTime, fontScale }: {
   currentTime: number;
   fontScale: number;
 }) {
-  const s = clip.subtitleStyle;
-  const isCustom = s?.position === "custom";
-  const posX = isCustom ? (s?.x ?? 50) : 50;
-  // 单字幕按 position 渲染，多字幕轨由用户设置不同 position 避免叠加（与后端 ASS 烧录一致）
-  const posY = isCustom
-    ? (s?.y ?? 80)
-    : (s?.position === "top" ? 12 : s?.position === "center" ? 50 : 88);
+  const s = normalizeSubtitleStyle(clip.subtitleStyle);
+  const { x: posX, y: posY } = resolveSubtitleAnchor(s);
   const baseColor = s?.color ?? "#FFFFFF";
   const highlightColor = s?.highlightColor ?? "#FFD700";
   const karaokeOn = (s?.karaoke ?? true) && (clip.words?.length ?? 0) > 0;
@@ -273,8 +269,9 @@ function SubtitleItem({ clip, currentTime, fontScale }: {
         position: "absolute",
         left: `${posX}%`,
         top: `${posY}%`,
-        transform: `translate(-50%, -50%) rotate(${s?.rotation ?? 0}deg) scale(${(s?.scaleX ?? 100) / 100}, ${(s?.scaleY ?? 100) / 100})`,
+        transform: `translate(-50%, -50%) rotate(${s.rotation ?? 0}deg) scale(${(s.scaleX ?? 100) / 100}, ${(s.scaleY ?? 100) / 100})`,
         transformOrigin: "center",
+        ["--sub-base-transform" as string]: `translate(-50%, -50%) rotate(${s.rotation ?? 0}deg) scale(${(s.scaleX ?? 100) / 100}, ${(s.scaleY ?? 100) / 100})`,
         fontFamily: s?.fontFamily,
         fontSize: `${Math.max(8, (s?.fontSize ?? 48) * fontScale)}px`,
         fontWeight: 700,

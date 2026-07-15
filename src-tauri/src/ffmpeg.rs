@@ -2430,6 +2430,12 @@ fn generate_ass_subtitles(
                     && existing.font_size == s.font_size
                     && existing.color == s.color
                     && existing.stroke_color == s.stroke_color
+                    && (existing.stroke_width - s.stroke_width).abs() < f64::EPSILON
+                    && existing.background_color == s.background_color
+                    && (existing.background_padding - s.background_padding).abs() < f64::EPSILON
+                    && existing.shadow_color == s.shadow_color
+                    && (existing.shadow_blur - s.shadow_blur).abs() < f64::EPSILON
+                    && (existing.letter_spacing - s.letter_spacing).abs() < f64::EPSILON
                     && existing.position == s.position
             });
             if !exists {
@@ -2443,29 +2449,54 @@ fn generate_ass_subtitles(
     // 生成 Style 行（加宽 margin + 描边 4px 提升可读性）
     let mut styles_str = String::new();
     for (name, style) in &style_names {
-        // 逐字高亮（karaoke）：PrimaryColour=高亮色（已播过），SecondaryColour=文字色（未播）
-        // ASS \kf：颜色从 Secondary 渐变到 Primary
+        // 逐字高亮（karaoke）：PrimaryColour=高亮色（已播过），SecondaryColour=文字色（未播）。
+        // ASS \kf：颜色从 Secondary 渐变到 Primary。
         let (primary, secondary) = if style.karaoke {
             let hi = hex_to_ass_color(&style.highlight_color);
             let base = hex_to_ass_color(&style.color);
             (hi, base)
         } else {
-            let c = hex_to_ass_color(&style.color);
-            (c.clone(), c)
+            let color = hex_to_ass_color(&style.color);
+            (color.clone(), color)
         };
-        let outline = hex_to_ass_color(&style.stroke_color);
-        // 统一用 Alignment=5（中中锚点），位置由 Dialogue 行的 \pos 接管，与前端 SubtitleOverlay 对齐
-        // ScaleX/Y/Rotation 也移到 Dialogue 行用 \fscx/\fscy/\frz，避免 Style 级别缩放干扰布局
+        let has_background = !style.background_color.trim().is_empty()
+            && !style.background_color.eq_ignore_ascii_case("none");
+        // ASS 的 BorderStyle=3 是方形底板，无法同时忠实表达圆角和独立描边；
+        // 首期优先把已经在前端暴露的背景和 padding 映射为可导出的近似效果。
+        let border_style = if has_background { 3 } else { 1 };
+        let outline_color = if has_background {
+            hex_to_ass_color(&style.background_color)
+        } else {
+            hex_to_ass_color(&style.stroke_color)
+        };
+        let outline_width = if has_background {
+            style.background_padding.max(1.0)
+        } else {
+            style.stroke_width.max(0.0)
+        };
+        let shadow_color = hex_to_ass_color(&style.shadow_color);
+        let shadow_distance = if has_background {
+            0.0
+        } else {
+            (style.shadow_blur / 3.0).clamp(0.0, 32.0)
+        };
+        // 统一用 Alignment=5（中中锚点），位置由 Dialogue 行的 \pos 接管，与前端 SubtitleOverlay 对齐。
+        // ScaleX/Y/Rotation 移到 Dialogue 行用 \fscx/\fscy/\frz，避免 Style 级别缩放干扰布局。
         let alignment = 5;
         let margin_v = 0;
         styles_str.push_str(&format!(
-            "Style: {name},{font},{size},{primary},{secondary},{outline},&H80000000,0,0,0,0,100,100,0,0,1,4,1,{align},{mlr},{mlr},{mv},1\n",
+            "Style: {name},{font},{size},{primary},{secondary},{outline},{back},-1,0,0,0,100,100,{spacing:.2},0,{border_style},{outline_width:.2},{shadow_distance:.2},{align},{mlr},{mlr},{mv},1\n",
             name = name,
             font = style.font_family,
             size = style.font_size,
             primary = primary,
             secondary = secondary,
-            outline = outline,
+            outline = outline_color,
+            back = shadow_color,
+            spacing = style.letter_spacing,
+            border_style = border_style,
+            outline_width = outline_width,
+            shadow_distance = shadow_distance,
             align = alignment,
             mlr = margin_lr,
             mv = margin_v,
@@ -2516,6 +2547,12 @@ fn generate_ass_subtitles(
                         && existing.font_size == s.font_size
                         && existing.color == s.color
                         && existing.stroke_color == s.stroke_color
+                        && (existing.stroke_width - s.stroke_width).abs() < f64::EPSILON
+                        && existing.background_color == s.background_color
+                        && (existing.background_padding - s.background_padding).abs() < f64::EPSILON
+                        && existing.shadow_color == s.shadow_color
+                        && (existing.shadow_blur - s.shadow_blur).abs() < f64::EPSILON
+                        && (existing.letter_spacing - s.letter_spacing).abs() < f64::EPSILON
                         && existing.position == s.position
                 })
                 .map(|(n, _)| n.clone())
@@ -2560,53 +2597,108 @@ fn generate_ass_subtitles(
                 .replace('\n', "\\N")
         };
 
-        // T4.8: 入场/出场动画 → ASS \fad(in,out) 标签（单位厘秒）
+        // 入场/出场动画。ASS 的 \fad / \move / \t 都使用毫秒；
+        // scale 可同时组合入场和出场，slide 在同一 Dialogue 中只支持一个 move，
+        // 因此入场 slide 优先，出场仍保留 fade 以确保不会静默变成静态字幕。
         let style = clip.subtitle_style.as_ref();
-        let anim_dur = (style.map(|s| s.animation_duration).unwrap_or(0.3) * 100.0) as u32;
-        let anim_in = style.map(|s| s.animation_in.as_str()).unwrap_or("");
-        let anim_out = style.map(|s| s.animation_out.as_str()).unwrap_or("");
-        let fade_in_cs = if anim_in == "fadeIn" || anim_in == "slideUp" || anim_in == "scaleIn" {
-            anim_dur
-        } else {
-            0
-        };
-        let fade_out_cs =
-            if anim_out == "fadeOut" || anim_out == "slideDown" || anim_out == "scaleOut" {
-                anim_dur
-            } else {
-                0
-            };
-        let fade_tag = if fade_in_cs > 0 || fade_out_cs > 0 {
-            format!("{{\\fad({fade_in_cs},{fade_out_cs})}}")
-        } else {
-            String::new()
-        };
+        let animation_duration_ms = (style
+            .map(|value| value.animation_duration)
+            .unwrap_or(0.3)
+            .clamp(0.0, clip.duration.max(0.0))
+            * 1000.0)
+            .round() as u32;
+        let total_duration_ms = (clip.duration.max(0.0) * 1000.0).round() as u32;
+        let outro_start_ms = total_duration_ms.saturating_sub(animation_duration_ms);
+        let animation_in = style.map(|value| value.animation_in.as_str()).unwrap_or("");
+        let animation_out = style
+            .map(|value| value.animation_out.as_str())
+            .unwrap_or("");
 
         let layer = track_layer
             .iter()
             .find(|(id, _)| id == &clip.track_id)
-            .map(|(_, l)| *l)
+            .map(|(_, layer)| *layer)
             .unwrap_or(0);
-        // 与前端 StageSubtitleLayer 对齐：单字幕按 position 渲染，不做多轨错开
-        // bottom -> y=88%, center -> y=50%, top -> y=12%, custom -> (x%, y%)
-        // 多字幕轨时由用户设置不同 position 避免叠加（与前端逻辑一致）
-        let style_pos = style.map(|s| s.position.as_str()).unwrap_or("bottom");
+        // 与前端 StageSubtitleLayer 对齐：bottom -> 88%，center -> 50%，top -> 12%。
+        let style_pos = style
+            .map(|value| value.position.as_str())
+            .unwrap_or("bottom");
         let (pos_x, pos_y) = match style_pos {
             "top" => (width as f64 / 2.0, height as f64 * 0.12),
             "center" => (width as f64 / 2.0, height as f64 * 0.50),
             "custom" => {
-                let cx = style.map(|s| s.x).unwrap_or(50.0);
-                let cy = style.map(|s| s.y).unwrap_or(80.0);
-                (width as f64 * cx / 100.0, height as f64 * cy / 100.0)
+                let custom_x = style.map(|value| value.x).unwrap_or(50.0);
+                let custom_y = style.map(|value| value.y).unwrap_or(80.0);
+                (
+                    width as f64 * custom_x / 100.0,
+                    height as f64 * custom_y / 100.0,
+                )
             }
             _ => (width as f64 / 2.0, height as f64 * 0.88),
         };
-        // 缩放和旋转（对应前端 transform: scale + rotate）
-        let sx = style.map(|s| s.scale_x).unwrap_or(100.0);
-        let sy = style.map(|s| s.scale_y).unwrap_or(100.0);
-        let rot = style.map(|s| s.rotation).unwrap_or(0.0);
+        let scale_x = style.map(|value| value.scale_x).unwrap_or(100.0);
+        let scale_y = style.map(|value| value.scale_y).unwrap_or(100.0);
+        let rotation = style.map(|value| value.rotation).unwrap_or(0.0);
+
+        let mut fade_in_ms = 0;
+        let mut fade_out_ms = 0;
+        let mut position_tag = format!("\\pos({pos_x:.1},{pos_y:.1})");
+        let mut scale_tags = format!("\\fscx{scale_x:.0}\\fscy{scale_y:.0}");
+        let mut transform_tags = String::new();
+        let slide_distance = (height as f64 * 0.028).round();
+
+        match animation_in {
+            "fadeIn" => fade_in_ms = animation_duration_ms,
+            "slideUp" => {
+                fade_in_ms = animation_duration_ms;
+                position_tag = format!(
+                    "\\move({pos_x:.1},{start_y:.1},{pos_x:.1},{pos_y:.1},0,{animation_duration_ms})",
+                    start_y = pos_y + slide_distance,
+                );
+            }
+            "scaleIn" => {
+                fade_in_ms = animation_duration_ms;
+                scale_tags = format!(
+                    "\\fscx{start_x:.0}\\fscy{start_y:.0}",
+                    start_x = scale_x * 0.6,
+                    start_y = scale_y * 0.6
+                );
+                transform_tags.push_str(&format!(
+                    "\\t(0,{animation_duration_ms},\\fscx{scale_x:.0}\\fscy{scale_y:.0})"
+                ));
+            }
+            _ => {}
+        }
+
+        match animation_out {
+            "fadeOut" => fade_out_ms = animation_duration_ms,
+            "slideDown" => {
+                fade_out_ms = animation_duration_ms;
+                if animation_in != "slideUp" {
+                    position_tag = format!(
+                        "\\move({pos_x:.1},{pos_y:.1},{pos_x:.1},{end_y:.1},{outro_start_ms},{total_duration_ms})",
+                        end_y = pos_y + slide_distance,
+                    );
+                }
+            }
+            "scaleOut" => {
+                fade_out_ms = animation_duration_ms;
+                transform_tags.push_str(&format!(
+                    "\\t({outro_start_ms},{total_duration_ms},\\fscx{end_x:.0}\\fscy{end_y:.0})",
+                    end_x = scale_x * 0.5,
+                    end_y = scale_y * 0.5,
+                ));
+            }
+            _ => {}
+        }
+
+        let fade_tag = if fade_in_ms > 0 || fade_out_ms > 0 {
+            format!("{{\\fad({fade_in_ms},{fade_out_ms})}}")
+        } else {
+            String::new()
+        };
         let transform_tag =
-            format!("{{\\pos({pos_x:.1},{pos_y:.1})\\fscx{sx:.0}\\fscy{sy:.0}\\frz{rot:.0}}}",);
+            format!("{{{position_tag}{scale_tags}\\frz{rotation:.0}{transform_tags}}}");
         ass.push_str(&format!(
             "Dialogue: {layer},{start},{end},{style_name},,0,0,0,,{fade_tag}{transform_tag}{escaped}\n"
         ));
@@ -3280,6 +3372,48 @@ mod tests {
     fn ffconcat_entries_normalize_windows_separators() {
         let entry = super::ffconcat_file_entry(std::path::Path::new(r"C:\Media Files\clip.mp4"));
         assert_eq!(entry, "file 'C:/Media Files/clip.mp4'\n");
+    }
+
+    #[test]
+    fn ass_subtitles_emit_core_style_fields() {
+        let mut subtitle = clip("subtitle", "subtitle", 0.0, 2.0);
+        subtitle.source_id = None;
+        subtitle.text = Some("Styled subtitle".to_string());
+        let mut style = crate::models::SubtitleStyle::default();
+        style.font_size = 54;
+        style.stroke_width = 3.5;
+        style.shadow_color = "#123456".to_string();
+        style.shadow_blur = 6.0;
+        style.letter_spacing = 1.25;
+        style.animation_in = "scaleIn".to_string();
+        style.animation_out = "slideDown".to_string();
+        style.animation_duration = 0.5;
+        subtitle.subtitle_style = Some(style);
+
+        let mut project = project_for(Vec::new());
+        project.tracks = vec![track_kind("subtitle", TrackKind::Subtitle, false)];
+        project.clips = vec![subtitle];
+        let ass = generate_ass_subtitles(&[&project.clips[0]], &project, &[]);
+
+        assert!(ass.contains("Style: S1,Noto Sans SC,54,"));
+        assert!(
+            ass.contains("&H00563412"),
+            "shadow color should use ASS BGR order"
+        );
+        assert!(ass.contains(",100,100,1.25,0,1,3.50,2.00,5,"));
+        assert!(ass.contains("\\fscx60\\fscy60\\frz0\\t(0,500,\\fscx100\\fscy100)"));
+        assert!(ass.contains("\\move(960.0,950.4,960.0,980.4,1500,2000)"));
+
+        let mut boxed_style = crate::models::SubtitleStyle::default();
+        boxed_style.background_color = "#112233".to_string();
+        boxed_style.background_padding = 6.0;
+        project.clips[0].subtitle_style = Some(boxed_style);
+        let boxed = generate_ass_subtitles(&[&project.clips[0]], &project, &[]);
+        assert!(
+            boxed.contains("&H00332211"),
+            "background color should use ASS BGR order"
+        );
+        assert!(boxed.contains(",0.00,0,3,6.00,0.00,5,"));
     }
 
     use super::*;

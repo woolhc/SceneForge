@@ -3845,12 +3845,12 @@ textarea {
   to { opacity: 1; }
 }
 @keyframes subSlideUp {
-  from { opacity: 0; transform: translateY(20px); }
-  to { opacity: 1; transform: translateY(0); }
+  from { opacity: 0; transform: var(--sub-base-transform) translateY(20px); }
+  to { opacity: 1; transform: var(--sub-base-transform) translateY(0); }
 }
 @keyframes subScaleIn {
-  from { opacity: 0; transform: scale(0.6); }
-  to { opacity: 1; transform: scale(1); }
+  from { opacity: 0; transform: var(--sub-base-transform) scale(0.6); }
+  to { opacity: 1; transform: var(--sub-base-transform) scale(1); }
 }
 .anim-fadeIn { animation: subFadeIn var(--sub-anim-dur, 0.3s) ease-out; }
 .anim-slideUp { animation: subSlideUp var(--sub-anim-dur, 0.3s) ease-out; }
@@ -3863,12 +3863,12 @@ textarea {
   to { opacity: 0; }
 }
 @keyframes subSlideDown {
-  from { opacity: 1; transform: translate(-50%, -50%) translateY(0); }
-  to { opacity: 0; transform: translate(-50%, -50%) translateY(30px); }
+  from { opacity: 1; transform: var(--sub-base-transform) translateY(0); }
+  to { opacity: 0; transform: var(--sub-base-transform) translateY(30px); }
 }
 @keyframes subScaleOut {
-  from { opacity: 1; transform: translate(-50%, -50%) scale(1); }
-  to { opacity: 0; transform: translate(-50%, -50%) scale(0.5); }
+  from { opacity: 1; transform: var(--sub-base-transform) scale(1); }
+  to { opacity: 0; transform: var(--sub-base-transform) scale(0.5); }
 }
 .anim-fadeOut { animation: subFadeOut var(--sub-anim-dur, 0.3s) ease-out forwards; }
 .anim-slideDown { animation: subSlideDown var(--sub-anim-dur, 0.3s) ease-out forwards; }

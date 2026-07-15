@@ -296,6 +296,27 @@ pub struct SubtitleStyle {
     pub color: String,
     #[serde(default = "default_subtitle_stroke_color")]
     pub stroke_color: String,
+    /// 描边粗细（像素，0=无描边）
+    #[serde(default = "default_subtitle_stroke_width")]
+    pub stroke_width: f64,
+    /// 背景色（"none" 表示透明）。ASS 导出使用方形底板近似。
+    #[serde(default = "default_subtitle_background_color")]
+    pub background_color: String,
+    /// 背景内边距（像素）。
+    #[serde(default = "default_subtitle_background_padding")]
+    pub background_padding: f64,
+    /// 阴影颜色。
+    #[serde(default = "default_subtitle_shadow_color")]
+    pub shadow_color: String,
+    /// 阴影模糊（像素；ASS 导出使用偏移近似）。
+    #[serde(default)]
+    pub shadow_blur: f64,
+    /// 字间距（像素）。
+    #[serde(default)]
+    pub letter_spacing: f64,
+    /// 行高倍数。当前 ASS 导出保留数据并使用 libass 默认行距。
+    #[serde(default = "default_subtitle_line_height")]
+    pub line_height: f64,
     #[serde(default = "default_subtitle_position")]
     /// "bottom" | "center" | "top" | "custom"
     pub position: String,
@@ -343,6 +364,13 @@ impl Default for SubtitleStyle {
             font_size: default_subtitle_font_size(),
             color: default_subtitle_color(),
             stroke_color: default_subtitle_stroke_color(),
+            stroke_width: default_subtitle_stroke_width(),
+            background_color: default_subtitle_background_color(),
+            background_padding: default_subtitle_background_padding(),
+            shadow_color: default_subtitle_shadow_color(),
+            shadow_blur: 0.0,
+            letter_spacing: 0.0,
+            line_height: default_subtitle_line_height(),
             position: default_subtitle_position(),
             font_family: default_subtitle_font_family(),
             x: default_subtitle_y(),
@@ -367,6 +395,21 @@ fn default_subtitle_color() -> String {
 }
 fn default_subtitle_stroke_color() -> String {
     "#000000".to_string()
+}
+fn default_subtitle_stroke_width() -> f64 {
+    2.0
+}
+fn default_subtitle_background_color() -> String {
+    "none".to_string()
+}
+fn default_subtitle_background_padding() -> f64 {
+    4.0
+}
+fn default_subtitle_shadow_color() -> String {
+    "#000000".to_string()
+}
+fn default_subtitle_line_height() -> f64 {
+    1.2
 }
 fn default_subtitle_position() -> String {
     "bottom".to_string()

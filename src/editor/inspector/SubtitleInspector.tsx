@@ -1,6 +1,7 @@
 import type { Clip, SubtitleStyle } from "../../types";
 import { DEFAULT_SUBTITLE_STYLE } from "../../types";
 import { FONT_OPTIONS } from "../../fonts";
+import { subtitleExportWarnings } from "../subtitles/styleContract";
 
 type SubtitlePosition = "bottom" | "center" | "top" | "custom";
 
@@ -35,6 +36,7 @@ export function SubtitleInspector({
   const onStyleChange = (patch: Partial<SubtitleStyle>, commit = true) => {
     onClipChange({ subtitleStyle: { ...style, ...patch } }, commit);
   };
+  const exportWarnings = subtitleExportWarnings(style);
 
   return (
     <>
@@ -52,6 +54,9 @@ export function SubtitleInspector({
         <label className="style-field subtitle-checkbox-field"><input type="checkbox" checked={(style.karaoke ?? true) && !!clip.words?.length} disabled={!clip.words?.length} onChange={(event) => onStyleChange({ karaoke: event.target.checked })} /><span>逐字高亮{clip.words?.length ? "" : "（需先识别字幕）"}</span></label>
         {(style.karaoke ?? true) && clip.words?.length ? <label className="style-field">高亮色<input type="color" value={style.highlightColor || "#FFD700"} onChange={(event) => onStyleChange({ highlightColor: event.target.value })} /></label> : null}
         {animationControls(style, onStyleChange, onCommit)}
+        {exportWarnings.length > 0 ? (
+          <p className="style-hint">导出提示：{exportWarnings.join(" ")}</p>
+        ) : null}
         <button className="panel-secondary-action" onClick={onApplyTrackStyle}>应用到整条轨</button>
       </div>
       <div className="subtitle-style-editor inspector-category inspector-category-animation">

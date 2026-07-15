@@ -1,7 +1,7 @@
 import Moveable from "react-moveable";
 import { useEffect, useRef, useState } from "react";
 import type { Clip, SubtitleStyle, WordCue } from "../types";
-import { DEFAULT_SUBTITLE_STYLE } from "../types";
+import { normalizeSubtitleStyle, resolveSubtitleAnchor } from "../editor/subtitles/styleContract";
 import { usePlaybackStore } from "../store/playbackStore";
 import { quantizeSubtitleClock, subtitleNeedsLiveClock } from "./subtitleClock";
 
@@ -51,7 +51,8 @@ export function SubtitleOverlay({
   // 记录拖动开始时的 scale（用于计算增量）
   const startScaleXRef = useRef(100);
   const startScaleYRef = useRef(100);
-  const style: SubtitleStyle = { ...DEFAULT_SUBTITLE_STYLE, ...(clip.subtitleStyle ?? {}) };
+  const style: SubtitleStyle = normalizeSubtitleStyle(clip.subtitleStyle);
+  const anchor = resolveSubtitleAnchor(style);
   const scaleX = (style.scaleX ?? 100) / 100;
   const scaleY = (style.scaleY ?? 100) / 100;
   const rotation = style.rotation ?? 0;
@@ -141,12 +142,11 @@ export function SubtitleOverlay({
         className={`subtitle-overlay-text ${animClass}`}
         style={{
           position: "absolute",
-          left: `${style.position === "custom" ? (style.x ?? 50) : 50}%`,
-          top: `${style.position === "custom"
-            ? (style.y ?? 80)
-            : style.position === "top" ? 20 : style.position === "center" ? 50 : 80}%`,
+          left: `${anchor.x}%`,
+          top: `${anchor.y}%`,
           transform: `translate(-50%, -50%) rotate(${rotation}deg) scale(${scaleX}, ${scaleY})`,
           transformOrigin: "center center",
+          ["--sub-base-transform" as string]: `translate(-50%, -50%) rotate(${rotation}deg) scale(${scaleX}, ${scaleY})`,
           // T4.8: 动画时长 CSS 变量
           ["--sub-anim-dur" as string]: `${style.animationDuration ?? 0.3}s`,
           fontFamily: style.fontFamily,
