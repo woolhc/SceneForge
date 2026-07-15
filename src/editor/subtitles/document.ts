@@ -1,4 +1,5 @@
 import type { Clip, Project, SubtitleStyle, Track } from "../../types";
+import type { SubtitleQualityIssueType } from "./types";
 import { normalizeSubtitleStyle } from "./styleContract";
 
 export type SubtitleCueDocument = {
@@ -340,4 +341,52 @@ export function mergeSubtitleCueWithNext(
       .filter((candidate) => candidate.id !== next.id)
       .map((candidate) => (candidate.id === clip.id ? merged : candidate)),
   };
+}
+
+function joinTextFragments(fragments: string[]) {
+  return fragments.reduce((text, fragment) => {
+    if (!text) return fragment;
+    const needsSpace =
+      /[A-Za-z0-9]$/.test(text) && /^[A-Za-z0-9]/.test(fragment);
+    return `${text}${needsSpace ? " " : ""}${fragment}`;
+  }, "");
+}
+
+/** Applies deterministic, non-destructive fixes for the quality issues that have a safe local remedy. */
+export function applySubtitleCueQuickFix(
+  project: Project,
+  cueId: string,
+  issueType: SubtitleQualityIssueType,
+): Project | null {
+  const target = subtitleOperationAllowed(project, cueId);
+  if (!target) return null;
+  const { clip } = target;
+  const style = normalizeSubtitleStyle(clip.subtitleStyle);
+
+  switch (issueType) {
+    case "unsafe_region":
+      return applySubtitleCuePatch(project, cueId, {
+        style: { ...style, position: "custom", x: 50, y: 70 },
+      });
+    case "too_wide":
+      return applySubtitleCuePatch(project, cueId, {
+        style: {
+          ...style,
+          fontSize: Math.max(16, Math.floor(style.fontSize * 0.9)),
+        },
+      });
+    case "too_many_lines":
+    case "orphan_line": {
+      const compact = joinTextFragments(
+        clip.text
+          ?.split(/\n+/)
+          .map((line) => line.trim())
+          .filter(Boolean) ?? [],
+      );
+      if (!compact || compact === clip.text) return null;
+      return applySubtitleCuePatch(project, cueId, { text: compact });
+    }
+    default:
+      return null;
+  }
 }

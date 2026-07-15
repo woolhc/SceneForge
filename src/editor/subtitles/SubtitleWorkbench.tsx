@@ -27,6 +27,7 @@ function SubtitleCueRow({
   onSplit,
   onMerge,
   issues,
+  onFixIssue,
   onPatch,
 }: {
   cue: SubtitleCueDocument;
@@ -37,6 +38,7 @@ function SubtitleCueRow({
   onSplit: () => void;
   onMerge: () => void;
   issues: SubtitleCueQualityIssue[];
+  onFixIssue: (issue: SubtitleCueQualityIssue) => void;
   onPatch: (patch: SubtitleCuePatch) => void;
 }) {
   const [text, setText] = useState(cue.text);
@@ -177,6 +179,7 @@ export function SubtitleWorkbench({
   canMergeCue,
   onSplitCue,
   onMergeCue,
+  onFixIssue,
 }: {
   project: Project | null;
   selectedCueId: string | null;
@@ -186,6 +189,7 @@ export function SubtitleWorkbench({
   canMergeCue: (cueId: string) => boolean;
   onSplitCue: (cueId: string) => void;
   onMergeCue: (cueId: string) => void;
+  onFixIssue: (cueId: string, issue: SubtitleCueQualityIssue) => void;
 }) {
   const [query, setQuery] = useState("");
   const [onlyIssues, setOnlyIssues] = useState(false);
@@ -261,6 +265,7 @@ export function SubtitleWorkbench({
               onSplit={() => onSplitCue(cue.id)}
               onMerge={() => onMergeCue(cue.id)}
               issues={issuesByCue.get(cue.id) ?? []}
+              onFixIssue={(issue) => onFixIssue(cue.id, issue)}
               onPatch={(patch) => onPatchCue(cue.id, patch)}
             />
           ))}

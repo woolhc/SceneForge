@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   applySubtitleCuePatch,
+  applySubtitleCueQuickFix,
   canMergeSubtitleCueWithNext,
   canSplitSubtitleCue,
   mergeSubtitleCueWithNext,
@@ -245,3 +246,45 @@ const grouped = {
 assert.equal(canSplitSubtitleCue(grouped, "split-1", 1.55), false);
 assert.equal(splitSubtitleCueAtTime(grouped, "split-1", 1.55), null);
 assert.equal(canMergeSubtitleCueWithNext(grouped, "split-1"), false);
+
+const qualityProject = {
+  ...splitProject,
+  ratio: "9:16",
+  clips: [
+    {
+      ...splitProject.clips[0],
+      id: "quality-fix",
+      text: "第一行\n短",
+      startOnTrack: 0,
+      duration: 1,
+      subtitleStyle: { position: "bottom", fontSize: 48 },
+      words: null,
+    },
+  ],
+};
+const movedSafe = applySubtitleCueQuickFix(
+  qualityProject,
+  "quality-fix",
+  "unsafe_region",
+)!;
+assert.equal(movedSafe.clips[0].subtitleStyle?.y, 70);
+const narrowed = applySubtitleCueQuickFix(
+  qualityProject,
+  "quality-fix",
+  "too_wide",
+)!;
+assert.equal(narrowed.clips[0].subtitleStyle?.fontSize, 43);
+const joined = applySubtitleCueQuickFix(
+  qualityProject,
+  "quality-fix",
+  "orphan_line",
+)!;
+assert.equal(joined.clips[0].text, "第一行短");
+assert.equal(
+  applySubtitleCueQuickFix(
+    qualityProject,
+    "quality-fix",
+    "reading_speed_too_fast",
+  ),
+  null,
+);

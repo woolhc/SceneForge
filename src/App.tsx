@@ -87,6 +87,7 @@ import { saveSubtitleArtifact } from "./editor/subtitles/artifacts";
 import { subtitleLayoutProfile } from "./editor/subtitles/profiles";
 import {
   applySubtitleCuePatch,
+  applySubtitleCueQuickFix,
   canMergeSubtitleCueWithNext,
   canSplitSubtitleCue,
   mergeSubtitleCueWithNext,
@@ -2360,6 +2361,17 @@ export function App() {
     void persist(next, "已更新字幕");
   }
 
+  function handleSubtitleWorkbenchQuickFix(cueId: string, issueType: import("./editor/subtitles/types").SubtitleQualityIssueType) {
+    if (!project) return;
+    const next = applySubtitleCueQuickFix(project, cueId, issueType);
+    if (!next) {
+      setStatus("该问题暂时需要通过拆分、合并或人工校对处理");
+      return;
+    }
+    void persist(next, "已修复字幕质量问题");
+    handleSubtitleWorkbenchSelect(cueId);
+  }
+
   function handleSubtitleWorkbenchSplit(cueId: string) {
     if (!project) return;
     const playhead = usePlaybackStore.getState().currentTime;
@@ -3091,6 +3103,7 @@ export function App() {
                   canMergeCue={(cueId) => project ? canMergeSubtitleCueWithNext(project, cueId) : false}
                   onSplitCue={handleSubtitleWorkbenchSplit}
                   onMergeCue={handleSubtitleWorkbenchMerge}
+                  onFixIssue={(cueId, issue) => handleSubtitleWorkbenchQuickFix(cueId, issue.type)}
                 />
               </>
             )}
