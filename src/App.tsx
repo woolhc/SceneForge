@@ -85,7 +85,14 @@ import { buildTranscriptSubtitleProject, prepareTranscriptSubtitles } from "./ed
 import { requestSubtitleSemanticAdvice } from "./editor/subtitles/semanticAdvice";
 import { saveSubtitleArtifact } from "./editor/subtitles/artifacts";
 import { subtitleLayoutProfile } from "./editor/subtitles/profiles";
-import { applySubtitleCuePatch, type SubtitleCuePatch } from "./editor/subtitles/document";
+import {
+  applySubtitleCuePatch,
+  canMergeSubtitleCueWithNext,
+  canSplitSubtitleCue,
+  mergeSubtitleCueWithNext,
+  splitSubtitleCueAtTime,
+  type SubtitleCuePatch,
+} from "./editor/subtitles/document";
 import { normalizeSubtitleStyle, resolveSubtitleAnchor } from "./editor/subtitles/styleContract";
 import {
   buildGenerationReport,
@@ -2353,6 +2360,29 @@ export function App() {
     void persist(next, "已更新字幕");
   }
 
+  function handleSubtitleWorkbenchSplit(cueId: string) {
+    if (!project) return;
+    const playhead = usePlaybackStore.getState().currentTime;
+    const next = splitSubtitleCueAtTime(project, cueId, playhead);
+    if (!next) {
+      setStatus("无法拆分：请选择有词级时间戳的单语字幕，并将播放头放在字幕中间");
+      return;
+    }
+    void persist(next, "已拆分字幕");
+    handleSubtitleWorkbenchSelect(cueId);
+  }
+
+  function handleSubtitleWorkbenchMerge(cueId: string) {
+    if (!project) return;
+    const next = mergeSubtitleCueWithNext(project, cueId);
+    if (!next) {
+      setStatus("无法合并：需要同一未锁定字幕轨上的下一条单语字幕");
+      return;
+    }
+    void persist(next, "已合并字幕");
+    handleSubtitleWorkbenchSelect(cueId);
+  }
+
   function updateSelectedClip(patch: Partial<Clip>, commit: boolean = true) {
     if (!project || !selectedClip) return;
     // 交互式编辑开始（首次非 commit 调用）→ 记录操作前快照
@@ -3057,6 +3087,10 @@ export function App() {
                   selectedCueId={selectedClipTrack?.kind === "subtitle" ? selectedClip?.id ?? null : null}
                   onSelectCue={handleSubtitleWorkbenchSelect}
                   onPatchCue={handleSubtitleWorkbenchPatch}
+                  canSplitCue={(cueId) => project ? canSplitSubtitleCue(project, cueId, usePlaybackStore.getState().currentTime) : false}
+                  canMergeCue={(cueId) => project ? canMergeSubtitleCueWithNext(project, cueId) : false}
+                  onSplitCue={handleSubtitleWorkbenchSplit}
+                  onMergeCue={handleSubtitleWorkbenchMerge}
                 />
               </>
             )}

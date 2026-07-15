@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import {
   applySubtitleCuePatch,
+  canMergeSubtitleCueWithNext,
+  canSplitSubtitleCue,
+  mergeSubtitleCueWithNext,
+  splitSubtitleCueAtTime,
   subtitleDocumentFromProject,
 } from "../../src/editor/subtitles/document";
 import type { Project } from "../../src/types";
@@ -166,3 +170,78 @@ assert.equal(
   project,
   "non-subtitle clips must reject workbench edits",
 );
+
+const splitProject = {
+  ...project,
+  tracks: [
+    {
+      id: "subtitle",
+      kind: "subtitle",
+      name: "字幕",
+      order: 0,
+      muted: false,
+      locked: false,
+    },
+  ],
+  clips: [
+    {
+      ...project.clips[1],
+      id: "split-1",
+      trackId: "subtitle",
+      startOnTrack: 1,
+      duration: 2,
+      sourceOut: 2,
+      text: "Hello world again",
+      words: [
+        { text: "Hello", start: 1, end: 1.4 },
+        { text: "world", start: 1.5, end: 1.9 },
+        { text: "again", start: 2, end: 2.5 },
+      ],
+      subtitleGroupId: null,
+    },
+    {
+      ...project.clips[1],
+      id: "split-2",
+      trackId: "subtitle",
+      startOnTrack: 3.1,
+      duration: 0.8,
+      sourceOut: 0.8,
+      text: "Final cue",
+      words: [
+        { text: "Final", start: 3.1, end: 3.4 },
+        { text: "cue", start: 3.45, end: 3.9 },
+      ],
+      subtitleGroupId: null,
+    },
+  ],
+} as Project;
+assert.equal(canSplitSubtitleCue(splitProject, "split-1", 1.55), true);
+const split = splitSubtitleCueAtTime(splitProject, "split-1", 1.55)!;
+const splitCues = split.clips.filter((clip) => clip.trackId === "subtitle");
+assert.equal(splitCues.length, 3);
+assert.equal(splitCues[0].text, "Hello");
+assert.equal(splitCues[1].text, "world again");
+assert.equal(
+  splitCues[0].startOnTrack + splitCues[0].duration,
+  splitCues[1].startOnTrack,
+);
+assert.equal(splitCues[0].words?.length, 1);
+assert.equal(splitCues[1].words?.length, 2);
+
+assert.equal(canMergeSubtitleCueWithNext(splitProject, "split-1"), true);
+const merged = mergeSubtitleCueWithNext(splitProject, "split-1")!;
+const mergedCue = merged.clips.find((clip) => clip.id === "split-1")!;
+assert.equal(mergedCue.text, "Hello world again Final cue");
+assert.ok(Math.abs(mergedCue.duration - 2.9) < 1e-9);
+assert.equal(mergedCue.words?.length, 5);
+
+const grouped = {
+  ...splitProject,
+  clips: splitProject.clips.map((clip) => ({
+    ...clip,
+    subtitleGroupId: "pair",
+  })),
+};
+assert.equal(canSplitSubtitleCue(grouped, "split-1", 1.55), false);
+assert.equal(splitSubtitleCueAtTime(grouped, "split-1", 1.55), null);
+assert.equal(canMergeSubtitleCueWithNext(grouped, "split-1"), false);

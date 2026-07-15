@@ -153,3 +153,191 @@ export function applySubtitleCuePatch(
     ),
   };
 }
+
+function joinWords(words: NonNullable<Clip["words"]>) {
+  return words.reduce((text, word, index) => {
+    if (index === 0) return word.text;
+    const previous = words[index - 1];
+    const needsSpace =
+      /[A-Za-z0-9]$/.test(previous.text) && /^[A-Za-z0-9]/.test(word.text);
+    return `${text}${needsSpace ? " " : ""}${word.text}`;
+  }, "");
+}
+
+function subtitleOperationAllowed(project: Project, cueId: string) {
+  const clip = project.clips.find((candidate) => candidate.id === cueId);
+  const track = clip
+    ? project.tracks.find((candidate) => candidate.id === clip.trackId)
+    : undefined;
+  if (
+    !clip ||
+    !track ||
+    track.kind !== "subtitle" ||
+    track.locked ||
+    clip.subtitleGroupId
+  )
+    return null;
+  return { clip, track };
+}
+
+/** Returns the closest safe word boundary in the cue, or null when the cue cannot be split. */
+export function subtitleCueSplitTime(
+  clip: Clip,
+  playheadTime: number,
+): number | null {
+  const words = clip.words ?? [];
+  if (words.length < 2) return null;
+  const start = clip.startOnTrack;
+  const end = clip.startOnTrack + clip.duration;
+  const candidates = words
+    .slice(1)
+    .map((word, index) => {
+      const previous = words[index];
+      const boundary = Math.max(previous.end, Math.min(word.start, end));
+      return boundary;
+    })
+    .filter((boundary) => boundary >= start + 0.2 && boundary <= end - 0.2);
+  if (candidates.length === 0) return null;
+  return candidates.reduce((best, candidate) =>
+    Math.abs(candidate - playheadTime) < Math.abs(best - playheadTime)
+      ? candidate
+      : best,
+  );
+}
+
+export function canSplitSubtitleCue(
+  project: Project,
+  cueId: string,
+  playheadTime: number,
+) {
+  const target = subtitleOperationAllowed(project, cueId);
+  return Boolean(
+    target && subtitleCueSplitTime(target.clip, playheadTime) !== null,
+  );
+}
+
+/**
+ * Splits an ungrouped, word-timed subtitle at the closest word boundary.
+ * Bilingual groups deliberately stay disabled until paired translation splitting
+ * can preserve source/target text fidelity together.
+ */
+export function splitSubtitleCueAtTime(
+  project: Project,
+  cueId: string,
+  playheadTime: number,
+): Project | null {
+  const target = subtitleOperationAllowed(project, cueId);
+  if (!target) return null;
+  const { clip } = target;
+  const words = clip.words ?? [];
+  const splitTime = subtitleCueSplitTime(clip, playheadTime);
+  if (splitTime === null) return null;
+  const rightIndex = words.findIndex(
+    (word) => word.start >= splitTime - 0.0001,
+  );
+  if (rightIndex <= 0 || rightIndex >= words.length) return null;
+
+  const leftWords = words.slice(0, rightIndex);
+  const rightWords = words.slice(rightIndex);
+  const end = clip.startOnTrack + clip.duration;
+  const left: Clip = {
+    ...clip,
+    duration: splitTime - clip.startOnTrack,
+    sourceOut: splitTime - clip.startOnTrack,
+    text: joinWords(leftWords),
+    words: leftWords,
+  };
+  const rightDuration = end - splitTime;
+  const right: Clip = {
+    ...clip,
+    id: `subtitle_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+    startOnTrack: splitTime,
+    duration: rightDuration,
+    sourceIn: 0,
+    sourceOut: rightDuration,
+    text: joinWords(rightWords),
+    words: rightWords,
+  };
+
+  const clips: Clip[] = [];
+  for (const candidate of project.clips) {
+    if (candidate.id === clip.id) {
+      clips.push(left, right);
+    } else {
+      clips.push(candidate);
+    }
+  }
+  return { ...project, clips };
+}
+
+function nextSubtitleCue(project: Project, clip: Clip) {
+  return project.clips
+    .filter(
+      (candidate) =>
+        candidate.trackId === clip.trackId && candidate.id !== clip.id,
+    )
+    .filter(
+      (candidate) =>
+        candidate.startOnTrack >= clip.startOnTrack + clip.duration - 0.0001,
+    )
+    .sort(
+      (a, b) => a.startOnTrack - b.startOnTrack || a.id.localeCompare(b.id),
+    )[0];
+}
+
+export function canMergeSubtitleCueWithNext(project: Project, cueId: string) {
+  const target = subtitleOperationAllowed(project, cueId);
+  if (!target) return false;
+  const next = nextSubtitleCue(project, target.clip);
+  const nextTrack = next
+    ? project.tracks.find((track) => track.id === next.trackId)
+    : undefined;
+  return Boolean(
+    next &&
+    nextTrack?.kind === "subtitle" &&
+    !nextTrack.locked &&
+    !next.subtitleGroupId,
+  );
+}
+
+/** Merges an ungrouped subtitle cue with the next cue on the same unlocked track. */
+export function mergeSubtitleCueWithNext(
+  project: Project,
+  cueId: string,
+): Project | null {
+  const target = subtitleOperationAllowed(project, cueId);
+  if (!target) return null;
+  const { clip } = target;
+  const next = nextSubtitleCue(project, clip);
+  const nextTrack = next
+    ? project.tracks.find((track) => track.id === next.trackId)
+    : undefined;
+  if (
+    !next ||
+    nextTrack?.kind !== "subtitle" ||
+    nextTrack.locked ||
+    next.subtitleGroupId
+  )
+    return null;
+
+  const mergedWords = [...(clip.words ?? []), ...(next.words ?? [])];
+  const mergedEnd = Math.max(
+    clip.startOnTrack + clip.duration,
+    next.startOnTrack + next.duration,
+  );
+  const merged: Clip = {
+    ...clip,
+    duration: mergedEnd - clip.startOnTrack,
+    sourceOut: mergedEnd - clip.startOnTrack,
+    text: mergedWords.length
+      ? joinWords(mergedWords)
+      : `${clip.text ?? ""}${clip.text && next.text ? " " : ""}${next.text ?? ""}`,
+    words: mergedWords.length ? mergedWords : null,
+  };
+  return {
+    ...project,
+    clips: project.clips
+      .filter((candidate) => candidate.id !== next.id)
+      .map((candidate) => (candidate.id === clip.id ? merged : candidate)),
+  };
+}

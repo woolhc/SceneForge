@@ -1,4 +1,4 @@
-import { Search } from "lucide-react";
+import { Merge, Scissors, Search } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import type { Project } from "../../types";
 import {
@@ -18,11 +18,19 @@ function SubtitleCueRow({
   cue,
   selected,
   onSelect,
+  canSplit,
+  canMerge,
+  onSplit,
+  onMerge,
   onPatch,
 }: {
   cue: SubtitleCueDocument;
   selected: boolean;
   onSelect: () => void;
+  canSplit: boolean;
+  canMerge: boolean;
+  onSplit: () => void;
+  onMerge: () => void;
   onPatch: (patch: SubtitleCuePatch) => void;
 }) {
   const [text, setText] = useState(cue.text);
@@ -105,10 +113,34 @@ function SubtitleCueRow({
           }
         }}
       />
-      <span className="subtitle-workbench-meta">
-        {cue.words.length ? `${cue.words.length} 词` : "无词级时间"}
-        {cue.groupId ? " · 双语组" : ""}
-      </span>
+      <div className="subtitle-workbench-meta">
+        <span>
+          {cue.words.length ? `${cue.words.length} 词` : "无词级时间"}
+          {cue.groupId ? " · 双语组" : ""}
+        </span>
+        <div className="subtitle-workbench-actions">
+          <button
+            disabled={!canSplit}
+            onClick={onSplit}
+            title={
+              cue.groupId
+                ? "双语组拆分将在后续支持"
+                : "按播放头附近的词边界拆分"
+            }
+          >
+            <Scissors size={12} />
+            拆分
+          </button>
+          <button
+            disabled={!canMerge}
+            onClick={onMerge}
+            title={cue.groupId ? "双语组合并将在后续支持" : "与下一条字幕合并"}
+          >
+            <Merge size={12} />
+            合并
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -122,11 +154,19 @@ export function SubtitleWorkbench({
   selectedCueId,
   onSelectCue,
   onPatchCue,
+  canSplitCue,
+  canMergeCue,
+  onSplitCue,
+  onMergeCue,
 }: {
   project: Project | null;
   selectedCueId: string | null;
   onSelectCue: (cueId: string) => void;
   onPatchCue: (cueId: string, patch: SubtitleCuePatch) => void;
+  canSplitCue: (cueId: string) => boolean;
+  canMergeCue: (cueId: string) => boolean;
+  onSplitCue: (cueId: string) => void;
+  onMergeCue: (cueId: string) => void;
 }) {
   const [query, setQuery] = useState("");
   const document = useMemo(
@@ -177,6 +217,10 @@ export function SubtitleWorkbench({
               cue={cue}
               selected={cue.id === selectedCueId}
               onSelect={() => onSelectCue(cue.id)}
+              canSplit={canSplitCue(cue.id)}
+              canMerge={canMergeCue(cue.id)}
+              onSplit={() => onSplitCue(cue.id)}
+              onMerge={() => onMergeCue(cue.id)}
               onPatch={(patch) => onPatchCue(cue.id, patch)}
             />
           ))}
