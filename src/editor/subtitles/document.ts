@@ -217,11 +217,127 @@ export function canSplitSubtitleCue(
   );
 }
 
-/**
- * Splits an ungrouped, word-timed subtitle at the closest word boundary.
- * Bilingual groups deliberately stay disabled until paired translation splitting
- * can preserve source/target text fidelity together.
- */
+function splitTextAtRatio(
+  text: string,
+  ratio: number,
+): [string, string] | null {
+  const characters = [...text];
+  if (characters.length < 2) return null;
+  const target = Math.max(
+    1,
+    Math.min(characters.length - 1, Math.round(characters.length * ratio)),
+  );
+  const candidates = Array.from(
+    { length: characters.length - 1 },
+    (_, index) => index + 1,
+  );
+  const punctuation = new Set([
+    "，",
+    "。",
+    "！",
+    "？",
+    ",",
+    ".",
+    "!",
+    "?",
+    " ",
+  ]);
+  const index = candidates.reduce((best, candidate) => {
+    const candidateScore =
+      Math.abs(candidate - target) -
+      (punctuation.has(characters[candidate - 1]) ? 0.75 : 0);
+    const bestScore =
+      Math.abs(best - target) -
+      (punctuation.has(characters[best - 1]) ? 0.75 : 0);
+    return candidateScore < bestScore ? candidate : best;
+  }, target);
+  const left = characters.slice(0, index).join("").trim();
+  const right = characters.slice(index).join("").trim();
+  return left && right ? [left, right] : null;
+}
+
+function splitSubtitleClipAtTime(
+  clip: Clip,
+  splitTime: number,
+  rightGroupId?: string,
+): [Clip, Clip] | null {
+  const end = clip.startOnTrack + clip.duration;
+  if (splitTime < clip.startOnTrack + 0.2 || splitTime > end - 0.2) return null;
+  const words = clip.words ?? [];
+  const rightIndex = words.findIndex(
+    (word) => word.start >= splitTime - 0.0001,
+  );
+  const leftWords = rightIndex > 0 ? words.slice(0, rightIndex) : [];
+  const rightWords = rightIndex > 0 ? words.slice(rightIndex) : [];
+  const textParts =
+    leftWords.length && rightWords.length
+      ? ([joinWords(leftWords), joinWords(rightWords)] as [string, string])
+      : splitTextAtRatio(
+          clip.text ?? "",
+          (splitTime - clip.startOnTrack) / clip.duration,
+        );
+  if (!textParts) return null;
+
+  const leftDuration = splitTime - clip.startOnTrack;
+  const rightDuration = end - splitTime;
+  const left: Clip = {
+    ...clip,
+    duration: leftDuration,
+    sourceOut: leftDuration,
+    text: textParts[0],
+    words: leftWords.length ? leftWords : null,
+  };
+  const right: Clip = {
+    ...clip,
+    id: `subtitle_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+    startOnTrack: splitTime,
+    duration: rightDuration,
+    sourceIn: 0,
+    sourceOut: rightDuration,
+    text: textParts[1],
+    words: rightWords.length ? rightWords : null,
+    subtitleGroupId: rightGroupId ?? clip.subtitleGroupId,
+  };
+  return [left, right];
+}
+
+function splitSubtitleGroupAtTime(
+  project: Project,
+  groupId: string,
+  playheadTime: number,
+): Project | null {
+  const group = project.clips.filter(
+    (clip) => clip.subtitleGroupId === groupId,
+  );
+  const source = group.find((clip) => (clip.words?.length ?? 0) >= 2);
+  const sourceTrack = source
+    ? project.tracks.find((track) => track.id === source.trackId)
+    : undefined;
+  if (!source || !sourceTrack || sourceTrack.locked || group.length < 2)
+    return null;
+  const splitTime = subtitleCueSplitTime(source, playheadTime);
+  if (splitTime === null) return null;
+  const rightGroupId = `${groupId}_split_${Date.now().toString(16)}`;
+  const splitById = new Map<string, [Clip, Clip]>();
+  for (const clip of group) {
+    const track = project.tracks.find(
+      (candidate) => candidate.id === clip.trackId,
+    );
+    if (!track || track.locked) return null;
+    const split = splitSubtitleClipAtTime(clip, splitTime, rightGroupId);
+    if (!split) return null;
+    splitById.set(clip.id, split);
+  }
+  const clips: Clip[] = [];
+  for (const clip of project.clips) {
+    const split = splitById.get(clip.id);
+    if (split) clips.push(...split);
+    else clips.push(clip);
+  }
+  return { ...project, clips };
+}
+
+/** Splits a word-timed single subtitle or a paired bilingual group at one shared boundary. */
 export function splitSubtitleCueAtTime(
   project: Project,
   cueId: string,
@@ -288,7 +404,7 @@ function nextSubtitleCue(project: Project, clip: Clip) {
 
 export function canMergeSubtitleCueWithNext(project: Project, cueId: string) {
   const target = subtitleOperationAllowed(project, cueId);
-  if (!target) return false;
+  if (!target || target.clip.subtitleGroupId) return false;
   const next = nextSubtitleCue(project, target.clip);
   const nextTrack = next
     ? project.tracks.find((track) => track.id === next.trackId)
@@ -307,7 +423,7 @@ export function mergeSubtitleCueWithNext(
   cueId: string,
 ): Project | null {
   const target = subtitleOperationAllowed(project, cueId);
-  if (!target) return null;
+  if (!target || target.clip.subtitleGroupId) return null;
   const { clip } = target;
   const next = nextSubtitleCue(project, clip);
   const nextTrack = next

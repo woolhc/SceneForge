@@ -2377,7 +2377,7 @@ export function App() {
     const playhead = usePlaybackStore.getState().currentTime;
     const next = splitSubtitleCueAtTime(project, cueId, playhead);
     if (!next) {
-      setStatus("无法拆分：请选择有词级时间戳的单语字幕，并将播放头放在字幕中间");
+      setStatus("无法拆分：需要带词级时间戳的字幕，并将播放头放在字幕中间");
       return;
     }
     void persist(next, "已拆分字幕");

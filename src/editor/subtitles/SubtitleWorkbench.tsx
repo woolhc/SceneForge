@@ -133,7 +133,7 @@ function SubtitleCueRow({
             onClick={onSplit}
             title={
               cue.groupId
-                ? "双语组拆分将在后续支持"
+                ? "按原文词级时间同步拆分双语组"
                 : "按播放头附近的词边界拆分"
             }
           >
