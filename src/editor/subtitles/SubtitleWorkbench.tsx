@@ -6,6 +6,10 @@ import {
   type SubtitleCueDocument,
   type SubtitleCuePatch,
 } from "./document";
+import {
+  inspectProjectSubtitleQuality,
+  type SubtitleCueQualityIssue,
+} from "./quality";
 
 function formatTime(seconds: number) {
   const safe = Math.max(0, seconds);
@@ -22,6 +26,7 @@ function SubtitleCueRow({
   canMerge,
   onSplit,
   onMerge,
+  issues,
   onPatch,
 }: {
   cue: SubtitleCueDocument;
@@ -31,6 +36,7 @@ function SubtitleCueRow({
   canMerge: boolean;
   onSplit: () => void;
   onMerge: () => void;
+  issues: SubtitleCueQualityIssue[];
   onPatch: (patch: SubtitleCuePatch) => void;
 }) {
   const [text, setText] = useState(cue.text);
@@ -117,6 +123,7 @@ function SubtitleCueRow({
         <span>
           {cue.words.length ? `${cue.words.length} 词` : "无词级时间"}
           {cue.groupId ? " · 双语组" : ""}
+          {issues.length ? ` · ${issues.length} 个问题` : ""}
         </span>
         <div className="subtitle-workbench-actions">
           <button
@@ -141,6 +148,18 @@ function SubtitleCueRow({
           </button>
         </div>
       </div>
+      {issues.length ? (
+        <div className="subtitle-workbench-issues">
+          {issues.map((issue) => (
+            <span
+              key={`${issue.type}:${issue.message}`}
+              className={issue.severity}
+            >
+              {issue.message}
+            </span>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -169,13 +188,25 @@ export function SubtitleWorkbench({
   onMergeCue: (cueId: string) => void;
 }) {
   const [query, setQuery] = useState("");
+  const [onlyIssues, setOnlyIssues] = useState(false);
   const document = useMemo(
     () => (project ? subtitleDocumentFromProject(project) : null),
     [project],
   );
+  const issues = useMemo(
+    () => (project ? inspectProjectSubtitleQuality(project) : []),
+    [project],
+  );
+  const issuesByCue = useMemo(() => {
+    const map = new Map<string, SubtitleCueQualityIssue[]>();
+    for (const issue of issues)
+      map.set(issue.cueId, [...(map.get(issue.cueId) ?? []), issue]);
+    return map;
+  }, [issues]);
   const normalizedQuery = query.trim().toLocaleLowerCase();
   const visibleCues =
     document?.cues.filter((cue) => {
+      if (onlyIssues && !issuesByCue.get(cue.id)?.length) return false;
       if (!normalizedQuery) return true;
       return `${cue.text} ${cue.trackName} ${cue.language ?? ""}`
         .toLocaleLowerCase()
@@ -193,14 +224,22 @@ export function SubtitleWorkbench({
         点击时间码定位时间线；文本和时间在失焦或按 Cmd/Ctrl + Enter
         后保存。锁定轨道只读。
       </p>
-      <label className="subtitle-workbench-search">
-        <Search size={14} />
-        <input
-          value={query}
-          onChange={(event) => setQuery(event.target.value)}
-          placeholder="搜索字幕、轨道或语言"
-        />
-      </label>
+      <div className="subtitle-workbench-filterbar">
+        <label className="subtitle-workbench-search">
+          <Search size={14} />
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="搜索字幕、轨道或语言"
+          />
+        </label>
+        <button
+          className={onlyIssues ? "active" : ""}
+          onClick={() => setOnlyIssues((value) => !value)}
+        >
+          {issues.length ? `${issues.length} 个问题` : "无问题"}
+        </button>
+      </div>
       {!document?.cues.length ? (
         <p className="style-hint">
           识别、导入或手动添加字幕后，会在这里集中校对。
@@ -221,6 +260,7 @@ export function SubtitleWorkbench({
               canMerge={canMergeCue(cue.id)}
               onSplit={() => onSplitCue(cue.id)}
               onMerge={() => onMergeCue(cue.id)}
+              issues={issuesByCue.get(cue.id) ?? []}
               onPatch={(patch) => onPatchCue(cue.id, patch)}
             />
           ))}

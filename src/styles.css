@@ -4955,3 +4955,56 @@ textarea {
   cursor: not-allowed;
   opacity: 0.38;
 }
+
+.subtitle-workbench-filterbar {
+  display: flex;
+  gap: 6px;
+}
+
+.subtitle-workbench-filterbar .subtitle-workbench-search {
+  flex: 1;
+}
+
+.subtitle-workbench-filterbar > button {
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0 7px;
+  color: var(--text-dim);
+  background: rgba(0, 0, 0, 0.14);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.subtitle-workbench-filterbar > button.active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.subtitle-workbench-issues {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.subtitle-workbench-issues span {
+  border-radius: 999px;
+  padding: 2px 5px;
+  font-size: 9px;
+}
+
+.subtitle-workbench-issues .error {
+  color: #ffaaa2;
+  background: rgba(255, 88, 78, 0.15);
+}
+
+.subtitle-workbench-issues .warning {
+  color: #ffd17e;
+  background: rgba(255, 183, 59, 0.14);
+}
+
+.subtitle-workbench-issues .info {
+  color: #aac7ff;
+  background: rgba(81, 139, 255, 0.14);
+}
