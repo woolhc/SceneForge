@@ -142,5 +142,8 @@ export function subtitleExportWarnings(
       "同一字幕同时上滑入场和下滑出场时，导出优先保留入场位移，出场以淡出近似。",
     );
   }
+  if (normalized.decorationId) {
+    warnings.push("花字装饰仅预览生效，导出时降级为纯文字样式。");
+  }
   return warnings;
 }
