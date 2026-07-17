@@ -170,13 +170,7 @@ function subtitleOperationAllowed(project: Project, cueId: string) {
   const track = clip
     ? project.tracks.find((candidate) => candidate.id === clip.trackId)
     : undefined;
-  if (
-    !clip ||
-    !track ||
-    track.kind !== "subtitle" ||
-    track.locked ||
-    clip.subtitleGroupId
-  )
+  if (!clip || !track || track.kind !== "subtitle" || track.locked)
     return null;
   return { clip, track };
 }
@@ -212,8 +206,15 @@ export function canSplitSubtitleCue(
   playheadTime: number,
 ) {
   const target = subtitleOperationAllowed(project, cueId);
-  return Boolean(
-    target && subtitleCueSplitTime(target.clip, playheadTime) !== null,
+  if (!target) return false;
+  if (!target.clip.subtitleGroupId)
+    return subtitleCueSplitTime(target.clip, playheadTime) !== null;
+  return (
+    subtitleGroupSplitTime(
+      project,
+      target.clip.subtitleGroupId,
+      playheadTime,
+    ) !== null
   );
 }
 
@@ -256,11 +257,7 @@ function splitTextAtRatio(
   return left && right ? [left, right] : null;
 }
 
-function splitSubtitleClipAtTime(
-  clip: Clip,
-  splitTime: number,
-  rightGroupId?: string,
-): [Clip, Clip] | null {
+function subtitleClipSplitParts(clip: Clip, splitTime: number) {
   const end = clip.startOnTrack + clip.duration;
   if (splitTime < clip.startOnTrack + 0.2 || splitTime > end - 0.2) return null;
   const words = clip.words ?? [];
@@ -276,8 +273,17 @@ function splitSubtitleClipAtTime(
           clip.text ?? "",
           (splitTime - clip.startOnTrack) / clip.duration,
         );
-  if (!textParts) return null;
+  return textParts ? { end, leftWords, rightWords, textParts } : null;
+}
 
+function splitSubtitleClipAtTime(
+  clip: Clip,
+  splitTime: number,
+  rightGroupId?: string,
+): [Clip, Clip] | null {
+  const parts = subtitleClipSplitParts(clip, splitTime);
+  if (!parts) return null;
+  const { end, leftWords, rightWords, textParts } = parts;
   const leftDuration = splitTime - clip.startOnTrack;
   const rightDuration = end - splitTime;
   const left: Clip = {
@@ -301,22 +307,47 @@ function splitSubtitleClipAtTime(
   return [left, right];
 }
 
+function subtitleGroupSplitTime(
+  project: Project,
+  groupId: string,
+  playheadTime: number,
+): number | null {
+  const group = project.clips.filter(
+    (clip) => clip.subtitleGroupId === groupId,
+  );
+  const source =
+    group.find(
+      (clip) =>
+        clip.subtitleRole === "source" && (clip.words?.length ?? 0) >= 2,
+    ) ?? group.find((clip) => (clip.words?.length ?? 0) >= 2);
+  if (!source || group.length < 2) return null;
+  const splitTime = subtitleCueSplitTime(source, playheadTime);
+  if (splitTime === null) return null;
+  for (const clip of group) {
+    const track = project.tracks.find(
+      (candidate) => candidate.id === clip.trackId,
+    );
+    if (
+      !track ||
+      track.kind !== "subtitle" ||
+      track.locked ||
+      !subtitleClipSplitParts(clip, splitTime)
+    )
+      return null;
+  }
+  return splitTime;
+}
+
 function splitSubtitleGroupAtTime(
   project: Project,
   groupId: string,
   playheadTime: number,
 ): Project | null {
+  const splitTime = subtitleGroupSplitTime(project, groupId, playheadTime);
+  if (splitTime === null) return null;
   const group = project.clips.filter(
     (clip) => clip.subtitleGroupId === groupId,
   );
-  const source = group.find((clip) => (clip.words?.length ?? 0) >= 2);
-  const sourceTrack = source
-    ? project.tracks.find((track) => track.id === source.trackId)
-    : undefined;
-  if (!source || !sourceTrack || sourceTrack.locked || group.length < 2)
-    return null;
-  const splitTime = subtitleCueSplitTime(source, playheadTime);
-  if (splitTime === null) return null;
   const rightGroupId = `${groupId}_split_${Date.now().toString(16)}`;
   const splitById = new Map<string, [Clip, Clip]>();
   for (const clip of group) {
@@ -346,6 +377,8 @@ export function splitSubtitleCueAtTime(
   const target = subtitleOperationAllowed(project, cueId);
   if (!target) return null;
   const { clip } = target;
+  if (clip.subtitleGroupId)
+    return splitSubtitleGroupAtTime(project, clip.subtitleGroupId, playheadTime);
   const words = clip.words ?? [];
   const splitTime = subtitleCueSplitTime(clip, playheadTime);
   if (splitTime === null) return null;
@@ -402,9 +435,96 @@ function nextSubtitleCue(project: Project, clip: Clip) {
     )[0];
 }
 
+type SubtitlePair = {
+  source: Clip;
+  target: Clip;
+};
+
+type SubtitlePairMerge = {
+  current: SubtitlePair;
+  next: SubtitlePair;
+  start: number;
+  end: number;
+};
+
+function subtitlePairForGroup(
+  project: Project,
+  groupId: string,
+): SubtitlePair | null {
+  const group = project.clips.filter(
+    (clip) => clip.subtitleGroupId === groupId,
+  );
+  if (group.length !== 2) return null;
+  const source = group.find((clip) => clip.subtitleRole === "source");
+  const target = group.find((clip) => clip.subtitleRole === "target");
+  if (!source || !target || source.trackId === target.trackId) return null;
+  for (const clip of group) {
+    const track = project.tracks.find(
+      (candidate) => candidate.id === clip.trackId,
+    );
+    if (!track || track.kind !== "subtitle" || track.locked) return null;
+  }
+  return { source, target };
+}
+
+function pairedSubtitleMerge(
+  project: Project,
+  groupId: string,
+): SubtitlePairMerge | null {
+  const current = subtitlePairForGroup(project, groupId);
+  if (!current) return null;
+  const nextSource = nextSubtitleCue(project, current.source);
+  const nextTarget = nextSubtitleCue(project, current.target);
+  if (
+    !nextSource?.subtitleGroupId ||
+    nextSource.subtitleGroupId !== nextTarget?.subtitleGroupId
+  )
+    return null;
+  const next = subtitlePairForGroup(project, nextSource.subtitleGroupId);
+  if (
+    !next ||
+    next.source.id !== nextSource.id ||
+    next.target.id !== nextTarget.id ||
+    next.source.trackId !== current.source.trackId ||
+    next.target.trackId !== current.target.trackId
+  )
+    return null;
+  return {
+    current,
+    next,
+    start: Math.min(current.source.startOnTrack, current.target.startOnTrack),
+    end: Math.max(
+      next.source.startOnTrack + next.source.duration,
+      next.target.startOnTrack + next.target.duration,
+    ),
+  };
+}
+
+function mergeSubtitleClips(
+  current: Clip,
+  next: Clip,
+  start = current.startOnTrack,
+  end = Math.max(
+    current.startOnTrack + current.duration,
+    next.startOnTrack + next.duration,
+  ),
+): Clip {
+  const words = [...(current.words ?? []), ...(next.words ?? [])];
+  return {
+    ...current,
+    startOnTrack: start,
+    duration: end - start,
+    sourceOut: end - start,
+    text: joinTextFragments([current.text ?? "", next.text ?? ""]),
+    words: words.length ? words : null,
+  };
+}
+
 export function canMergeSubtitleCueWithNext(project: Project, cueId: string) {
   const target = subtitleOperationAllowed(project, cueId);
-  if (!target || target.clip.subtitleGroupId) return false;
+  if (!target) return false;
+  if (target.clip.subtitleGroupId)
+    return pairedSubtitleMerge(project, target.clip.subtitleGroupId) !== null;
   const next = nextSubtitleCue(project, target.clip);
   const nextTrack = next
     ? project.tracks.find((track) => track.id === next.trackId)
@@ -417,14 +537,46 @@ export function canMergeSubtitleCueWithNext(project: Project, cueId: string) {
   );
 }
 
-/** Merges an ungrouped subtitle cue with the next cue on the same unlocked track. */
+/** Merges a single cue or both members of a bilingual group with their corresponding next cue. */
 export function mergeSubtitleCueWithNext(
   project: Project,
   cueId: string,
 ): Project | null {
   const target = subtitleOperationAllowed(project, cueId);
-  if (!target || target.clip.subtitleGroupId) return null;
+  if (!target) return null;
   const { clip } = target;
+  if (clip.subtitleGroupId) {
+    const pair = pairedSubtitleMerge(project, clip.subtitleGroupId);
+    if (!pair) return null;
+    const mergedById = new Map([
+      [
+        pair.current.source.id,
+        mergeSubtitleClips(
+          pair.current.source,
+          pair.next.source,
+          pair.start,
+          pair.end,
+        ),
+      ],
+      [
+        pair.current.target.id,
+        mergeSubtitleClips(
+          pair.current.target,
+          pair.next.target,
+          pair.start,
+          pair.end,
+        ),
+      ],
+    ]);
+    const removedIds = new Set([pair.next.source.id, pair.next.target.id]);
+    return {
+      ...project,
+      clips: project.clips
+        .filter((candidate) => !removedIds.has(candidate.id))
+        .map((candidate) => mergedById.get(candidate.id) ?? candidate),
+    };
+  }
+
   const next = nextSubtitleCue(project, clip);
   const nextTrack = next
     ? project.tracks.find((track) => track.id === next.trackId)
@@ -437,20 +589,7 @@ export function mergeSubtitleCueWithNext(
   )
     return null;
 
-  const mergedWords = [...(clip.words ?? []), ...(next.words ?? [])];
-  const mergedEnd = Math.max(
-    clip.startOnTrack + clip.duration,
-    next.startOnTrack + next.duration,
-  );
-  const merged: Clip = {
-    ...clip,
-    duration: mergedEnd - clip.startOnTrack,
-    sourceOut: mergedEnd - clip.startOnTrack,
-    text: mergedWords.length
-      ? joinWords(mergedWords)
-      : `${clip.text ?? ""}${clip.text && next.text ? " " : ""}${next.text ?? ""}`,
-    words: mergedWords.length ? mergedWords : null,
-  };
+  const merged = mergeSubtitleClips(clip, next);
   return {
     ...project,
     clips: project.clips

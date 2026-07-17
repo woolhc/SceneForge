@@ -220,6 +220,8 @@ pub enum TrackKind {
     Audio,
     /// 字幕轨（叠加文字，渲染时烧录）
     Subtitle,
+    /// 独立文本图层（不挂 ASR，可自由创建的文字，渲染时烧录）
+    Text,
 }
 
 /// 素材库实体 —— 一段可播放的源媒体。
@@ -256,6 +258,39 @@ pub struct MediaSource {
     pub duration: f64,
     /// 来源标识："pexels" | "local" | "tts"
     pub source: String,
+    /// 用户自定标签（素材库筛选用）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    /// 是否收藏
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub favorite: Option<bool>,
+    /// 最近一次被拖入时间线的时间（ISO 8601）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
+}
+
+impl Default for MediaSource {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            kind: String::new(),
+            title: String::new(),
+            url: None,
+            local_path: None,
+            proxy_path: None,
+            proxy_status: None,
+            proxy_width: None,
+            proxy_height: None,
+            thumbnail_url: None,
+            width: 0,
+            height: 0,
+            duration: 0.0,
+            source: String::new(),
+            tags: None,
+            favorite: None,
+            last_used_at: None,
+        }
+    }
 }
 
 /// 画面裁剪（源帧百分比 0-100）
@@ -352,6 +387,9 @@ pub struct SubtitleStyle {
     /// T4.8: 动画时长（秒）
     #[serde(default = "default_anim_duration")]
     pub animation_duration: f64,
+    /// 花字装饰模板 id。仅预览生效，导出时降级为纯文字样式。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoration_id: Option<String>,
 }
 
 fn default_anim_duration() -> f64 {
@@ -383,6 +421,7 @@ impl Default for SubtitleStyle {
             animation_in: String::new(),
             animation_out: String::new(),
             animation_duration: default_anim_duration(),
+            decoration_id: None,
         }
     }
 }
@@ -469,6 +508,9 @@ pub struct Keyframe {
     pub value: f64,
     #[serde(default = "default_easing")]
     pub easing: String,
+    /// easing == "bezier" 时的三次贝塞尔控制点 [x1,y1,x2,y2]，参考 CSS cubic-bezier
+    #[serde(default)]
+    pub bezier_points: Option<[f64; 4]>,
 }
 
 fn default_easing() -> String {
@@ -599,11 +641,14 @@ fn default_transform_mix() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClipVisualEffect {
-    /// 特效类型：vignette | flicker | shake | glow | mirror | invert | grayscale
+    /// 特效类型：vignette | flicker | shake | glow | mirror | invert | grayscale | chromakey
     pub kind: String,
-    /// 强度 0-100，默认 50
+    /// 强度 0-100，默认 50；chromakey 下映射为抠像容差（similarity）
     #[serde(default = "default_effect_intensity")]
     pub intensity: f64,
+    /// 抠像目标色（十六进制），仅 kind="chromakey" 使用
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chroma_key_color: Option<String>,
 }
 
 fn default_effect_intensity() -> f64 {
@@ -646,6 +691,9 @@ pub struct Clip {
     /// afftdn 滤镜 nr 参数（噪声降低分贝，0-97，0=关闭）
     #[serde(default)]
     pub noise_reduction: f64,
+    /// 变声/音效预设 id（None=无）。仅导出生效，预览不处理
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_effect: Option<String>,
     /// 滤镜名称（None=无滤镜）。如 "vintage"/"warm"/"cool"/"bw" 等
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
@@ -939,6 +987,9 @@ pub struct RenderProjectRequest {
     /// 用户选择的导出路径（None=用默认 app 数据目录）
     #[serde(default)]
     pub output_path: Option<String>,
+    /// P3-4: 批量多比例导出时的比例覆盖（None=用项目当前比例，不影响已保存的项目数据）
+    #[serde(default)]
+    pub ratio: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -947,6 +998,17 @@ pub struct PexelsSearchRequest {
     pub query: String,
     pub ratio: String,
     pub per_page: Option<u8>,
+    #[serde(default)]
+    pub page: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PexelsSearchResult {
+    pub assets: Vec<MediaSource>,
+    pub page: u32,
+    pub has_more: bool,
+    pub total_results: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]

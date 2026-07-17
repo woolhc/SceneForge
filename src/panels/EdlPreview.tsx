@@ -32,7 +32,7 @@ function EdlCardThumbnails({ query, ratio }: { query: string; ratio: string }) {
             setLoaded(true);
             void desktopApi
               .searchPexelsVideos({ query, ratio, perPage: 3 })
-              .then(setAssets)
+              .then((result) => setAssets(result.assets))
               .catch(() => setAssets([]));
             observer.disconnect();
             break;

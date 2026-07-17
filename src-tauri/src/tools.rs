@@ -151,6 +151,21 @@ fn resolve_with(
         };
     }
 
+    // Development builds can retain stale copied sidecars under target/debug.
+    // Homebrew's whisper-cli is dynamically linked relative to its original
+    // installation, so the copied executable may exist while being unable to
+    // start. Prefer the directly installed PATH command during development;
+    // explicit settings and environment overrides still remain authoritative.
+    if cfg!(debug_assertions) && tool == NativeTool::Whisper {
+        if let Some(path) = path_lookup(tool.command_name()) {
+            return ToolResolution {
+                path,
+                source: ToolSource::Path,
+                available: true,
+            };
+        }
+    }
+
     let mut bundle_roots = BUNDLE_ROOTS.get().cloned().unwrap_or_default();
     if let Some(parent) = current_executable.as_deref().and_then(Path::parent) {
         let parent = parent.to_path_buf();
@@ -273,6 +288,35 @@ mod tests {
         let result = resolve_with(NativeTool::Whisper, Some(&configured), None, None, |_| None);
         assert!(result.available);
         assert_eq!(result.source, ToolSource::Configured);
+    }
+
+    #[test]
+    fn development_whisper_prefers_runnable_path_over_stale_bundle() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "sceneforge-whisper-resolution-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let bundled = temp_root.join(platform_executable_name(NativeTool::Whisper));
+        std::fs::write(&bundled, b"stale copied sidecar").unwrap();
+        let path_whisper = PathBuf::from("/opt/homebrew/bin/whisper-cli");
+
+        let result = resolve_with(
+            NativeTool::Whisper,
+            None,
+            None,
+            Some(temp_root.join("SceneForge")),
+            |_| Some(path_whisper.clone()),
+        );
+
+        if cfg!(debug_assertions) {
+            assert_eq!(result.source, ToolSource::Path);
+            assert_eq!(result.path, path_whisper);
+        } else {
+            assert_eq!(result.source, ToolSource::Bundled);
+            assert_eq!(result.path, bundled);
+        }
+        let _ = std::fs::remove_dir_all(temp_root);
     }
 
     #[test]

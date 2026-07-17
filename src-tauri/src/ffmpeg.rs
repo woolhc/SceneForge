@@ -104,6 +104,79 @@ async fn run_with_timeout_and_cancel(
     }
 }
 
+/// 与 `run_with_timeout_and_cancel` 类似，但通过 `-progress pipe:1` 增量解析 ffmpeg 的
+/// `out_time_ms=` 输出，按 `total_duration_secs` 换算成 0.0-1.0 的真实编码进度，
+/// 每次解析到新进度行都会调用 `on_progress`。stderr 需要并发读取排空，否则管道缓冲区
+/// 写满会导致 ffmpeg 进程阻塞（死锁）。要求调用前已对 `cmd` 追加 `-progress pipe:1 -nostats`。
+async fn run_with_progress_and_cancel(
+    cmd: &mut Command,
+    secs: u64,
+    cancel_flag: Option<&std::sync::atomic::AtomicBool>,
+    total_duration_secs: f64,
+    on_progress: &(dyn Fn(f64) + Send + Sync),
+) -> anyhow::Result<Output> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+    cmd.kill_on_drop(true);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let stdout = child.stdout.take().expect("stdout 已设置为 piped");
+    let mut stderr = child.stderr.take().expect("stderr 已设置为 piped");
+
+    let wait_fut = async {
+        let stdout_task = async {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                if let Some(value) = line.strip_prefix("out_time_ms=") {
+                    if let Ok(us) = value.trim().parse::<i64>() {
+                        if total_duration_secs > 0.0 {
+                            let secs_done = (us.max(0) as f64) / 1_000_000.0;
+                            let frac = (secs_done / total_duration_secs).clamp(0.0, 1.0);
+                            on_progress(frac);
+                        }
+                    }
+                }
+            }
+        };
+        let stderr_task = async {
+            let mut buf = Vec::new();
+            let _ = stderr.read_to_end(&mut buf).await;
+            buf
+        };
+        let (_, stderr_buf, status) = tokio::join!(stdout_task, stderr_task, child.wait());
+        status.map(|status| (status, stderr_buf))
+    };
+    tokio::pin!(wait_fut);
+
+    let deadline = tokio::time::sleep(Duration::from_secs(secs));
+    tokio::pin!(deadline);
+    let cancel = async {
+        loop {
+            if let Some(flag) = cancel_flag {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    };
+    tokio::pin!(cancel);
+
+    let (status, stderr_buf) = tokio::select! {
+        result = &mut wait_fut => result?,
+        _ = &mut deadline => anyhow::bail!("命令执行超时（{}s）", secs),
+        _ = &mut cancel, if cancel_flag.is_some() => anyhow::bail!("渲染已取消"),
+    };
+
+    Ok(Output {
+        status,
+        stdout: Vec::new(),
+        stderr: stderr_buf,
+    })
+}
+
 fn check_cancel(cancel_flag: Option<&std::sync::atomic::AtomicBool>) -> anyhow::Result<()> {
     if let Some(flag) = cancel_flag {
         if flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -139,7 +212,7 @@ pub fn collect_mix_audio_clips(project: &Project) -> Vec<&Clip> {
             }
             match track.kind {
                 TrackKind::Voiceover | TrackKind::Audio | TrackKind::Video => {}
-                TrackKind::Image | TrackKind::Subtitle => return false,
+                TrackKind::Image | TrackKind::Subtitle | TrackKind::Text => return false,
             }
             let Some(source_id) = &clip.source_id else {
                 return false;
@@ -888,6 +961,12 @@ pub async fn render_project_video(
             cb(35, "正在单遍渲染视频图...");
         }
         check_cancel(cancel_flag)?;
+        // 单遍编码真实进度映射到 35-85% 区间
+        let single_pass_on_progress = progress_cb.map(|cb| {
+            let f: Box<dyn Fn(f64) + Send + Sync> =
+                Box::new(move |frac: f64| cb(35 + (frac * 50.0) as u32, "正在单遍渲染视频图..."));
+            f
+        });
         render_single_pass_video_graph(
             cache_dir,
             project,
@@ -898,6 +977,8 @@ pub async fn render_project_video(
             target_w,
             target_h,
             cancel_flag,
+            total_duration,
+            single_pass_on_progress.as_deref(),
         )
         .await?;
 
@@ -906,6 +987,12 @@ pub async fn render_project_video(
             cb(85, "正在烧录字幕和混音...");
         }
         check_cancel(cancel_flag)?;
+        // 烧录字幕/混音真实进度映射到 85-99% 区间（100% 留给渲染完成）
+        let burn_on_progress = progress_cb.map(|cb| {
+            let f: Box<dyn Fn(f64) + Send + Sync> =
+                Box::new(move |frac: f64| cb(85 + (frac * 14.0) as u32, "正在烧录字幕和混音..."));
+            f
+        });
         let result = burn_subtitle_and_mix_audio(
             cache_dir,
             projects_dir,
@@ -915,6 +1002,8 @@ pub async fn render_project_video(
             &transition_shrink_points,
             &encoder,
             cancel_flag,
+            total_duration,
+            burn_on_progress.as_deref(),
         )
         .await?;
         if let Some(cb) = progress_cb {
@@ -1232,6 +1321,12 @@ pub async fn render_project_video(
         cb(85, "正在烧录字幕和混音...");
     }
     check_cancel(cancel_flag)?;
+    // 烧录字幕/混音真实进度映射到 85-99% 区间（100% 留给渲染完成）
+    let burn_on_progress = progress_cb.map(|cb| {
+        let f: Box<dyn Fn(f64) + Send + Sync> =
+            Box::new(move |frac: f64| cb(85 + (frac * 14.0) as u32, "正在烧录字幕和混音..."));
+        f
+    });
     let result = burn_subtitle_and_mix_audio(
         cache_dir,
         projects_dir,
@@ -1241,6 +1336,8 @@ pub async fn render_project_video(
         &transition_shrink_points,
         &encoder,
         cancel_flag,
+        total_duration,
+        burn_on_progress.as_deref(),
     )
     .await?;
     // T3.3: 进度 100%
@@ -1265,6 +1362,8 @@ async fn render_single_pass_video_graph(
     width: u32,
     height: u32,
     cancel_flag: Option<&std::sync::atomic::AtomicBool>,
+    total_duration_secs: f64,
+    on_progress: Option<&(dyn Fn(f64) + Send + Sync)>,
 ) -> anyhow::Result<()> {
     let mut args: Vec<String> = vec!["-y".to_string()];
     let all_clips: Vec<&Clip> = graph
@@ -1404,8 +1503,17 @@ async fn render_single_pass_video_graph(
 
     check_cancel(cancel_flag)?;
     let mut cmd = crate::tools::command(crate::tools::NativeTool::Ffmpeg);
+    args.push("-progress".to_string());
+    args.push("pipe:1".to_string());
+    args.push("-nostats".to_string());
     cmd.args(&args);
-    let output = run_with_timeout_and_cancel(&mut cmd, 1800, cancel_flag).await?;
+    let output = match on_progress {
+        Some(cb) if total_duration_secs > 0.0 => {
+            run_with_progress_and_cancel(&mut cmd, 1800, cancel_flag, total_duration_secs, cb)
+                .await?
+        }
+        _ => run_with_timeout_and_cancel(&mut cmd, 1800, cancel_flag).await?,
+    };
     if !output.status.success() {
         anyhow::bail!(
             "单遍视频图渲染失败：{}",
@@ -2144,6 +2252,8 @@ async fn burn_subtitle_and_mix_audio(
     transition_shrink_points: &[(f64, f64)],
     encoder: &str,
     cancel_flag: Option<&std::sync::atomic::AtomicBool>,
+    total_duration_secs: f64,
+    on_progress: Option<&(dyn Fn(f64) + Send + Sync)>,
 ) -> anyhow::Result<PathBuf> {
     let render_dir = projects_dir.join(&project.id).join("renders");
     let output_path = render_dir.join(if preview { "preview.mp4" } else { "final.mp4" });
@@ -2152,11 +2262,11 @@ async fn burn_subtitle_and_mix_audio(
     // 图片轨/图片素材没有音频流，必须排除，否则提取失败会导致后续混音索引错位。
     let audio_clips = collect_mix_audio_clips(project);
 
-    // 收集字幕轨 clip，生成 .ass 字幕文件
+    // 收集字幕轨 + 文字轨 clip，生成 .ass 字幕文件
     let subtitle_track_ids: Vec<String> = project
         .tracks
         .iter()
-        .filter(|t| t.kind == TrackKind::Subtitle && !t.hidden)
+        .filter(|t| (t.kind == TrackKind::Subtitle || t.kind == TrackKind::Text) && !t.hidden)
         .map(|t| t.id.clone())
         .collect();
     let mut subtitle_clips: Vec<&Clip> = project
@@ -2331,8 +2441,17 @@ async fn burn_subtitle_and_mix_audio(
 
     check_cancel(cancel_flag)?;
     let mut cmd = crate::tools::command(crate::tools::NativeTool::Ffmpeg);
+    args.push("-progress".to_string());
+    args.push("pipe:1".to_string());
+    args.push("-nostats".to_string());
     cmd.args(&args);
-    let output = run_with_timeout_and_cancel(&mut cmd, 1800, cancel_flag).await?;
+    let output = match on_progress {
+        Some(cb) if total_duration_secs > 0.0 => {
+            run_with_progress_and_cancel(&mut cmd, 1800, cancel_flag, total_duration_secs, cb)
+                .await?
+        }
+        _ => run_with_timeout_and_cancel(&mut cmd, 1800, cancel_flag).await?,
+    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         // 字幕/混音失败时尝试无字幕版本（去掉 subtitles 滤镜重试一次）
@@ -2406,7 +2525,7 @@ fn generate_ass_subtitles(
     let mut subtitle_tracks_sorted: Vec<&crate::models::Track> = project
         .tracks
         .iter()
-        .filter(|t| t.kind == TrackKind::Subtitle && !t.hidden)
+        .filter(|t| (t.kind == TrackKind::Subtitle || t.kind == TrackKind::Text) && !t.hidden)
         .collect();
     subtitle_tracks_sorted.sort_by(|a, b| b.order.cmp(&a.order));
     let track_layer: Vec<(String, i32)> = subtitle_tracks_sorted
@@ -2975,6 +3094,18 @@ async fn merge_audio_clips(
         .map(|(clip, _)| clip.start_on_track + clip.duration)
         .fold(0.0_f64, f64::max);
 
+    // 变声/音效预设：仅导出生效（预览不处理，需要 AudioWorklet 才能实时预览，成本高，见 P3-2）
+    // asetrate 改采样率实现变调，aresample 换回标准采样率，atempo 抵消 asetrate 带来的变速
+    fn voice_effect_filter(effect: Option<&str>) -> String {
+        match effect {
+            Some("pitch_up") => ",asetrate=44100*1.25,aresample=44100,atempo=0.8".to_string(),
+            Some("pitch_down") => ",asetrate=44100*0.8,aresample=44100,atempo=1.25".to_string(),
+            Some("vibrato") => ",vibrato=f=5:d=0.5".to_string(),
+            Some("tremolo") => ",tremolo=f=5:d=0.5".to_string(),
+            _ => String::new(),
+        }
+    }
+
     // 用 adelay + amix 把各段按 startOnTrack 偏移混合
     // 简化版：用 concat + adelay（每段前面插入静音 = startOnTrack - 前一段结束）
     let mut args: Vec<String> = vec!["-y".to_string()];
@@ -3029,9 +3160,10 @@ async fn merge_audio_clips(
         } else {
             format!("volume={vol:.4}")
         };
-        // adelay + volume(clip音量/关键帧) + 降噪 + afade 淡入淡出
+        let voice_filter = voice_effect_filter(clip.voice_effect.as_deref());
+        // adelay + volume(clip音量/关键帧) + 降噪 + 变声 + afade 淡入淡出
         filter.push_str(&format!(
-            "[{i}:a]adelay={delay_ms}|{delay_ms},{vol_filter}{nr_filter},afade=t=in:st=0:d={fade_in:.3},afade=t=out:st={fade_out_start:.3}:d={fade_out:.3}[d{i}];"
+            "[{i}:a]adelay={delay_ms}|{delay_ms},{vol_filter}{nr_filter}{voice_filter},afade=t=in:st=0:d={fade_in:.3},afade=t=out:st={fade_out_start:.3}:d={fade_out:.3}[d{i}];"
         ));
     }
     let inputs_label: String = (0..n).map(|i| format!("[d{i}]")).collect();
@@ -3165,6 +3297,17 @@ fn clip_color_filter(clip: &Clip) -> String {
                     parts.push(format!(
                         "crop=iw-2*{amp}:ih-2*{amp}:x='{amp}+{amp}*sin(2*PI*t)':y='{amp}+{amp}*cos(3*PI*t)'"
                     ));
+                }
+                // 抠像/绿幕：colorkey 抠除目标色，intensity 映射容差（similarity）+ 边缘柔化（blend）
+                "chromakey" => {
+                    let color = eff
+                        .chroma_key_color
+                        .as_deref()
+                        .unwrap_or("#00FF00")
+                        .replace('#', "0x");
+                    let similarity = 0.01 + intensity * 0.4;
+                    let blend = intensity * 0.2;
+                    parts.push(format!("colorkey={color}:{similarity:.4}:{blend:.4}"));
                 }
                 _ => {}
             }
@@ -3435,6 +3578,7 @@ mod tests {
             fade_in: 0.0,
             fade_out: 0.0,
             noise_reduction: 0.0,
+            voice_effect: None,
             filter: None,
             brightness: 0.0,
             contrast: 0.0,
@@ -3475,6 +3619,7 @@ mod tests {
             height: 1080,
             duration: 10.0,
             source: "local".to_string(),
+            ..Default::default()
         }
     }
 
@@ -3568,6 +3713,7 @@ mod tests {
             height: 1080,
             duration: 10.0,
             source: "pexels".to_string(),
+            ..Default::default()
         }];
 
         assert!(reconcile_project_media_cache(&mut project, &cache_dir));
@@ -3609,6 +3755,7 @@ mod tests {
             height: 1080,
             duration: 10.0,
             source: "pexels".to_string(),
+            ..Default::default()
         }];
 
         assert!(!reconcile_project_media_cache(&mut project, &cache_dir));

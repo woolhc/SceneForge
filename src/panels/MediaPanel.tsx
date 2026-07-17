@@ -13,8 +13,11 @@ export function MediaPanel({
   onImportLocal,
   onSearchVideos,
   onSearchPhotos,
+  hasMore,
+  onLoadMore,
   onPreview,
   onAddToTimeline,
+  onToggleFavorite,
 }: {
   media: MediaSource[];
   busy: string | null;
@@ -22,8 +25,11 @@ export function MediaPanel({
   onImportLocal: () => void;
   onSearchVideos: (query: string) => void;
   onSearchPhotos: (query: string) => void;
+  hasMore?: boolean;
+  onLoadMore?: () => void;
   onPreview: (asset: MediaSource | null) => void;
   onAddToTimeline: (asset: MediaSource) => void;
+  onToggleFavorite?: (asset: MediaSource) => void;
 }) {
   const importing = busy === "library-import";
   return (
@@ -42,8 +48,11 @@ export function MediaPanel({
         previewingId={previewingId}
         onSearchVideos={onSearchVideos}
         onSearchPhotos={onSearchPhotos}
+        hasMore={hasMore}
+        onLoadMore={onLoadMore}
         onPreview={onPreview}
         onAddToTimeline={onAddToTimeline}
+        onToggleFavorite={onToggleFavorite}
       />
     </div>
   );

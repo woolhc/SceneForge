@@ -1,15 +1,9 @@
-import { ArrowDown, ArrowUp, Clock3, Eye, EyeOff, Image as ImageIcon, Lock, Mic2, MicOff, SlidersHorizontal, Trash2, Unlock, Video } from "lucide-react";
+import { ArrowDown, ArrowUp, Clock3, Eye, EyeOff, Image as ImageIcon, Lock, Mic2, MicOff, SlidersHorizontal, Trash2, Type, Unlock, Video } from "lucide-react";
 import React, { useEffect, useRef, useState } from "react";
 import type { Clip, ClipKeyframes, Keyframe, MediaSource, Track } from "../types";
 import { desktopApi } from "../tauri";
 import { usePlaybackStore } from "../store/playbackStore";
-import {
-  computeDraggedClip,
-  hasExceededPointerDragThreshold,
-  pxToSeconds,
-  type DragHandle,
-  type DragState,
-} from "./clipInteraction";
+import { hasExceededPointerDragThreshold, type DragHandle } from "./clipInteraction";
 
 function TimelineTrackInner({
   track,
@@ -20,9 +14,11 @@ function TimelineTrackInner({
   selectedClipId,
   selectedClipIds,
   locked,
+  isDragBlocked,
   onSelectClip,
-  onClipDrag,
-  onClipCommit,
+  onDragStart,
+  onDragMove,
+  onDragEnd,
   onBoxSelect,
   onDropAsset,
   onContextMenu,
@@ -33,6 +29,7 @@ function TimelineTrackInner({
   onMoveDown,
   onDeleteTrack,
   onKeyframeClick,
+  onKeyframeDrag,
   onEditSubtitleStyle,
 }: {
   track: Track;
@@ -44,9 +41,12 @@ function TimelineTrackInner({
   selectedClipId: string | null;
   selectedClipIds?: string[];
   locked: boolean;
+  /** 当前轨道是否是跨轨拖拽悬停中但不兼容的目标（视觉标红） */
+  isDragBlocked?: boolean;
   onSelectClip: (id: string, additive: boolean, range?: boolean) => void;
-  onClipDrag: (clipId: string, patch: Partial<Clip>, commit: boolean) => void;
-  onClipCommit: (clipId: string) => void;
+  onDragStart: (clip: Clip, handle: DragHandle, clientX: number, clientY: number, trackId: string) => void;
+  onDragMove: (clientX: number, clientY: number) => void;
+  onDragEnd: () => void;
   onBoxSelect: (ids: string[], additive: boolean) => void;
   onDropAsset: (trackId: string, assetId: string, startOnTrack: number) => void;
   onContextMenu: (clip: Clip, trackKind: string, x: number, y: number) => void;
@@ -57,9 +57,9 @@ function TimelineTrackInner({
   onMoveDown: (trackId: string) => void;
   onDeleteTrack?: (trackId: string) => void;
   onKeyframeClick?: (clipId: string, prop: keyof ClipKeyframes, time: number) => void;
+  onKeyframeDrag?: (clipId: string, prop: keyof ClipKeyframes, kfIndex: number, newTime: number, commit: boolean) => void;
   onEditSubtitleStyle?: (trackId: string) => void;
 }) {
-  const dragRef = useRef<DragState | null>(null);
   const boxRef = useRef<{
     pointerId: number;
     startX: number;
@@ -67,10 +67,23 @@ function TimelineTrackInner({
     additive: boolean;
     activated: boolean;
   } | null>(null);
+  const keyframeDragRef = useRef<{
+    clipId: string;
+    prop: keyof ClipKeyframes;
+    kfIndex: number;
+    startX: number;
+    initialTime: number;
+    clipDuration: number;
+    activated: boolean;
+  } | null>(null);
   const pxPerSecond = totalDuration > 0 ? timelineWidth / totalDuration : 1;
   const [dragOver, setDragOver] = useState(false);
   const [boxSelection, setBoxSelection] = useState<{ left: number; width: number } | null>(null);
 
+  /**
+   * 拖拽状态本身提升到 App.tsx（跨轨拖拽必须知道全部轨道布局，单轨组件做不到）。
+   * 这里只做 pointer capture 管理和坐标转发，不再持有 DragState / 调用 computeDraggedClip。
+   */
   function startDrag(
     event: React.PointerEvent<HTMLDivElement>,
     clip: Clip,
@@ -80,47 +93,19 @@ function TimelineTrackInner({
     event.stopPropagation();
     event.preventDefault();
     onSelectClip(clip.id, event.metaKey || event.ctrlKey, event.shiftKey);
-    const peers = clips.filter((c) => c.id !== clip.id);
-    dragRef.current = {
-      clipId: clip.id,
-      handle,
-      startX: event.clientX,
-      initial: structuredClone(clip),
-      peers,
-      // T2.2: playhead 从 store 按需读（拖拽时才用），避免每帧 prop 变化导致重渲染
-      playhead: usePlaybackStore.getState().currentTime,
-      activated: false,
-    };
     (event.currentTarget as HTMLDivElement).setPointerCapture(event.pointerId);
+    onDragStart(clip, handle, event.clientX, event.clientY, track.id);
   }
 
   function moveDrag(event: React.PointerEvent<HTMLDivElement>) {
-    const drag = dragRef.current;
-    if (!drag) return;
-    if (!drag.activated) {
-      if (!hasExceededPointerDragThreshold(drag.startX, event.clientX)) return;
-      drag.activated = true;
-    }
-    const deltaSeconds = pxToSeconds(event.clientX - drag.startX, pxPerSecond);
-    const clip = clips.find((c) => c.id === drag.clipId);
-    if (!clip) return;
-    const source = clip.sourceId ? media.find((m) => m.id === clip.sourceId) : null;
-    const sourceDuration = source?.duration;
-    const next = computeDraggedClip(drag, deltaSeconds, sourceDuration, pxPerSecond);
-    // 存最后一次 patch，endDrag 时用它提交
-    drag.lastPatch = next;
-    onClipDrag(drag.clipId, next, false);
+    onDragMove(event.clientX, event.clientY);
   }
 
   function endDrag(event: React.PointerEvent<HTMLDivElement>) {
-    const drag = dragRef.current;
-    if (!drag) return;
-    (event.currentTarget as HTMLDivElement).releasePointerCapture(event.pointerId);
-    // 用最后一次 patch 提交（commit=true 触发持久化 + 撤销快照）
-    if (drag.lastPatch) {
-      onClipDrag(drag.clipId, drag.lastPatch, true);
+    if ((event.currentTarget as HTMLDivElement).hasPointerCapture(event.pointerId)) {
+      (event.currentTarget as HTMLDivElement).releasePointerCapture(event.pointerId);
     }
-    dragRef.current = null;
+    onDragEnd();
   }
 
   function timeFromClientX(clientX: number, element: HTMLDivElement): number {
@@ -182,7 +167,7 @@ function TimelineTrackInner({
   function isAssetAcceptable(assetId: string): boolean {
     const asset = media.find((m) => m.id === assetId);
     if (!asset) return false;
-    // 视频轨接受视频；图片轨接受图片；音频/配音轨接受音频；字幕轨不接受素材
+    // 视频轨接受视频；图片轨接受图片；音频/配音轨接受音频；字幕轨/文字轨不接受素材
     if (track.kind === "video") return asset.kind === "video";
     if (track.kind === "image") return asset.kind === "image";
     if (track.kind === "audio" || track.kind === "voiceover") return asset.kind === "audio";
@@ -220,7 +205,8 @@ function TimelineTrackInner({
 
   return (
     <div
-      className={`track track-${track.kind} ${dragOver ? "drag-over" : ""} ${track.hidden ? "track-hidden" : ""}`}
+      className={`track track-${track.kind} ${dragOver ? "drag-over" : ""} ${track.hidden ? "track-hidden" : ""} ${isDragBlocked ? "track-drag-blocked" : ""}`}
+      data-track-id={track.id}
       style={{ height: track.height && track.height > 0 ? `${track.height}px` : undefined }}
       onPointerDown={startBoxSelect}
       onPointerMove={moveBoxSelect}
@@ -232,7 +218,7 @@ function TimelineTrackInner({
     >
       {boxSelection && <div className="track-selection-box" style={{ left: boxSelection.left, width: boxSelection.width }} />}
       <span className="track-label">
-        {track.kind === "video" ? <Video size={15} /> : track.kind === "image" ? <ImageIcon size={15} /> : track.kind === "voiceover" ? <Mic2 size={15} /> : null}
+        {track.kind === "video" ? <Video size={15} /> : track.kind === "image" ? <ImageIcon size={15} /> : track.kind === "voiceover" ? <Mic2 size={15} /> : track.kind === "text" ? <Type size={15} /> : null}
         <span className="track-name">{track.name}</span>
         <button
           className={`track-ctrl ${track.muted ? "active" : ""}`}
@@ -241,7 +227,7 @@ function TimelineTrackInner({
         >
           {track.muted ? <MicOff size={12} /> : <Mic2 size={12} />}
         </button>
-        {onEditSubtitleStyle && track.kind === "subtitle" && (
+        {onEditSubtitleStyle && (track.kind === "subtitle" || track.kind === "text") && (
           <button
             className="track-ctrl"
             title="统一调整本轨字幕样式"
@@ -358,7 +344,47 @@ function TimelineTrackInner({
                 onPointerDown={(e) => {
                   e.stopPropagation();
                   e.preventDefault();
-                  onKeyframeClick?.(clip.id, m.prop, m.time);
+                  (e.currentTarget as HTMLSpanElement).setPointerCapture(e.pointerId);
+                  keyframeDragRef.current = {
+                    clipId: clip.id,
+                    prop: m.prop,
+                    kfIndex: m.kfIndex,
+                    startX: e.clientX,
+                    initialTime: m.time,
+                    clipDuration: clip.duration,
+                    activated: false,
+                  };
+                }}
+                onPointerMove={(e) => {
+                  const drag = keyframeDragRef.current;
+                  if (!drag || drag.clipId !== clip.id || drag.prop !== m.prop || drag.kfIndex !== m.kfIndex) return;
+                  if (!drag.activated) {
+                    if (!hasExceededPointerDragThreshold(drag.startX, e.clientX)) return;
+                    drag.activated = true;
+                  }
+                  const deltaPx = e.clientX - drag.startX;
+                  const deltaTime = pxPerSecond > 0 ? deltaPx / pxPerSecond : 0;
+                  const newTime = Math.max(0, Math.min(drag.clipDuration, drag.initialTime + deltaTime));
+                  onKeyframeDrag?.(drag.clipId, drag.prop, drag.kfIndex, newTime, false);
+                }}
+                onPointerUp={(e) => {
+                  const drag = keyframeDragRef.current;
+                  if ((e.currentTarget as HTMLSpanElement).hasPointerCapture(e.pointerId)) {
+                    (e.currentTarget as HTMLSpanElement).releasePointerCapture(e.pointerId);
+                  }
+                  keyframeDragRef.current = null;
+                  if (!drag || drag.clipId !== clip.id || drag.prop !== m.prop || drag.kfIndex !== m.kfIndex) return;
+                  if (drag.activated) {
+                    const deltaPx = e.clientX - drag.startX;
+                    const deltaTime = pxPerSecond > 0 ? deltaPx / pxPerSecond : 0;
+                    const newTime = Math.max(0, Math.min(drag.clipDuration, drag.initialTime + deltaTime));
+                    onKeyframeDrag?.(drag.clipId, drag.prop, drag.kfIndex, newTime, true);
+                  } else {
+                    onKeyframeClick?.(clip.id, m.prop, m.time);
+                  }
+                }}
+                onPointerCancel={() => {
+                  keyframeDragRef.current = null;
                 }}
                 title={`${KEYFRAME_PROP_LABELS[m.prop]} @ ${m.time.toFixed(2)}s`}
               />

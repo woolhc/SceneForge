@@ -6,6 +6,7 @@ import type {
   AppSettings,
   FfmpegStatus,
   MediaSource,
+  PexelsSearchResult,
   Project,
   ProjectSummary,
   RenderResult,
@@ -473,12 +474,15 @@ async function webFallback<T>(command: string, args?: Record<string, unknown>): 
   }
 
   if (command === "search_pexels_videos") {
-    const request = args?.request as { query: string; ratio: string; perPage?: number };
+    const request = args?.request as { query: string; ratio: string; perPage?: number; page?: number };
     const portrait = request.ratio === "9:16";
-    const assets: MediaSource[] = Array.from({ length: request.perPage || 3 }).map((_, index) => ({
+    const page = request.page ?? 1;
+    const perPage = request.perPage || 3;
+    const totalResults = perPage * 3;
+    const assets: MediaSource[] = Array.from({ length: perPage }).map((_, index) => ({
       id: uid("pexels"),
       kind: "video",
-      title: `${request.query || "Pexels"} #${index + 1}`,
+      title: `${request.query || "Pexels"} #${(page - 1) * perPage + index + 1}`,
       url: null,
       localPath: null,
       proxyPath: null,
@@ -491,16 +495,24 @@ async function webFallback<T>(command: string, args?: Record<string, unknown>): 
       duration: 14 + index * 2,
       source: "pexels",
     }));
-    return assets as T;
+    return {
+      assets,
+      page,
+      hasMore: page * perPage < totalResults,
+      totalResults,
+    } as PexelsSearchResult as T;
   }
 
   if (command === "search_pexels_photos") {
-    const request = args?.request as { query: string; ratio: string; perPage?: number };
+    const request = args?.request as { query: string; ratio: string; perPage?: number; page?: number };
     const portrait = request.ratio === "9:16";
-    const assets: MediaSource[] = Array.from({ length: request.perPage || 3 }).map((_, index) => ({
+    const page = request.page ?? 1;
+    const perPage = request.perPage || 3;
+    const totalResults = perPage * 3;
+    const assets: MediaSource[] = Array.from({ length: perPage }).map((_, index) => ({
       id: uid("pexels-photo"),
       kind: "image",
-      title: `${request.query || "Pexels"} #${index + 1}`,
+      title: `${request.query || "Pexels"} #${(page - 1) * perPage + index + 1}`,
       url: null,
       localPath: null,
       proxyPath: null,
@@ -513,7 +525,12 @@ async function webFallback<T>(command: string, args?: Record<string, unknown>): 
       duration: 5,
       source: "pexels",
     }));
-    return assets as T;
+    return {
+      assets,
+      page,
+      hasMore: page * perPage < totalResults,
+      totalResults,
+    } as PexelsSearchResult as T;
   }
 
   if (command === "cache_asset_video") {
@@ -805,10 +822,10 @@ export const desktopApi = {
   },
   segmentScript: (request: { script: string; ratio: string }) =>
     call<SegmentScriptResult>("segment_script", { request }),
-  searchPexelsVideos: (request: { query: string; ratio: string; perPage?: number }) =>
-    call<MediaSource[]>("search_pexels_videos", { request }),
-  searchPexelsPhotos: (request: { query: string; ratio: string; perPage?: number }) =>
-    call<MediaSource[]>("search_pexels_photos", { request }),
+  searchPexelsVideos: (request: { query: string; ratio: string; perPage?: number; page?: number }) =>
+    call<PexelsSearchResult>("search_pexels_videos", { request }),
+  searchPexelsPhotos: (request: { query: string; ratio: string; perPage?: number; page?: number }) =>
+    call<PexelsSearchResult>("search_pexels_photos", { request }),
   cacheAssetVideo: (asset: MediaSource) =>
     call<MediaSource>("cache_asset_video", { request: { asset } }),
   importMedia: (sourcePath: string) =>
@@ -872,7 +889,7 @@ export const desktopApi = {
     ratio: string;
     materialDirection?: string;
   }) => call<AiSegment[]>("enrich_segments", { request }),
-  renderProject: (request: { projectId: string; preview: boolean; outputPath?: string | null }) =>
+  renderProject: (request: { projectId: string; preview: boolean; outputPath?: string | null; ratio?: string | null }) =>
     call<RenderResult>("render_project", { request }),
   /** T3.3: 取消正在进行的渲染任务 */
   cancelRender: () => call<void>("cancel_render"),

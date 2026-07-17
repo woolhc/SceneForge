@@ -1,10 +1,13 @@
 use serde::Deserialize;
 
-use crate::models::{AppSettings, MediaSource, PexelsSearchRequest};
+use crate::models::{AppSettings, MediaSource, PexelsSearchRequest, PexelsSearchResult};
 
 #[derive(Debug, Deserialize)]
 struct PexelsVideoResponse {
     videos: Vec<PexelsVideo>,
+    page: u32,
+    per_page: u32,
+    total_results: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,7 +34,7 @@ struct PexelsVideoFile {
 pub async fn search_videos(
     settings: &AppSettings,
     request: PexelsSearchRequest,
-) -> anyhow::Result<Vec<MediaSource>> {
+) -> anyhow::Result<PexelsSearchResult> {
     let api_key = settings.pexels_api_key.trim();
     if api_key.is_empty() {
         anyhow::bail!("请先在设置中配置 Pexels API Key");
@@ -49,11 +52,13 @@ pub async fn search_videos(
     };
 
     let per_page = request.per_page.unwrap_or(6).clamp(1, 12).to_string();
+    let page = request.page.unwrap_or(1).max(1).to_string();
     let mut url = reqwest::Url::parse("https://api.pexels.com/videos/search")?;
     url.query_pairs_mut()
         .append_pair("query", query)
         .append_pair("orientation", orientation)
-        .append_pair("per_page", per_page.as_str());
+        .append_pair("per_page", per_page.as_str())
+        .append_pair("page", page.as_str());
 
     let client = crate::ffmpeg::http_client();
     let response = client
@@ -69,12 +74,18 @@ pub async fn search_videos(
     }
 
     let payload: PexelsVideoResponse = serde_json::from_str(&body)?;
+    let has_more = payload.page.saturating_mul(payload.per_page) < payload.total_results;
     let assets = payload
         .videos
         .into_iter()
         .filter_map(|video| video_to_source(video, request.ratio.as_str()))
         .collect();
-    Ok(assets)
+    Ok(PexelsSearchResult {
+        assets,
+        page: payload.page,
+        has_more,
+        total_results: payload.total_results,
+    })
 }
 
 fn video_to_source(video: PexelsVideo, ratio: &str) -> Option<MediaSource> {
@@ -97,6 +108,7 @@ fn video_to_source(video: PexelsVideo, ratio: &str) -> Option<MediaSource> {
         height,
         duration: video.duration,
         source: "pexels".to_string(),
+        ..Default::default()
     })
 }
 
@@ -142,6 +154,9 @@ fn choose_video_file<'a>(files: &'a [PexelsVideoFile], ratio: &str) -> Option<&'
 #[derive(Debug, Deserialize)]
 struct PexelsPhotoResponse {
     photos: Vec<PexelsPhoto>,
+    page: u32,
+    per_page: u32,
+    total_results: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,7 +178,7 @@ struct PexelsPhotoSrc {
 pub async fn search_photos(
     settings: &AppSettings,
     request: PexelsSearchRequest,
-) -> anyhow::Result<Vec<MediaSource>> {
+) -> anyhow::Result<PexelsSearchResult> {
     let api_key = settings.pexels_api_key.trim();
     if api_key.is_empty() {
         anyhow::bail!("请先在设置中配置 Pexels API Key");
@@ -181,11 +196,13 @@ pub async fn search_photos(
     };
 
     let per_page = request.per_page.unwrap_or(6).clamp(1, 12).to_string();
+    let page = request.page.unwrap_or(1).max(1).to_string();
     let mut url = reqwest::Url::parse("https://api.pexels.com/v1/search")?;
     url.query_pairs_mut()
         .append_pair("query", query)
         .append_pair("orientation", orientation)
-        .append_pair("per_page", per_page.as_str());
+        .append_pair("per_page", per_page.as_str())
+        .append_pair("page", page.as_str());
 
     let client = crate::ffmpeg::http_client();
     let response = client
@@ -201,12 +218,18 @@ pub async fn search_photos(
     }
 
     let payload: PexelsPhotoResponse = serde_json::from_str(&body)?;
+    let has_more = payload.page.saturating_mul(payload.per_page) < payload.total_results;
     let assets = payload
         .photos
         .into_iter()
         .map(|photo| photo_to_source(photo))
         .collect();
-    Ok(assets)
+    Ok(PexelsSearchResult {
+        assets,
+        page: payload.page,
+        has_more,
+        total_results: payload.total_results,
+    })
 }
 
 fn photo_to_source(photo: PexelsPhoto) -> MediaSource {
@@ -226,5 +249,6 @@ fn photo_to_source(photo: PexelsPhoto) -> MediaSource {
         height: photo.height,
         duration: 0.0,
         source: "pexels".to_string(),
+        ..Default::default()
     }
 }

@@ -95,7 +95,7 @@ export type GenerateNarrationResult = {
 // 核心数据模型：剪映式的 Track + Clip 多轨道结构
 // ============================================================================
 
-export type TrackKind = "video" | "image" | "voiceover" | "audio" | "subtitle";
+export type TrackKind = "video" | "image" | "voiceover" | "audio" | "subtitle" | "text";
 
 export type MediaSource = {
   id: string;
@@ -117,6 +117,19 @@ export type MediaSource = {
   duration: number;
   /** "pexels" | "local" | "tts" */
   source: string;
+  /** 用户自定标签（素材库筛选用） */
+  tags?: string[] | null;
+  /** 是否收藏 */
+  favorite?: boolean | null;
+  /** 最近一次被拖入时间线的时间（ISO 8601） */
+  lastUsedAt?: string | null;
+};
+
+export type PexelsSearchResult = {
+  assets: MediaSource[];
+  page: number;
+  hasMore: boolean;
+  totalResults: number;
 };
 
 export type SubtitleStyle = {
@@ -160,6 +173,8 @@ export type SubtitleStyle = {
   animationOut?: string;
   /** T4.8: 动画时长（秒，默认 0.3） */
   animationDuration?: number;
+  /** 花字装饰模板 id（关联 textTemplates.ts 的 TextTemplate.decoration）。仅预览生效，导出降级为纯文字。 */
+  decorationId?: string | null;
 };
 
 /** 单个词/字符的时间戳（用于逐字高亮） */
@@ -208,7 +223,9 @@ export type Keyframe = {
   /** 相对 clip 起点的秒数 */
   time: number;
   value: number;
-  easing: "linear" | "easeIn" | "easeOut" | "easeInOut";
+  easing: "linear" | "easeIn" | "easeOut" | "easeInOut" | "bezier";
+  /** easing === "bezier" 时的三次贝塞尔控制点 [x1,y1,x2,y2]，参考 CSS cubic-bezier */
+  bezierPoints?: [number, number, number, number];
 };
 
 /** T4.2: clip 的关键帧集合（每个属性一组按 time 排序的关键帧） */
@@ -246,10 +263,12 @@ export type ClipMask = {
 
 /** 视觉特效项（剪映式"特效"面板） */
 export type ClipVisualEffect = {
-  /** 特效类型：vignette | flicker | shake | glow | mirror | invert | grayscale */
+  /** 特效类型：vignette | flicker | shake | glow | mirror | invert | grayscale | chromakey */
   kind: string;
-  /** 强度 0-100 */
+  /** 强度 0-100；chromakey 下映射为抠像容差（similarity） */
   intensity: number;
+  /** 抠像目标色（十六进制），仅 kind="chromakey" 使用，默认绿幕 #00FF00 */
+  chromaKeyColor?: string;
 };
 
 export type TransitionConfig = {
@@ -281,6 +300,8 @@ export type Clip = {
   fadeOut: number;
   /** 音频降噪强度 0-100（0=关闭；映射到 afftdn nr 0-25dB） */
   noiseReduction?: number;
+  /** 变声/音效预设 id（null=无）。仅导出生效，预览不处理（需要 AudioWorklet 才能实时预览，成本高） */
+  voiceEffect?: string | null;
   /** 滤镜名称 */
   filter?: string | null;
   /** 色彩调节：亮度 -100~100 */
@@ -468,6 +489,15 @@ export const DEFAULT_SUBTITLE_STYLE: SubtitleStyle = {
   animationIn: "none",
   animationOut: "none",
   animationDuration: 0.3,
+};
+
+/** 独立文本图层默认样式：不挂 ASR，更大字号、居中，贴近"标题"场景 */
+export const DEFAULT_TEXT_LAYER_STYLE: SubtitleStyle = {
+  ...DEFAULT_SUBTITLE_STYLE,
+  fontSize: 64,
+  position: "center",
+  y: 50,
+  karaoke: false,
 };
 
 /** 根据项目比例和导出分辨率计算视频实际宽度（像素）。

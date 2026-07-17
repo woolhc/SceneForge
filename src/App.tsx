@@ -5,6 +5,7 @@ import {
   Copy,
   Crop as CropIcon,
   Bookmark,
+  Grid3x3,
   ImagePlay,
   Loader2,
   Mic2,
@@ -13,6 +14,7 @@ import {
   Plus,
   Scissors,
   Search,
+  Shield,
   SkipBack,
   SkipForward,
   SlidersHorizontal,
@@ -31,6 +33,7 @@ import type {
   Clip,
   ClipKeyframes,
   ClipTransform,
+  Keyframe,
   FfmpegStatus,
   MediaSource,
   Project,
@@ -45,10 +48,12 @@ import type {
   WhisperModelDownloadProgress,
   WhisperModelStatus,
 } from "./types";
-import { DEFAULT_SUBTITLE_STYLE, DEFAULT_TRANSFORM, DEFAULT_CROP, videoWidthForProject } from "./types";
+import { DEFAULT_SUBTITLE_STYLE, DEFAULT_TEXT_LAYER_STYLE, DEFAULT_TRANSFORM, DEFAULT_CROP, videoWidthForProject } from "./types";
 import type { AiSegment } from "./types";
 import { FONT_OPTIONS } from "./fonts";
 import { SubtitleOverlay } from "./preview/SubtitleOverlay";
+import { VisualLayerOverlay } from "./preview/VisualLayerOverlay";
+import { MaskOverlay } from "./preview/MaskOverlay";
 import { quantizeSubtitleClock, subtitleNeedsLiveClock } from "./preview/subtitleClock";
 import { ContextMenu } from "./timeline/ContextMenu";
 import { ExportDialog } from "./panels/ExportDialog";
@@ -79,7 +84,7 @@ import {
   toggleTrackMuted,
 } from "./editor/timelineActions";
 import { runGeneratePipeline, type GeneratePipelineInput } from "./editor/pipeline";
-import { mergeCachedMediaSource } from "./editor/mediaCache";
+import { mergeCachedMediaSource, updateMediaSource } from "./editor/mediaCache";
 import { selectAssetCandidate, type AssetSelectionResult } from "./editor/assetSelection";
 import { buildTranscriptSubtitleProject, prepareTranscriptSubtitles } from "./editor/subtitleFromTranscript";
 import { requestSubtitleSemanticAdvice } from "./editor/subtitles/semanticAdvice";
@@ -120,12 +125,24 @@ import {
 import {
   addKeyframe,
   findKeyframeAt,
+  moveKeyframe,
   removeKeyframeAt,
   updateKeyframeEasing,
 } from "./editor/keyframes";
 import { Ruler } from "./timeline/Ruler";
 import { TimelineTrack } from "./timeline/TimelineTrack";
-import { shouldStartTimelinePan } from "./timeline/clipInteraction";
+import {
+  shouldStartTimelinePan,
+  hasExceededPointerDragThreshold,
+  pxToSeconds,
+  computeDraggedClip,
+  computeTrackAtY,
+  isClipTrackCompatible,
+  resolveCrossTrackDrop,
+  type DragHandle,
+  type DragState,
+  type TrackLayoutEntry,
+} from "./timeline/clipInteraction";
 import { realignTimeline } from "./timeline/realignTimeline";
 import { MediaPanel } from "./panels/MediaPanel";
 import { TextPanel } from "./panels/TextPanel";
@@ -218,6 +235,44 @@ function PlayheadLine({ totalDuration }: { totalDuration: number }) {
     <div
       className="playhead"
       style={{ left: `calc(44px + (100% - 58px) * ${percent / 100})` }}
+    />
+  );
+}
+
+/** P0-4：拖拽时命中吸附点后渲染的横跨全部轨道的竖线，坐标系与 PlayheadLine 一致 */
+function SnapLine({ time, totalDuration }: { time: number; totalDuration: number }) {
+  const percent = totalDuration > 0 ? Math.min(100, (time / totalDuration) * 100) : 0;
+  return (
+    <div
+      className="timeline-snap-line"
+      style={{ left: `calc(44px + (100% - 58px) * ${percent / 100})` }}
+    />
+  );
+}
+
+/** P0-3：跨轨拖拽悬停时的目标轨道预览条（纯视觉，不代表已生效，松手时才判定是否真的跨轨） */
+function CrossTrackGhost({
+  left,
+  width,
+  top,
+  height,
+  blocked,
+}: {
+  left: number;
+  width: number;
+  top: number;
+  height: number;
+  blocked: boolean;
+}) {
+  return (
+    <div
+      className={`timeline-cross-track-ghost ${blocked ? "blocked" : ""}`}
+      style={{
+        left: `calc(44px + (100% - 58px) * ${left / 100})`,
+        width: `calc((100% - 58px) * ${width / 100})`,
+        top,
+        height,
+      }}
     />
   );
 }
@@ -552,6 +607,12 @@ export function App() {
   const [voiceReferenceDrafts, setVoiceReferenceDrafts] = useState<Record<string, string>>({});
   const [assetCandidates, setAssetCandidates] = useState<Record<string, MediaSource[]>>({});
   const [assetQueryDraft, setAssetQueryDraft] = useState("");
+  const [libraryPagination, setLibraryPagination] = useState<{
+    query: string;
+    mode: "video" | "photo";
+    page: number;
+    hasMore: boolean;
+  } | null>(null);
   const [assetCachingIds, setAssetCachingIds] = useState<Set<string>>(new Set());
   const activeToolTab = useUiStore((s) => s.activeToolTab);
   const setActiveToolTab = useUiStore((s) => s.setActiveToolTab);
@@ -591,14 +652,21 @@ export function App() {
   const exportState = useUiStore((s) => s.exportState);
   const setExportState = useUiStore((s) => s.setExportState);
   const exportPath = useUiStore((s) => s.exportPath);
+  const exportPaths = useUiStore((s) => s.exportPaths);
   const exportError = useUiStore((s) => s.exportError);
   const exportProgress = useUiStore((s) => s.exportProgress);
   const setExportProgress = useUiStore((s) => s.setExportProgress);
   const exportMessage = useUiStore((s) => s.exportMessage);
   const setExportMessage = useUiStore((s) => s.setExportMessage);
+  const exportEtaSeconds = useUiStore((s) => s.exportEtaSeconds);
+  const setExportEtaSeconds = useUiStore((s) => s.setExportEtaSeconds);
   // 预览窗口缩放
   const previewZoom = useUiStore((s) => s.previewZoom);
   const setPreviewZoom = useUiStore((s) => s.setPreviewZoom);
+  const showSafeArea = useUiStore((s) => s.showSafeArea);
+  const setShowSafeArea = useUiStore((s) => s.setShowSafeArea);
+  const showGrid = useUiStore((s) => s.showGrid);
+  const setShowGrid = useUiStore((s) => s.setShowGrid);
   const [showPreviewDebug, setShowPreviewDebug] = useState(false);
   const [previewDebugInfo, setPreviewDebugInfo] = useState<Record<string, string>>({});
   const [view, setView] = useState<"home" | "editor">("home");
@@ -625,10 +693,14 @@ export function App() {
     async function setup() {
       if ("__TAURI_INTERNALS__" in window) {
         const { listen } = await import("@tauri-apps/api/event");
-        unlisten = await listen<{ progress: number; message: string }>("render-progress", (event) => {
-          setExportProgress(event.payload.progress);
-          setExportMessage(event.payload.message || "");
-        });
+        unlisten = await listen<{ progress: number; message: string; etaSeconds?: number }>(
+          "render-progress",
+          (event) => {
+            setExportProgress(event.payload.progress);
+            setExportMessage(event.payload.message || "");
+            setExportEtaSeconds(event.payload.etaSeconds ?? null);
+          },
+        );
       }
     }
     void setup();
@@ -638,7 +710,13 @@ export function App() {
   const [timelineHeightPct, setTimelineHeightPct] = useState(35);
   const bootstrapped = useRef(false);
   const timelineScrollRef = useRef<HTMLDivElement | null>(null);
+  const timelineCanvasRef = useRef<HTMLDivElement | null>(null);
   const timelineDrag = useRef({ active: false, x: 0, left: 0 });
+  // 跨轨拖拽（P0-3）+ 吸附线（P0-4）：拖拽状态提升到父级，因为需要看到全部轨道布局
+  const timelineClipDragRef = useRef<DragState | null>(null);
+  const [activeSnapLine, setActiveSnapLine] = useState<number | null>(null);
+  const [dragHoverTrackId, setDragHoverTrackId] = useState<string | null>(null);
+  const [dragHoverBlocked, setDragHoverBlocked] = useState(false);
   const stageRef = useRef<HTMLDivElement | null>(null);
   // T4.1: 画中画叠加层容器（PreviewEngine 在里面动态管理 overlay video）
   const overlayContainerRef = useRef<HTMLDivElement | null>(null);
@@ -773,7 +851,10 @@ export function App() {
   }
 
   /** 修改播放头处关键帧的 easing（遍历所有属性） */
-  function setKeyframeEasingAtPlayhead(easing: "linear" | "easeIn" | "easeOut" | "easeInOut") {
+  function setKeyframeEasingAtPlayhead(
+    easing: "linear" | "easeIn" | "easeOut" | "easeInOut" | "bezier",
+    bezierPoints?: [number, number, number, number],
+  ) {
     if (!selectedClip) return;
     const currentTime = usePlaybackStore.getState().currentTime;
     const relTime = Math.max(0, currentTime - selectedClip.startOnTrack);
@@ -783,7 +864,7 @@ export function App() {
     const next = { ...cur };
     for (const prop of props) {
       if (findKeyframeAt(cur[prop], relTime)) {
-        next[prop] = updateKeyframeEasing(cur[prop], relTime, easing);
+        next[prop] = updateKeyframeEasing(cur[prop], relTime, easing, bezierPoints);
         changed = true;
       }
     }
@@ -803,7 +884,12 @@ export function App() {
   }
 
   /** 获取播放头处关键帧的 easing（取第一个命中的） */
-  function getKeyframeEasingAtPlayhead(): "linear" | "easeIn" | "easeOut" | "easeInOut" | null {
+  function getKeyframeEasingAtPlayhead(): "linear" | "easeIn" | "easeOut" | "easeInOut" | "bezier" | null {
+    return getKeyframeAtPlayhead()?.easing ?? null;
+  }
+
+  /** 获取播放头处第一个命中的关键帧完整对象（含 bezierPoints），用于曲线编辑器 */
+  function getKeyframeAtPlayhead(): Keyframe | null {
     if (!selectedClip) return null;
     const currentTime = usePlaybackStore.getState().currentTime;
     const relTime = Math.max(0, currentTime - selectedClip.startOnTrack);
@@ -811,7 +897,7 @@ export function App() {
     const props = ["x", "y", "scale", "opacity", "rotation", "volume"] as const;
     for (const prop of props) {
       const kf = findKeyframeAt(cur[prop], relTime);
-      if (kf) return kf.easing;
+      if (kf) return kf;
     }
     return null;
   }
@@ -1494,16 +1580,21 @@ export function App() {
     }
   }
 
-  /** 手动添加一条空字幕到字幕轨末尾 */
+  /** 手动添加一条空字幕到字幕轨末尾；没有字幕轨时自动创建 */
   function handleAddManualSubtitle() {
     if (!project) return;
-    const subtitleTrack = project.tracks
+    const existingTrack = project.tracks
       .filter((t) => t.kind === "subtitle")
       .sort((a, b) => a.order - b.order)[0];
-    if (!subtitleTrack) {
-      setStatus("没有字幕轨，请先在时间线添加字幕轨");
-      return;
-    }
+    const maxOrder = project.tracks.reduce((max, track) => Math.max(max, track.order), -1);
+    const subtitleTrack: Track = existingTrack ?? {
+      id: newTrackId("subtitle"),
+      kind: "subtitle",
+      name: nextTrackName(project, "subtitle"),
+      order: maxOrder + 1,
+      muted: false,
+      locked: false,
+    };
     const subtitleClips = project.clips.filter((c) => c.trackId === subtitleTrack.id);
     const endTime = subtitleClips.reduce((max, c) => Math.max(max, c.startOnTrack + c.duration), 0);
     const newClip: Clip = {
@@ -1526,8 +1617,59 @@ export function App() {
       transitionIn: null,
       transitionOut: null,
     };
-    void persist({ ...project, clips: [...project.clips, newClip] }, "已添加字幕");
+    const tracks = existingTrack ? project.tracks : [...project.tracks, subtitleTrack];
+    void persist({ ...project, tracks, clips: [...project.clips, newClip] }, "已添加字幕");
     setSelectedClipId(newClip.id);
+  }
+
+  /** 添加一个独立文本图层：没有文字轨时自动创建，插入位置取播放头 */
+  function handleAddTextLayer() {
+    if (!project) return;
+    const existingTrack = project.tracks
+      .filter((t) => t.kind === "text")
+      .sort((a, b) => a.order - b.order)[0];
+    const maxOrder = project.tracks.reduce((max, track) => Math.max(max, track.order), -1);
+    const textTrack: Track = existingTrack ?? {
+      id: newTrackId("text"),
+      kind: "text",
+      name: nextTrackName(project, "text"),
+      order: maxOrder + 1,
+      muted: false,
+      locked: false,
+    };
+    const startOnTrack = usePlaybackStore.getState().currentTime;
+    const newClip: Clip = {
+      id: newClipId(),
+      trackId: textTrack.id,
+      sourceId: null,
+      startOnTrack,
+      duration: 3,
+      sourceIn: 0,
+      sourceOut: 3,
+      speed: 1,
+      volume: 1,
+      fadeIn: 0,
+      fadeOut: 0,
+      brightness: 0,
+      contrast: 0,
+      saturation: 0,
+      text: "新文本",
+      subtitleStyle: { ...DEFAULT_TEXT_LAYER_STYLE },
+      transitionIn: null,
+      transitionOut: null,
+    };
+    const tracks = existingTrack ? project.tracks : [...project.tracks, textTrack];
+    void persist({ ...project, tracks, clips: [...project.clips, newClip] }, "已添加文本图层");
+    setSelectedClipId(newClip.id);
+  }
+
+  /** 应用花字模板到当前选中的文本图层；未选中文本图层时提示先新建 */
+  function handleApplyTextTemplate(style: Partial<SubtitleStyle>) {
+    if (selectedClip && selectedClipTrack?.kind === "text") {
+      updateSelectedClip({ subtitleStyle: { ...(selectedClip.subtitleStyle ?? DEFAULT_TEXT_LAYER_STYLE), ...style } });
+      return;
+    }
+    setStatus("请先新建或选中一个文本图层，再应用花字模板");
   }
 
   /** 导入 SRT 字幕文件：解析后端 -> 生成字幕 clip 到字幕轨 */
@@ -2006,7 +2148,7 @@ export function App() {
     },
   ): Promise<AssetSelectionResult> {
     try {
-      const assets = await desktopApi.searchPexelsVideos({ query, ratio, perPage: 8 });
+      const { assets } = await desktopApi.searchPexelsVideos({ query, ratio, perPage: 8 });
       setAssetCandidates((previous) => ({ ...previous, [clipId]: assets }));
       const result = selectAssetCandidate(assets, {
         clipId,
@@ -2161,7 +2303,7 @@ export function App() {
       updateSelectedClip({ visualQuery: query });
     }
     try {
-      const assets = await desktopApi.searchPexelsVideos({ query, ratio: project.ratio, perPage: 8 });
+      const { assets } = await desktopApi.searchPexelsVideos({ query, ratio: project.ratio, perPage: 8 });
       setAssetCandidates((previous) => ({ ...previous, [selectedClip.id]: assets }));
       if (assets[0]) {
         await bindAssetToClip(project.id, selectedClip.id, assets[0]);
@@ -2388,7 +2530,7 @@ export function App() {
     if (!project) return;
     const next = mergeSubtitleCueWithNext(project, cueId);
     if (!next) {
-      setStatus("无法合并：需要同一未锁定字幕轨上的下一条单语字幕");
+      setStatus("无法合并：单语需有同轨下一条字幕；双语需原文、译文两轨都有对应的下一组且轨道未锁定");
       return;
     }
     void persist(next, "已合并字幕");
@@ -2513,6 +2655,19 @@ export function App() {
     }
   }
 
+  const clipsByTrackId = useMemo(() => {
+    const map = new Map<string, Clip[]>();
+    if (!project) return map;
+    for (const track of project.tracks) {
+      map.set(track.id, []);
+    }
+    for (const clip of project.clips) {
+      const clips = map.get(clip.trackId);
+      if (clips) clips.push(clip);
+    }
+    return map;
+  }, [project?.clips, project?.tracks]);
+
   /** 时间线拖拽回写：拖动中只更新本地 state（不保存），释放时提交。 */
   // 交互式编辑（拖拽/滑块）开始时记录快照，commit 时用它压入撤销栈（避免中间态污染）
   const interactiveEditSnapshotRef = useRef<Project | null>(null);
@@ -2556,9 +2711,117 @@ export function App() {
     }
   }
 
-  function handleClipCommit(_clipId: string) {
-    // 兼容旧调用点（已由 handleClipDrag commit=true 取代）
+  function handleKeyframeDrag(
+    clipId: string,
+    prop: keyof ClipKeyframes,
+    kfIndex: number,
+    newTime: number,
+    commit: boolean,
+  ) {
+    if (!project) return;
+    if (!commit && !interactiveEditSnapshotRef.current) {
+      interactiveEditSnapshotRef.current = structuredClone(project);
+    }
+    const next: Project = {
+      ...project,
+      clips: project.clips.map((c) => {
+        if (c.id !== clipId || !c.keyframes) return c;
+        return {
+          ...c,
+          keyframes: {
+            ...c.keyframes,
+            [prop]: moveKeyframe(c.keyframes[prop], kfIndex, { time: newTime }),
+          },
+        };
+      }),
+    };
+    setProject(next);
+    if (commit) {
+      const snapshot = interactiveEditSnapshotRef.current;
+      interactiveEditSnapshotRef.current = null;
+      void persistWithSnapshot(next, snapshot, "已调整关键帧");
+    }
   }
+
+  /** 测量当前时间线各轨道相对 .timeline-canvas 顶部的像素布局，用于跨轨拖拽命中判定 */
+  function getTrackLayout(): TrackLayoutEntry[] {
+    const canvas = timelineCanvasRef.current;
+    if (!canvas) return [];
+    const canvasTop = canvas.getBoundingClientRect().top;
+    const trackEls = canvas.querySelectorAll<HTMLDivElement>(":scope > .track");
+    return Array.from(trackEls).map((el) => {
+      const rect = el.getBoundingClientRect();
+      return {
+        trackId: el.dataset.trackId ?? "",
+        top: rect.top - canvasTop,
+        height: rect.height,
+      };
+    });
+  }
+
+  const handleTimelineDragStart = useCallback((clip: Clip, handle: DragHandle, clientX: number, _clientY: number, trackId: string) => {
+    const peers = (clipsByTrackId.get(trackId) ?? []).filter((c) => c.id !== clip.id);
+    timelineClipDragRef.current = {
+      clipId: clip.id,
+      handle,
+      startX: clientX,
+      initial: structuredClone(clip),
+      peers,
+      playhead: usePlaybackStore.getState().currentTime,
+      activated: false,
+      sourceTrackId: trackId,
+      currentTrackId: trackId,
+      crossTrackEnabled: handle === "body" && selectedClipIds.length <= 1,
+    };
+  }, [clipsByTrackId, selectedClipIds]);
+
+  const handleTimelineDragMove = useCallback((clientX: number, clientY: number) => {
+    const drag = timelineClipDragRef.current;
+    if (!drag || !project) return;
+    if (!drag.activated) {
+      if (!hasExceededPointerDragThreshold(drag.startX, clientX)) return;
+      drag.activated = true;
+    }
+    const deltaSeconds = pxToSeconds(clientX - drag.startX, pxPerSecond);
+    const source = drag.initial.sourceId ? project.media.find((m) => m.id === drag.initial.sourceId) : null;
+    const sourceDuration = source?.duration;
+    const { patch, snapLine } = computeDraggedClip(drag, deltaSeconds, sourceDuration, pxPerSecond);
+    drag.lastPatch = patch;
+    setActiveSnapLine(snapLine);
+    handleClipDrag(drag.clipId, patch, false);
+
+    if (drag.crossTrackEnabled) {
+      const layout = getTrackLayout();
+      const canvasTop = timelineCanvasRef.current?.getBoundingClientRect().top ?? 0;
+      const hitTrackId = computeTrackAtY(clientY - canvasTop, layout);
+      if (hitTrackId && hitTrackId !== drag.sourceTrackId) {
+        const targetTrack = project.tracks.find((t) => t.id === hitTrackId);
+        const compatible = targetTrack ? isClipTrackCompatible(drag.initial, targetTrack, project.media) : false;
+        drag.currentTrackId = hitTrackId;
+        setDragHoverTrackId(hitTrackId);
+        setDragHoverBlocked(!compatible);
+      } else {
+        drag.currentTrackId = drag.sourceTrackId;
+        setDragHoverTrackId(null);
+        setDragHoverBlocked(false);
+      }
+    }
+  }, [project, pxPerSecond]);
+
+  const handleTimelineDragEnd = useCallback(() => {
+    const drag = timelineClipDragRef.current;
+    timelineClipDragRef.current = null;
+    setActiveSnapLine(null);
+    setDragHoverTrackId(null);
+    setDragHoverBlocked(false);
+    if (!drag || !drag.lastPatch) return;
+    let finalPatch = drag.lastPatch;
+    if (drag.crossTrackEnabled && drag.currentTrackId !== drag.sourceTrackId && !dragHoverBlocked) {
+      const targetTrackClips = (clipsByTrackId.get(drag.currentTrackId) ?? []).filter((c) => c.id !== drag.clipId);
+      finalPatch = resolveCrossTrackDrop(finalPatch, drag.initial, drag.currentTrackId, targetTrackClips);
+    }
+    handleClipDrag(drag.clipId, finalPatch, true);
+  }, [clipsByTrackId, dragHoverBlocked]);
 
   /**
    * 插入 clip 到轨道的指定位置（剪映式插入模式）：
@@ -2610,17 +2873,26 @@ export function App() {
     }
   }
 
+  /** 切换素材收藏状态 */
+  function handleToggleFavorite(asset: MediaSource) {
+    const current = projectRef.current;
+    if (!current) return;
+    const next = updateMediaSource(current, asset.id, { favorite: !asset.favorite });
+    void persist(next, asset.favorite ? `已取消收藏：${asset.title}` : `已收藏：${asset.title}`);
+  }
+
   /** 搜索 Pexels，结果加入素材库（而非直接绑到某 clip） */
   async function handleSearchPexelsLibrary(query: string) {
     if (!project) return;
     setBusy("library-search");
     setStatus(`正在搜索 Pexels 视频：${query}`);
     try {
-      const assets = await desktopApi.searchPexelsVideos({ query, ratio: project.ratio, perPage: 8 });
+      const { assets, page, hasMore } = await desktopApi.searchPexelsVideos({ query, ratio: project.ratio, perPage: 8 });
       // 合并去重加入素材库
       const existing = new Set(project.media.map((m) => m.id));
       const additions = assets.filter((a) => !existing.has(a.id));
       const next: Project = { ...project, media: [...project.media, ...additions] };
+      setLibraryPagination({ query, mode: "video", page, hasMore });
       void persist(next, `已加入 ${additions.length} 个视频素材到素材库`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -2635,11 +2907,36 @@ export function App() {
     setBusy("library-search");
     setStatus(`正在搜索 Pexels 图片：${query}`);
     try {
-      const assets = await desktopApi.searchPexelsPhotos({ query, ratio: project.ratio, perPage: 8 });
+      const { assets, page, hasMore } = await desktopApi.searchPexelsPhotos({ query, ratio: project.ratio, perPage: 8 });
       const existing = new Set(project.media.map((m) => m.id));
       const additions = assets.filter((a) => !existing.has(a.id));
       const next: Project = { ...project, media: [...project.media, ...additions] };
+      setLibraryPagination({ query, mode: "photo", page, hasMore });
       void persist(next, `已加入 ${additions.length} 张图片到素材库`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /** 加载 Pexels 搜索结果的下一页，追加到素材库 */
+  async function handleLoadMorePexels() {
+    if (!project || !libraryPagination || !libraryPagination.hasMore) return;
+    const { query, mode, page } = libraryPagination;
+    setBusy("library-search");
+    setStatus(`正在加载更多${mode === "video" ? "视频" : "图片"}素材...`);
+    try {
+      const nextPage = page + 1;
+      const result =
+        mode === "video"
+          ? await desktopApi.searchPexelsVideos({ query, ratio: project.ratio, perPage: 8, page: nextPage })
+          : await desktopApi.searchPexelsPhotos({ query, ratio: project.ratio, perPage: 8, page: nextPage });
+      const existing = new Set(project.media.map((m) => m.id));
+      const additions = result.assets.filter((a) => !existing.has(a.id));
+      const next: Project = { ...project, media: [...project.media, ...additions] };
+      setLibraryPagination({ query, mode, page: result.page, hasMore: result.hasMore });
+      void persist(next, `已加入 ${additions.length} 个素材到素材库`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -2654,10 +2951,11 @@ export function App() {
   async function handleAddToTimeline(asset: MediaSource) {
     const current = projectRef.current;
     if (!current) return;
-    // 把素材加入素材库（去重）
+    // 把素材加入素材库（去重），并刷新最近使用时间
+    const lastUsedAt = new Date().toISOString();
     const media = current.media.some((m) => m.id === asset.id)
-      ? current.media
-      : [...current.media, asset];
+      ? current.media.map((m) => (m.id === asset.id ? { ...m, lastUsedAt } : m))
+      : [...current.media, { ...asset, lastUsedAt }];
     const currentWithMedia = { ...current, media };
 
     const selectedTrack = selectedClip
@@ -2778,9 +3076,10 @@ export function App() {
       transitionOut: null,
     };
     // 用插入模式：放到光标位置，后面的 clip 自动往后推
+    const lastUsedAt = new Date().toISOString();
     const updatedMedia = current.media.some((m) => m.id === asset.id)
-      ? current.media
-      : [...current.media, asset];
+      ? current.media.map((m) => (m.id === asset.id ? { ...m, lastUsedAt } : m))
+      : [...current.media, { ...asset, lastUsedAt }];
     const nextWithMedia = { ...current, media: updatedMedia };
     const next = insertClipToTrack(nextWithMedia, trackId, newClip, finalStart);
     void persist(next, `已添加到${track.name}：${asset.title}`);
@@ -2791,18 +3090,6 @@ export function App() {
   }
 
   const timelineWidth = Math.max(840, totalDuration * pxPerSecond);
-  const clipsByTrackId = useMemo(() => {
-    const map = new Map<string, Clip[]>();
-    if (!project) return map;
-    for (const track of project.tracks) {
-      map.set(track.id, []);
-    }
-    for (const clip of project.clips) {
-      const clips = map.get(clip.trackId);
-      if (clips) clips.push(clip);
-    }
-    return map;
-  }, [project?.clips, project?.tracks]);
   const handleTimelineSelectClip = useCallback((id: string, additive: boolean, range?: boolean) => {
     selectClip(id, additive, range);
     const c = project?.clips.find((clip) => clip.id === id);
@@ -3072,8 +3359,11 @@ export function App() {
                 onImportLocal={handleImportLocal}
                 onSearchVideos={handleSearchPexelsLibrary}
                 onSearchPhotos={handleSearchPexelsPhotos}
+                hasMore={libraryPagination?.hasMore ?? false}
+                onLoadMore={handleLoadMorePexels}
                 onPreview={setPreviewingAsset}
                 onAddToTimeline={handleAddToTimeline}
+                onToggleFavorite={handleToggleFavorite}
               />
             )}
             {activeToolTab === "text" && (
@@ -3082,10 +3372,12 @@ export function App() {
                 busy={busy}
                 onScriptChange={(script) => updateProjectPatch({ script })}
                 onAiSegment={handleSegmentScript}
+                onAddTextLayer={handleAddTextLayer}
+                onApplyTextTemplate={handleApplyTextTemplate}
               />
             )}
             {activeToolTab === "subtitle" && (
-              <>
+              <div className="panel-content subtitle-editor-panel">
                 <SubtitlePanel
                   busy={busy}
                   onRecognizeSubtitles={handleRecognizeSubtitles}
@@ -3105,7 +3397,7 @@ export function App() {
                   onMergeCue={handleSubtitleWorkbenchMerge}
                   onFixIssue={(cueId, issue) => handleSubtitleWorkbenchQuickFix(cueId, issue.type)}
                 />
-              </>
+              </div>
             )}
             {activeToolTab === "audio" && (
               <AudioPanel
@@ -3228,6 +3520,22 @@ export function App() {
               <button className="zoom-btn" title="放大" onClick={() => setPreviewZoom((z) => Math.min(200, z + 25))}>
                 <ZoomIn size={14} />
               </button>
+              <button
+                className={`zoom-btn ${showSafeArea ? "active" : ""}`}
+                title="安全区参考线"
+                aria-label="安全区参考线"
+                onClick={() => setShowSafeArea((v) => !v)}
+              >
+                <Shield size={14} />
+              </button>
+              <button
+                className={`zoom-btn ${showGrid ? "active" : ""}`}
+                title="网格参考线"
+                aria-label="网格参考线"
+                onClick={() => setShowGrid((v) => !v)}
+              >
+                <Grid3x3 size={14} />
+              </button>
               {isDevelopmentPreview && (
                 <button
                   className={`zoom-btn ${showPreviewDebug ? "active" : ""}`}
@@ -3252,6 +3560,13 @@ export function App() {
             style={{ transform: `scale(${previewZoom / 100})`, transformOrigin: "center center" }}
           >
             <div className="stage-grid" />
+            {showGrid && <div className="stage-grid-overlay" />}
+            {showSafeArea && (
+              <>
+                <div className="stage-safe-area-overlay stage-safe-area-outer" />
+                <div className="stage-safe-area-overlay stage-safe-area-inner" />
+              </>
+            )}
             {/* 素材库悬停预览覆盖层：优先级最高，悬停素材时大图预览 */}
             {previewingSrc && (
               <div className="stage-preview-overlay">
@@ -3291,7 +3606,8 @@ export function App() {
             )}
             {/* 字幕叠层：选中字幕 clip 时用 SubtitleOverlay（react-moveable）；否则纯渲染 */}
             {(() => {
-              const isSelectedSubtitle = selectedClipTrack?.kind === "subtitle" && !!selectedClip;
+              const isSelectedSubtitle =
+                (selectedClipTrack?.kind === "subtitle" || selectedClipTrack?.kind === "text") && !!selectedClip;
               // 编辑模式优先：双击字幕 → textarea 直接编辑
               if (isSelectedSubtitle && subtitleEditing && selectedClip) {
                 const s = selectedClip.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE };
@@ -3372,6 +3688,28 @@ export function App() {
               }
               return <StageSubtitleLayer fontScale={fontScale} />;
             })()}
+            {selectedClip && selectedClipTrack && isVisualTrackKind(selectedClipTrack.kind) && (
+              <VisualLayerOverlay
+                clip={selectedClip}
+                targetRef={stageRef}
+                isSelected
+                onMove={(x, y) => updateOverlayTransform({ x, y }, false)}
+                onMoveEnd={() => commitInteractiveEdit()}
+                onScale={(scale) => updateOverlayTransform({ scale }, false)}
+                onScaleEnd={() => commitInteractiveEdit()}
+                onRotate={(rotation) => updateOverlayTransform({ rotation }, false)}
+                onRotateEnd={() => commitInteractiveEdit()}
+              />
+            )}
+            {selectedClip && selectedClipTrack && isVisualTrackKind(selectedClipTrack.kind) && selectedClip.mask && (
+              <MaskOverlay
+                clip={selectedClip}
+                mask={selectedClip.mask}
+                isSelected
+                onChange={(patch) => updateSelectedClip({ mask: { ...selectedClip.mask!, ...patch } }, false)}
+                onCommit={() => commitInteractiveEdit()}
+              />
+            )}
           </div>
           </div>
           )}
@@ -3548,7 +3886,7 @@ export function App() {
                   <textarea value={selectedClip.text || ""} onChange={(event) => updateSelectedClip({ text: event.target.value }, false)} onBlur={() => commitInteractiveEdit()} />
                 </label>
               )}
-              {selectedClipTrack.kind === "subtitle" && (
+              {(selectedClipTrack.kind === "subtitle" || selectedClipTrack.kind === "text") && (
                 <SubtitleInspector
                   clip={selectedClip}
                   onClipChange={updateSelectedClip}
@@ -3937,10 +4275,15 @@ export function App() {
                       transform={overlayTransform}
                       hasKeyframe={hasKeyframeAtPlayhead()}
                       easing={getKeyframeEasingAtPlayhead()}
+                      bezierPoints={getKeyframeAtPlayhead()?.bezierPoints}
                       onAdd={addKeyframeAtPlayhead}
                       onRemove={removeKeyframeAtPlayhead}
                       onClear={() => updateSelectedClip({ keyframes: null })}
                       onEasingChange={setKeyframeEasingAtPlayhead}
+                      onCurveChange={(property, next) =>
+                        updateSelectedClip({ keyframes: { ...(selectedClip.keyframes ?? {}), [property]: next } }, false)
+                      }
+                      onCurveCommit={() => commitInteractiveEdit()}
                     />
                   )}
                   {isVisualTrackKind(selectedClipTrack.kind) && (
@@ -4006,6 +4349,7 @@ export function App() {
                   <button onClick={() => handleAddTrack("voiceover")}>配音轨</button>
                   <button onClick={() => handleAddTrack("audio")}>音频轨</button>
                   <button onClick={() => handleAddTrack("subtitle")}>字幕轨</button>
+                  <button onClick={() => handleAddTrack("text")}>文字轨</button>
                 </div>
               )}
             </div>
@@ -4043,7 +4387,7 @@ export function App() {
           onPointerCancel={handleTimelinePointerUp}
           onWheel={handleTimelineWheel}
         >
-          <div className="timeline-canvas" style={{ width: timelineWidth }}>
+          <div ref={timelineCanvasRef} className="timeline-canvas" style={{ width: timelineWidth }}>
             <Ruler totalDuration={totalDuration} pxPerSecond={pxPerSecond} onSeek={seek} fps={project?.renderConfig?.fps ?? 30} />
             {/* 章节标记：在 ruler 下方按时间位置渲染，点击 seek 到该时间 */}
             {(project?.chapters ?? []).length > 0 && (
@@ -4082,6 +4426,26 @@ export function App() {
               否则它会基于 canvas 全宽计算，和 clip/ruler 错位。
             */}
             <PlayheadLine totalDuration={totalDuration} />
+            {activeSnapLine !== null && <SnapLine time={activeSnapLine} totalDuration={totalDuration} />}
+            {dragHoverTrackId && (() => {
+              const layout = getTrackLayout();
+              const hoverEntry = layout.find((entry) => entry.trackId === dragHoverTrackId);
+              const drag = timelineClipDragRef.current;
+              if (!hoverEntry || !drag) return null;
+              const start = drag.lastPatch?.startOnTrack ?? drag.initial.startOnTrack;
+              const duration = drag.lastPatch?.duration ?? drag.initial.duration;
+              const leftPct = totalDuration > 0 ? (start / totalDuration) * 100 : 0;
+              const widthPct = totalDuration > 0 ? (duration / totalDuration) * 100 : 0;
+              return (
+                <CrossTrackGhost
+                  left={leftPct}
+                  width={widthPct}
+                  top={hoverEntry.top}
+                  height={hoverEntry.height}
+                  blocked={dragHoverBlocked}
+                />
+              );
+            })()}
             {project?.tracks
               .slice()
               .sort((a, b) => a.order - b.order)
@@ -4098,8 +4462,10 @@ export function App() {
                   selectedClipIds={selectedClipIds}
                   locked={track.locked}
                   onSelectClip={handleTimelineSelectClip}
-                  onClipDrag={handleClipDrag}
-                  onClipCommit={handleClipCommit}
+                  isDragBlocked={track.id === dragHoverTrackId && dragHoverBlocked}
+                  onDragStart={handleTimelineDragStart}
+                  onDragMove={handleTimelineDragMove}
+                  onDragEnd={handleTimelineDragEnd}
                   onBoxSelect={selectClipsByBox}
                   onDropAsset={handleDropAssetToTrack}
                   onContextMenu={handleTimelineContextMenu}
@@ -4110,6 +4476,7 @@ export function App() {
                   onMoveDown={handleTimelineMoveDown}
                   onDeleteTrack={handleTimelineDeleteTrack}
                   onKeyframeClick={handleKeyframeClick}
+                  onKeyframeDrag={handleKeyframeDrag}
                   onEditSubtitleStyle={handleEditSubtitleStyle}
                 />
               ))}
@@ -4215,13 +4582,16 @@ export function App() {
             void desktopApi.saveProject(next);
           }
         }}
+        currentRatio={project?.ratio ?? "9:16"}
         onExport={handleRenderFinal}
         onCancel={() => { void desktopApi.cancelRender(); }}
         exportState={exportState}
         exportProgress={exportProgress}
         exportMessage={exportMessage}
+        exportEtaSeconds={exportEtaSeconds}
         defaultName={project?.title || "导出视频"}
         outputPath={exportPath}
+        outputPaths={exportPaths}
         errorMessage={exportError}
       />
 

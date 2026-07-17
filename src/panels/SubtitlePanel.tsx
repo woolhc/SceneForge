@@ -30,7 +30,7 @@ export function SubtitlePanel({
   }, []);
 
   return (
-    <div className="panel-content">
+    <div className="subtitle-panel-content">
       <div className="text-section">
         <div className="text-section-title">
           <Captions size={15} />

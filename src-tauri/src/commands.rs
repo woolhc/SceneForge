@@ -9,7 +9,7 @@ use crate::models::{
     AppInfo, AppSettings, CacheAssetRequest, Clip, CreateProjectRequest, CreateVoiceProfileRequest,
     FfmpegStatus, FilmstripRequest, GenerateAudioRequest, GenerateNarrationRequest,
     GenerateNarrationResult, ImportMediaRequest, ImportVoiceProfileRequest, MediaSource,
-    PexelsSearchRequest, Project, ProjectSummary, RenderProjectRequest, RenderResult,
+    PexelsSearchRequest, PexelsSearchResult, Project, ProjectSummary, RenderProjectRequest, RenderResult,
     ReplaceVoiceSampleRequest, SegmentScriptRequest, SegmentScriptResult, ThumbnailRequest, Track,
     TrackKind, UpdateVoiceProfileRequest, VoicePreviewRequest, VoicePreviewResult, VoiceProfile,
     WordCue,
@@ -395,6 +395,7 @@ pub fn add_track(
         "voiceover" => crate::models::TrackKind::Voiceover,
         "audio" => crate::models::TrackKind::Audio,
         "subtitle" => crate::models::TrackKind::Subtitle,
+        "text" => crate::models::TrackKind::Text,
         other => return Err(format!("未知轨道类型：{other}")),
     };
     let next_order = project.tracks.iter().map(|t| t.order).max().unwrap_or(0) + 1;
@@ -532,6 +533,7 @@ pub async fn generate_narration(
         height: 0,
         duration,
         source: "tts".to_string(),
+        ..Default::default()
     };
     project.media.push(audio_source);
 
@@ -568,7 +570,7 @@ pub async fn segment_script(
 pub async fn search_pexels_videos(
     state: State<'_, AppState>,
     request: PexelsSearchRequest,
-) -> Result<Vec<MediaSource>, String> {
+) -> Result<PexelsSearchResult, String> {
     let settings = {
         let conn = state.db.lock().map_err(map_error)?;
         storage::load_settings(&conn).map_err(map_error)?
@@ -583,7 +585,7 @@ pub async fn search_pexels_videos(
 pub async fn search_pexels_photos(
     state: State<'_, AppState>,
     request: PexelsSearchRequest,
-) -> Result<Vec<MediaSource>, String> {
+) -> Result<PexelsSearchResult, String> {
     let settings = {
         let conn = state.db.lock().map_err(map_error)?;
         storage::load_settings(&conn).map_err(map_error)?
@@ -704,6 +706,7 @@ pub async fn generate_audio(
             height: 0,
             duration: real_duration,
             source: "tts".to_string(),
+            ..Default::default()
         };
         let mut existing = None;
         if let Some(idx) = project.media.iter().position(|m| m.id == source_id) {
@@ -821,6 +824,7 @@ pub async fn detach_audio(
         height: 0,
         duration,
         source: "extracted".to_string(),
+        ..Default::default()
     };
     let conn = state.db.lock().map_err(map_error)?;
     let mut latest = storage::get_project(&conn, &request.project_id).map_err(map_error)?;
@@ -872,6 +876,7 @@ pub async fn detach_audio(
         fade_in: clip.fade_in,
         fade_out: clip.fade_out,
         noise_reduction: 0.0,
+        voice_effect: None,
         filter: None,
         brightness: 0.0,
         contrast: 0.0,
@@ -965,6 +970,7 @@ pub async fn separate_vocals(
         height: 0,
         duration: clip.duration,
         source: "vocals".to_string(),
+        ..Default::default()
     };
     let inst_source = MediaSource {
         id: format!("inst-{}", uuid::Uuid::new_v4()),
@@ -981,6 +987,7 @@ pub async fn separate_vocals(
         height: 0,
         duration: clip.duration,
         source: "instrumental".to_string(),
+        ..Default::default()
     };
     let conn = state.db.lock().map_err(map_error)?;
     let mut latest = storage::get_project(&conn, &request.project_id).map_err(map_error)?;
@@ -1037,6 +1044,7 @@ pub async fn separate_vocals(
             fade_in: 0.0,
             fade_out: 0.0,
             noise_reduction: 0.0,
+        voice_effect: None,
             filter: None,
             brightness: 0.0,
             contrast: 0.0,
@@ -1350,6 +1358,7 @@ pub async fn generate_subtitles(
                         fade_in: 0.0,
                         fade_out: 0.0,
                         noise_reduction: 0.0,
+        voice_effect: None,
                         filter: None,
                         brightness: 0.0,
                         contrast: 0.0,
@@ -1394,6 +1403,7 @@ pub async fn generate_subtitles(
                     fade_in: 0.0,
                     fade_out: 0.0,
                     noise_reduction: 0.0,
+        voice_effect: None,
                     filter: None,
                     brightness: 0.0,
                     contrast: 0.0,
@@ -1438,6 +1448,7 @@ pub async fn generate_subtitles(
                     fade_in: 0.0,
                     fade_out: 0.0,
                     noise_reduction: 0.0,
+        voice_effect: None,
                     filter: None,
                     brightness: 0.0,
                     contrast: 0.0,
@@ -1626,6 +1637,7 @@ pub async fn import_srt(
             fade_in: 0.0,
             fade_out: 0.0,
             noise_reduction: 0.0,
+        voice_effect: None,
             filter: None,
             brightness: 0.0,
             contrast: 0.0,
@@ -1782,6 +1794,7 @@ pub async fn import_media(
         height,
         duration,
         source: "local".to_string(),
+        ..Default::default()
     })
 }
 
@@ -2256,10 +2269,16 @@ pub async fn render_project(
         .render_cancel
         .store(false, std::sync::atomic::Ordering::Relaxed);
 
-    let project = {
+    let mut project = {
         let conn = state.db.lock().map_err(map_error)?;
         storage::get_project(&conn, &request.project_id).map_err(map_error)?
     };
+    // P3-4: 批量多比例导出时按请求覆盖比例，仅影响本次渲染，不落库
+    if let Some(ref ratio) = request.ratio {
+        if !ratio.is_empty() {
+            project.ratio = ratio.clone();
+        }
+    }
 
     let _ = app_handle.emit(
         "render-progress",
@@ -2327,13 +2346,25 @@ pub async fn render_project(
         }
     }
 
-    // T3.3: 进度回调，把段级进度通过事件发到前端
+    // T3.3/P3-3: 进度回调，把段级进度 + 剩余时间预估通过事件发到前端
+    // ETA 用 (总时长-已完成)/已完成*已耗时 估算，并做指数滑动平均减少抖动
     let app_handle_clone = app_handle.clone();
+    let render_start = std::time::Instant::now();
+    let smoothed_eta: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
     let progress_cb = move |percent: u32, phase: &str| {
-        let _ = app_handle_clone.emit(
-            "render-progress",
-            serde_json::json!({ "progress": percent, "message": phase }),
-        );
+        let mut payload = serde_json::json!({ "progress": percent, "message": phase });
+        if percent > 0 && percent < 100 {
+            let elapsed = render_start.elapsed().as_secs_f64();
+            let raw_eta = elapsed * (100.0 - percent as f64) / (percent as f64);
+            let mut guard = smoothed_eta.lock().unwrap();
+            let eta = match *guard {
+                Some(prev) => prev * 0.7 + raw_eta * 0.3,
+                None => raw_eta,
+            };
+            *guard = Some(eta);
+            payload["etaSeconds"] = serde_json::json!(eta.max(0.0).round() as u64);
+        }
+        let _ = app_handle_clone.emit("render-progress", payload);
     };
     let cancel_flag = &state.render_cancel;
 

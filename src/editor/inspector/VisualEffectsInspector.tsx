@@ -9,6 +9,7 @@ const effectOptions = [
   { id: "grayscale", label: "灰度" },
   { id: "flicker", label: "闪烁" },
   { id: "shake", label: "抖动" },
+  { id: "chromakey", label: "抠像/绿幕" },
 ] as const;
 
 function effectLabel(kind: string): string {
@@ -42,22 +43,38 @@ export function VisualEffectsInspector({
         })}
       </div>
       {(effects ?? []).map((effect, index) => (
-        <label key={effect.kind} className="style-field">
-          {effectLabel(effect.kind)}（{effect.intensity.toFixed(0)}）
-          <input
-            type="range"
-            min={0}
-            max={100}
-            step={5}
-            value={effect.intensity}
-            onChange={(event) => {
-              const next = [...(effects ?? [])];
-              next[index] = { ...next[index], intensity: Number(event.target.value) };
-              onChange(next, false);
-            }}
-            onPointerUp={onCommit}
-          />
-        </label>
+        <div key={effect.kind} className="style-field-column">
+          <label className="style-field">
+            {effect.kind === "chromakey" ? "容差" : effectLabel(effect.kind)}（{effect.intensity.toFixed(0)}）
+            <input
+              type="range"
+              min={0}
+              max={100}
+              step={5}
+              value={effect.intensity}
+              onChange={(event) => {
+                const next = [...(effects ?? [])];
+                next[index] = { ...next[index], intensity: Number(event.target.value) };
+                onChange(next, false);
+              }}
+              onPointerUp={onCommit}
+            />
+          </label>
+          {effect.kind === "chromakey" && (
+            <label className="style-field">
+              抠像颜色
+              <input
+                type="color"
+                value={effect.chromaKeyColor || "#00FF00"}
+                onChange={(event) => {
+                  const next = [...(effects ?? [])];
+                  next[index] = { ...next[index], chromaKeyColor: event.target.value };
+                  onChange(next);
+                }}
+              />
+            </label>
+          )}
+        </div>
       ))}
       <small className="style-hint">视觉特效在导出时生效</small>
     </div>

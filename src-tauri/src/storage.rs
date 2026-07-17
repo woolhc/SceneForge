@@ -550,6 +550,7 @@ mod tests {
             height: 1080,
             duration: 5.0,
             source: "pexels".to_string(),
+            ..Default::default()
         }
     }
 

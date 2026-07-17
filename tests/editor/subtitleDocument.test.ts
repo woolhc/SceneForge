@@ -236,16 +236,165 @@ assert.equal(mergedCue.text, "Hello world again Final cue");
 assert.ok(Math.abs(mergedCue.duration - 2.9) < 1e-9);
 assert.equal(mergedCue.words?.length, 5);
 
-const grouped = {
+const bilingualProject = {
   ...splitProject,
-  clips: splitProject.clips.map((clip) => ({
-    ...clip,
-    subtitleGroupId: "pair",
-  })),
+  tracks: [
+    {
+      id: "source-track",
+      kind: "subtitle",
+      name: "原文",
+      order: 0,
+      muted: false,
+      locked: false,
+    },
+    {
+      id: "target-track",
+      kind: "subtitle",
+      name: "译文",
+      order: 1,
+      muted: false,
+      locked: false,
+    },
+  ],
+  clips: [
+    {
+      ...splitProject.clips[0],
+      id: "source-current",
+      trackId: "source-track",
+      startOnTrack: 1,
+      duration: 2,
+      sourceOut: 2,
+      text: "Hello world again",
+      subtitleGroupId: "current-pair",
+      subtitleRole: "source",
+    },
+    {
+      ...splitProject.clips[0],
+      id: "target-current",
+      trackId: "target-track",
+      startOnTrack: 1.05,
+      duration: 1.9,
+      sourceOut: 1.9,
+      text: "你好，世界",
+      words: null,
+      subtitleGroupId: "current-pair",
+      subtitleRole: "target",
+    },
+    {
+      ...splitProject.clips[1],
+      id: "source-next",
+      trackId: "source-track",
+      subtitleGroupId: "next-pair",
+      subtitleRole: "source",
+    },
+    {
+      ...splitProject.clips[1],
+      id: "target-next",
+      trackId: "target-track",
+      startOnTrack: 3.1,
+      duration: 0.85,
+      sourceOut: 0.85,
+      text: "最后一句",
+      words: null,
+      subtitleGroupId: "next-pair",
+      subtitleRole: "target",
+    },
+  ],
+} as Project;
+
+assert.equal(canSplitSubtitleCue(bilingualProject, "target-current", 1.55), true);
+const splitPair = splitSubtitleCueAtTime(
+  bilingualProject,
+  "target-current",
+  1.55,
+)!;
+const splitGroups = new Map<string, typeof splitPair.clips>();
+for (const cue of splitPair.clips) {
+  const groupId = cue.subtitleGroupId;
+  if (!groupId) continue;
+  splitGroups.set(groupId, [...(splitGroups.get(groupId) ?? []), cue]);
+}
+assert.equal(splitGroups.size, 3);
+assert.ok([...splitGroups.values()].every((cues) => cues.length === 2));
+assert.equal(canMergeSubtitleCueWithNext(splitPair, "source-current"), true);
+const roundTripPair = mergeSubtitleCueWithNext(splitPair, "source-current")!;
+const roundTripSource = roundTripPair.clips.find(
+  (clip) => clip.id === "source-current",
+)!;
+const roundTripTarget = roundTripPair.clips.find(
+  (clip) => clip.id === "target-current",
+)!;
+assert.equal(roundTripPair.clips.length, bilingualProject.clips.length);
+assert.equal(roundTripSource.text, "Hello world again");
+assert.equal(roundTripTarget.text, "你好，世界");
+assert.equal(roundTripSource.startOnTrack, roundTripTarget.startOnTrack);
+assert.equal(roundTripSource.duration, roundTripTarget.duration);
+
+assert.equal(canMergeSubtitleCueWithNext(bilingualProject, "source-current"), true);
+assert.equal(canMergeSubtitleCueWithNext(bilingualProject, "target-current"), true);
+const mergedPair = mergeSubtitleCueWithNext(
+  bilingualProject,
+  "target-current",
+)!;
+assert.equal(mergedPair.clips.length, 2);
+assert.ok(!mergedPair.clips.some((clip) => clip.subtitleGroupId === "next-pair"));
+const mergedSource = mergedPair.clips.find(
+  (clip) => clip.id === "source-current",
+)!;
+const mergedTarget = mergedPair.clips.find(
+  (clip) => clip.id === "target-current",
+)!;
+assert.equal(mergedSource.subtitleGroupId, "current-pair");
+assert.equal(mergedTarget.subtitleGroupId, "current-pair");
+assert.equal(mergedSource.text, "Hello world again Final cue");
+assert.equal(mergedTarget.text, "你好，世界最后一句");
+assert.equal(mergedSource.words?.length, 5);
+assert.equal(mergedTarget.words, null);
+assert.equal(mergedSource.startOnTrack, mergedTarget.startOnTrack);
+assert.equal(mergedSource.duration, mergedTarget.duration);
+assert.equal(mergedSource.startOnTrack, 1);
+assert.ok(Math.abs(mergedSource.duration - 2.95) < 1e-9);
+
+const missingTargetNext = {
+  ...bilingualProject,
+  clips: bilingualProject.clips.filter((clip) => clip.id !== "target-next"),
 };
-assert.equal(canSplitSubtitleCue(grouped, "split-1", 1.55), false);
-assert.equal(splitSubtitleCueAtTime(grouped, "split-1", 1.55), null);
-assert.equal(canMergeSubtitleCueWithNext(grouped, "split-1"), false);
+assert.equal(
+  canMergeSubtitleCueWithNext(missingTargetNext, "source-current"),
+  false,
+);
+assert.equal(
+  mergeSubtitleCueWithNext(missingTargetNext, "source-current"),
+  null,
+);
+
+const mismatchedNextGroup = {
+  ...bilingualProject,
+  clips: bilingualProject.clips.map((clip) =>
+    clip.id === "target-next"
+      ? { ...clip, subtitleGroupId: "different-next-pair" }
+      : clip,
+  ),
+};
+assert.equal(
+  canMergeSubtitleCueWithNext(mismatchedNextGroup, "target-current"),
+  false,
+);
+
+const lockedTargetTrack = {
+  ...bilingualProject,
+  tracks: bilingualProject.tracks.map((track) =>
+    track.id === "target-track" ? { ...track, locked: true } : track,
+  ),
+};
+assert.equal(
+  canMergeSubtitleCueWithNext(lockedTargetTrack, "source-current"),
+  false,
+);
+assert.equal(
+  mergeSubtitleCueWithNext(lockedTargetTrack, "source-current"),
+  null,
+);
 
 const qualityProject = {
   ...splitProject,

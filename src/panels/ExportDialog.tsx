@@ -5,17 +5,26 @@ import { desktopApi } from "../tauri";
 
 export type ExportState = "idle" | "exporting" | "done" | "error";
 
+const RATIO_OPTIONS = [
+  { v: "9:16", label: "9:16 竖屏" },
+  { v: "16:9", label: "16:9 横屏" },
+  { v: "1:1", label: "1:1 方形" },
+];
+
 export function ExportDialog({
   open,
   onClose,
   config,
   onConfigChange,
+  currentRatio,
   onExport,
   onCancel,
   exportState,
   exportProgress,
   exportMessage,
+  exportEtaSeconds,
   outputPath,
+  outputPaths,
   errorMessage,
   defaultName,
 }: {
@@ -23,19 +32,35 @@ export function ExportDialog({
   onClose: () => void;
   config: RenderConfig;
   onConfigChange: (config: RenderConfig) => void;
-  onExport: (outputPath: string | null) => void;
+  /** 项目当前比例，作为多比例导出勾选框的默认选中项 */
+  currentRatio: string;
+  onExport: (outputPath: string | null, ratios?: string[]) => void;
   onCancel?: () => void;
   exportState: ExportState;
   exportProgress?: number;
   exportMessage?: string;
+  exportEtaSeconds?: number | null;
   outputPath?: string | null;
+  /** 批量多比例导出时，所有已完成文件的路径 */
+  outputPaths?: string[];
   errorMessage?: string;
   defaultName: string;
 }) {
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [savePath, setSavePath] = useState<string | null>(null);
+  const [selectedRatios, setSelectedRatios] = useState<string[]>([currentRatio]);
 
   if (!open) return null;
+
+  function toggleRatio(ratio: string) {
+    setSelectedRatios((cur) => {
+      if (cur.includes(ratio)) {
+        const next = cur.filter((r) => r !== ratio);
+        return next.length > 0 ? next : cur; // 至少保留一项
+      }
+      return [...cur, ratio];
+    });
+  }
 
   const resolutions = [
     { v: "480p", label: "480p · 流畅", w: "854×480" },
@@ -64,6 +89,12 @@ export function ExportDialog({
   const matchedPreset = presets.find((p) =>
     Object.entries(p.patch).every(([k, v]) => (config as Record<string, unknown>)[k] === v),
   );
+
+  function formatEta(seconds: number): string {
+    if (seconds < 60) return `约 ${Math.round(seconds)} 秒`;
+    const minutes = Math.round(seconds / 60);
+    return `约 ${minutes} 分钟`;
+  }
 
   return (
     <div className="modal-backdrop" onClick={exportState === "exporting" ? undefined : onClose}>
@@ -116,6 +147,28 @@ export function ExportDialog({
                   </button>
                 ))}
               </div>
+            </div>
+
+            {/* 多比例批量导出 */}
+            <div className="export-section">
+              <div className="export-section-title">导出比例（可多选，批量导出）</div>
+              <div className="ratio-checkbox-row">
+                {RATIO_OPTIONS.map((r) => (
+                  <label key={r.v} className="ratio-checkbox">
+                    <input
+                      type="checkbox"
+                      checked={selectedRatios.includes(r.v)}
+                      onChange={() => toggleRatio(r.v)}
+                    />
+                    {r.label}
+                  </label>
+                ))}
+              </div>
+              {selectedRatios.length > 1 && (
+                <small className="style-hint">
+                  将依次渲染 {selectedRatios.length} 个文件，文件名自动加比例后缀
+                </small>
+              )}
             </div>
 
             {/* 分辨率选择 */}
@@ -220,9 +273,9 @@ export function ExportDialog({
             {/* 导出按钮 */}
             <div className="modal-actions">
               <button onClick={onClose}>取消</button>
-              <button className="primary-button" onClick={() => onExport(savePath)}>
+              <button className="primary-button" onClick={() => onExport(savePath, selectedRatios)}>
                 <Download size={16} />
-                开始导出
+                {selectedRatios.length > 1 ? `开始批量导出 (${selectedRatios.length})` : "开始导出"}
               </button>
             </div>
           </>
@@ -236,7 +289,10 @@ export function ExportDialog({
             <div className="export-progress-bar">
               <div className="export-progress-fill" style={{ width: `${exportProgress ?? 0}%` }} />
             </div>
-            <span className="export-progress-pct">{exportProgress ?? 0}%</span>
+            <span className="export-progress-pct">
+              {exportProgress ?? 0}%
+              {exportEtaSeconds != null && exportEtaSeconds > 0 ? ` · 剩余${formatEta(exportEtaSeconds)}` : ""}
+            </span>
             {onCancel && (
               <button className="export-cancel-btn" onClick={onCancel}>
                 取消导出
@@ -249,8 +305,21 @@ export function ExportDialog({
         {exportState === "done" && (
           <div className="export-done">
             <CheckCircle2 size={48} color="var(--accent)" />
-            <strong>导出成功！</strong>
-            {outputPath && (
+            <strong>{outputPaths && outputPaths.length > 1 ? `批量导出成功！共 ${outputPaths.length} 个文件` : "导出成功！"}</strong>
+            {outputPaths && outputPaths.length > 1 ? (
+              <>
+                {outputPaths.map((p) => (
+                  <code key={p} className="export-path">{p}</code>
+                ))}
+                <div className="modal-actions">
+                  <button onClick={onClose}>关闭</button>
+                  <button className="primary-button" onClick={() => void desktopApi.revealInFinder(outputPaths[0])}>
+                    <FolderOpen size={16} />
+                    打开文件夹
+                  </button>
+                </div>
+              </>
+            ) : outputPath && (
               <>
                 <code className="export-path">{outputPath}</code>
                 <div className="modal-actions">
@@ -277,7 +346,7 @@ export function ExportDialog({
             <code className="export-error">{errorMessage}</code>
             <div className="modal-actions">
               <button onClick={onClose}>关闭</button>
-              <button className="primary-button" onClick={() => onExport(savePath)}>重试</button>
+              <button className="primary-button" onClick={() => onExport(savePath, selectedRatios)}>重试</button>
             </div>
           </div>
         )}

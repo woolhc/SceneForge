@@ -73,6 +73,24 @@ export function AudioInspector({
           <small className="style-hint">降低背景噪声（导出时生效）</small>
         </div>
       )}
+      {capabilities.canReduceNoise && (
+        <div className="style-field-column">
+          <label className="style-field">
+            变声/音效
+            <select
+              value={clip.voiceEffect ?? ""}
+              onChange={(event) => onClipChange({ voiceEffect: event.target.value || null })}
+            >
+              <option value="">无</option>
+              <option value="pitch_up">升调</option>
+              <option value="pitch_down">降调</option>
+              <option value="vibrato">颤音</option>
+              <option value="tremolo">震音</option>
+            </select>
+          </label>
+          <small className="style-hint">仅导出时生效，预览听到的仍是原声</small>
+        </div>
+      )}
     </div>
   );
 }

@@ -38,10 +38,15 @@ interface UiStore {
   showExport: boolean;
   exportState: ExportState;
   exportPath: string | null;
+  /** P3-4: 批量多比例导出时，所有已完成的输出路径（单比例导出时只有一项） */
+  exportPaths: string[];
   exportError: string;
   exportProgress: number;
   exportMessage: string;
+  exportEtaSeconds: number | null;
   previewZoom: number;
+  showSafeArea: boolean;
+  showGrid: boolean;
   toasts: Toast[];
 
   setEditorMode: (editorMode: EditorMode) => void;
@@ -56,10 +61,14 @@ interface UiStore {
   setShowExport: (showExport: boolean | ((previous: boolean) => boolean)) => void;
   setExportState: (exportState: ExportState) => void;
   setExportPath: (exportPath: string | null) => void;
+  setExportPaths: (exportPaths: string[]) => void;
   setExportError: (exportError: string) => void;
   setExportProgress: (exportProgress: number) => void;
   setExportMessage: (exportMessage: string) => void;
+  setExportEtaSeconds: (exportEtaSeconds: number | null) => void;
   setPreviewZoom: (next: number | ((previous: number) => number)) => void;
+  setShowSafeArea: (showSafeArea: boolean | ((previous: boolean) => boolean)) => void;
+  setShowGrid: (showGrid: boolean | ((previous: boolean) => boolean)) => void;
   pushToast: (toast: Omit<Toast, "id" | "createdAt">) => string;
   dismissToast: (id: string) => void;
   clearToasts: () => void;
@@ -80,10 +89,14 @@ export const useUiStore = create<UiStore>((set) => ({
   showExport: false,
   exportState: "idle",
   exportPath: null,
+  exportPaths: [],
   exportError: "",
   exportProgress: 0,
   exportMessage: "",
+  exportEtaSeconds: null,
   previewZoom: 100,
+  showSafeArea: false,
+  showGrid: false,
   toasts: [],
 
   setEditorMode: (editorMode) => set({ editorMode }),
@@ -123,12 +136,22 @@ export const useUiStore = create<UiStore>((set) => ({
     })),
   setExportState: (exportState) => set({ exportState }),
   setExportPath: (exportPath) => set({ exportPath }),
+  setExportPaths: (exportPaths) => set({ exportPaths }),
   setExportError: (exportError) => set({ exportError }),
   setExportProgress: (exportProgress) => set({ exportProgress }),
   setExportMessage: (exportMessage) => set({ exportMessage }),
+  setExportEtaSeconds: (exportEtaSeconds) => set({ exportEtaSeconds }),
   setPreviewZoom: (next) =>
     set((state) => ({
       previewZoom: typeof next === "function" ? next(state.previewZoom) : next,
+    })),
+  setShowSafeArea: (showSafeArea) =>
+    set((state) => ({
+      showSafeArea: typeof showSafeArea === "function" ? showSafeArea(state.showSafeArea) : showSafeArea,
+    })),
+  setShowGrid: (showGrid) =>
+    set((state) => ({
+      showGrid: typeof showGrid === "function" ? showGrid(state.showGrid) : showGrid,
     })),
   pushToast: (toast) => {
     const id = uid("toast");

@@ -140,7 +140,14 @@ fn parse_timestamp(s: &str) -> f64 {
 
 /// Whisper 就绪指引。安装包内置 whisper-cli，模型由应用首次使用流程管理。
 fn whisper_install_hint() -> String {
-    "请打开 SceneForge「设置 → 语音识别」下载推荐模型，或选择已有的 Whisper `.bin` 模型。若 whisper-cli 缺失，请重新安装 SceneForge；开发模式可在设置中指定本机命令。".to_string()
+    "请打开 SceneForge「设置 → 语音识别」下载推荐模型，或选择已有的 Whisper `.bin` 模型。若 whisper-cli 缺失，请重新安装 SceneForge；开发模式会优先使用系统 PATH 中可直接运行的 whisper-cli。".to_string()
+}
+
+fn whisper_failure_hint(stderr: &str) -> String {
+    if stderr.contains("Library not loaded") || stderr.contains("dyld[") {
+        return "whisper-cli 的 macOS 动态运行库不完整。开发模式请安装可直接运行的 Homebrew whisper-cpp，或在「设置 → 语音识别」指定完整的 whisper-cli 路径；正式安装包请重新安装。".to_string();
+    }
+    whisper_install_hint()
 }
 
 /// 调用 whisper-cli 识别音频，返回带时间戳的原始片段。
@@ -212,10 +219,11 @@ pub async fn transcribe_audio(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if stderr.is_empty() { stdout } else { stderr };
         anyhow::bail!(
             "whisper 识别失败：{}\n{}",
-            if stderr.is_empty() { stdout } else { stderr },
-            whisper_install_hint()
+            detail,
+            whisper_failure_hint(&detail)
         );
     }
 
@@ -913,7 +921,7 @@ fn split_text_by_punctuation(text: &str, max_chars: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{join_words_with_smart_separator, segment_subtitles_rules};
+    use super::{join_words_with_smart_separator, segment_subtitles_rules, whisper_failure_hint};
     use crate::models::{SubtitleCue, WordCue};
 
     fn word(text: &str, start: f64, end: f64) -> WordCue {
@@ -923,6 +931,13 @@ mod tests {
             end,
             confidence: Some(1.0),
         }
+    }
+
+    #[test]
+    fn dyld_failure_gets_runtime_library_guidance() {
+        let hint = whisper_failure_hint("dyld[1]: Library not loaded: @rpath/libwhisper.1.dylib");
+        assert!(hint.contains("动态运行库不完整"));
+        assert!(!hint.contains("下载推荐模型"));
     }
 
     #[test]

@@ -143,7 +143,7 @@ function SubtitleCueRow({
           <button
             disabled={!canMerge}
             onClick={onMerge}
-            title={cue.groupId ? "双语组合并将在后续支持" : "与下一条字幕合并"}
+            title={cue.groupId ? "同步合并原文与译文的下一组字幕" : "与下一条字幕合并"}
           >
             <Merge size={12} />
             合并

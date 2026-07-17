@@ -8,6 +8,6 @@ export function toggleVisualEffect(
   const active = current.some((effect) => effect.kind === kind);
   const next = active
     ? current.filter((effect) => effect.kind !== kind)
-    : [...current, { kind, intensity: 50 }];
+    : [...current, kind === "chromakey" ? { kind, intensity: 50, chromaKeyColor: "#00FF00" } : { kind, intensity: 50 }];
   return next.length > 0 ? next : null;
 }
