@@ -8,8 +8,28 @@ import type { Keyframe, ClipKeyframes } from "../types";
  * t 越界取端点值（首帧之前取首帧，末帧之后取末帧）。
  */
 
+/** 三次贝塞尔（CSS cubic-bezier 语义）在给定 t01 处沿 x/y 分量求值 */
+function cubicBezierComponent(t: number, p1: number, p2: number): number {
+  const mt = 1 - t;
+  return 3 * mt * mt * t * p1 + 3 * mt * t * t * p2 + t * t * t;
+}
+
+/** 已知目标 x（进度）反解贝塞尔参数 t（牛顿迭代，8 次足够精度），再求对应 y */
+function applyCubicBezier(x01: number, points: [number, number, number, number]): number {
+  const [x1, y1, x2, y2] = points;
+  let t = x01;
+  for (let i = 0; i < 8; i++) {
+    const x = cubicBezierComponent(t, x1, x2) - x01;
+    const dx = 3 * (1 - t) * (1 - t) * x1 + 6 * (1 - t) * t * (x2 - x1) + 3 * t * t * (1 - x2);
+    if (Math.abs(dx) < 1e-6) break;
+    t -= x / dx;
+    t = Math.max(0, Math.min(1, t));
+  }
+  return cubicBezierComponent(t, y1, y2);
+}
+
 /** 单个 easing 应用到归一化进度 [0,1] */
-function applyEasing(t01: number, easing: string): number {
+function applyEasing(t01: number, easing: string, bezierPoints?: [number, number, number, number]): number {
   switch (easing) {
     case "easeIn":
       return t01 * t01;
@@ -17,6 +37,8 @@ function applyEasing(t01: number, easing: string): number {
       return 1 - (1 - t01) * (1 - t01);
     case "easeInOut":
       return t01 < 0.5 ? 2 * t01 * t01 : 1 - Math.pow(-2 * t01 + 2, 2) / 2;
+    case "bezier":
+      return bezierPoints ? applyCubicBezier(t01, bezierPoints) : t01;
     case "linear":
     default:
       return t01;
@@ -46,7 +68,7 @@ export function sampleKeyframes(kfs: Keyframe[] | undefined, t: number): number 
   const span = b.time - a.time;
   if (span <= 0) return b.value;
   const t01 = (t - a.time) / span;
-  const eased = applyEasing(t01, b.easing || "linear");
+  const eased = applyEasing(t01, b.easing || "linear", b.bezierPoints);
   return a.value + (b.value - a.value) * eased;
 }
 
@@ -111,16 +133,29 @@ export function findKeyframeAt(
   return kfs.find((k) => Math.abs(k.time - time) <= tol) ?? null;
 }
 
-/** 修改指定时间（±tol）关键帧的 easing。返回新数组。 */
+/** 修改指定时间（±tol）关键帧的 easing（可选带贝塞尔控制点）。返回新数组。 */
 export function updateKeyframeEasing(
   kfs: Keyframe[] | undefined,
   time: number,
   easing: Keyframe["easing"],
+  bezierPoints?: [number, number, number, number],
   tol = 0.05,
 ): Keyframe[] {
   return (kfs ?? []).map((k) =>
-    Math.abs(k.time - time) <= tol ? { ...k, easing } : k,
+    Math.abs(k.time - time) <= tol ? { ...k, easing, bezierPoints: easing === "bezier" ? bezierPoints ?? k.bezierPoints ?? [0.42, 0, 0.58, 1] : undefined } : k,
   );
+}
+
+/** 更新指定索引关键帧的 time/value（用于曲线编辑器拖拽）。更新后按 time 重新排序。返回新数组。 */
+export function moveKeyframe(
+  kfs: Keyframe[] | undefined,
+  index: number,
+  patch: Partial<Pick<Keyframe, "time" | "value">>,
+): Keyframe[] {
+  const arr = kfs ?? [];
+  if (index < 0 || index >= arr.length) return arr;
+  const next = arr.map((k, i) => (i === index ? { ...k, ...patch } : k));
+  return next.sort((a, b) => a.time - b.time);
 }
 
 // ===== 手工验证用例（文件底部，方便核对，不自动执行）=====
