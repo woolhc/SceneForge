@@ -1,9 +1,37 @@
-import { Film, Image, Loader2, Search } from "lucide-react";
-import { useState } from "react";
+import { Film, Image, Loader2, Music, Search, Star } from "lucide-react";
+import { useMemo, useState } from "react";
 import { desktopApi } from "../tauri";
 import type { MediaSource } from "../types";
 
 type SearchMode = "video" | "image";
+type LibraryFilter = "all" | "video" | "image" | "audio" | "favorite" | "recent";
+
+const FILTER_TABS: { id: LibraryFilter; label: string }[] = [
+  { id: "all", label: "全部" },
+  { id: "video", label: "视频" },
+  { id: "image", label: "图片" },
+  { id: "audio", label: "音频" },
+  { id: "favorite", label: "收藏" },
+  { id: "recent", label: "最近使用" },
+];
+
+function filterMedia(media: MediaSource[], filter: LibraryFilter): MediaSource[] {
+  switch (filter) {
+    case "video":
+    case "image":
+    case "audio":
+      return media.filter((asset) => asset.kind === filter);
+    case "favorite":
+      return media.filter((asset) => asset.favorite);
+    case "recent":
+      return media
+        .filter((asset) => asset.lastUsedAt)
+        .slice()
+        .sort((a, b) => (b.lastUsedAt || "").localeCompare(a.lastUsedAt || ""));
+    default:
+      return media;
+  }
+}
 
 export function MediaLibrary({
   media,
@@ -11,20 +39,28 @@ export function MediaLibrary({
   previewingId,
   onSearchVideos,
   onSearchPhotos,
+  hasMore,
+  onLoadMore,
   onPreview,
   onAddToTimeline,
+  onToggleFavorite,
 }: {
   media: MediaSource[];
   busy: string | null;
   previewingId?: string | null;
   onSearchVideos: (query: string) => void;
   onSearchPhotos: (query: string) => void;
+  hasMore?: boolean;
+  onLoadMore?: () => void;
   onPreview: (asset: MediaSource | null) => void;
   onAddToTimeline: (asset: MediaSource) => void;
+  onToggleFavorite?: (asset: MediaSource) => void;
 }) {
   const [query, setQuery] = useState("");
   const [mode, setMode] = useState<SearchMode>("video");
+  const [filter, setFilter] = useState<LibraryFilter>("all");
   const searching = busy === "library-search";
+  const filteredMedia = useMemo(() => filterMedia(media, filter), [media, filter]);
 
   function doSearch() {
     const q = query.trim();
@@ -70,14 +106,26 @@ export function MediaLibrary({
         </button>
       </div>
 
+      <div className="library-filter-tabs">
+        {FILTER_TABS.map((tab) => (
+          <button
+            key={tab.id}
+            className={filter === tab.id ? "active" : ""}
+            onClick={() => setFilter(tab.id)}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
       <div className="library-grid">
-        {media.length === 0 && (
+        {filteredMedia.length === 0 && (
           <div className="library-empty">
             <Film size={28} />
-            <span>还没有素材，搜索 Pexels 或导入本地文件</span>
+            <span>{media.length === 0 ? "还没有素材，搜索 Pexels 或导入本地文件" : "没有符合条件的素材"}</span>
           </div>
         )}
-        {media.map((asset) => {
+        {filteredMedia.map((asset) => {
           const thumb = desktopApi.mediaSrc(asset.thumbnailUrl || asset.localPath || null);
           const targetLabel = asset.kind === "image" ? "图片轨" : asset.kind === "audio" ? "音频轨" : "视频轨";
           return (
@@ -102,11 +150,23 @@ export function MediaLibrary({
                 }
               }}
             >
+              {onToggleFavorite && (
+                <button
+                  className={`library-favorite-star ${asset.favorite ? "active" : ""}`}
+                  title={asset.favorite ? "取消收藏" : "收藏"}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onToggleFavorite(asset);
+                  }}
+                >
+                  <Star size={13} fill={asset.favorite ? "currentColor" : "none"} />
+                </button>
+              )}
               {thumb ? (
                 <img src={thumb} alt="" draggable={false} />
               ) : (
                 <div className="library-card-fallback">
-                  {asset.kind === "audio" ? "🎵" : asset.kind === "image" ? <Image size={20} /> : <Film size={20} />}
+                  {asset.kind === "audio" ? <Music size={20} /> : asset.kind === "image" ? <Image size={20} /> : <Film size={20} />}
                 </div>
               )}
               <span>{asset.title}</span>
@@ -120,6 +180,12 @@ export function MediaLibrary({
           );
         })}
       </div>
+      {filteredMedia.length > 0 && hasMore && (
+        <button className="library-load-more" disabled={searching} onClick={onLoadMore}>
+          {searching ? <Loader2 className="spin" size={14} /> : null}
+          加载更多
+        </button>
+      )}
     </div>
   );
 }

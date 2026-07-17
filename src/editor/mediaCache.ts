@@ -34,6 +34,15 @@ export function mergeCachedMediaSource(project: Project, cached: MediaSource): P
   return { ...project, media };
 }
 
+/** 更新一个 media 项的部分字段（收藏/标签/最近使用等），不存在则原样返回。 */
+export function updateMediaSource(project: Project, id: string, patch: Partial<MediaSource>): Project {
+  const existingIndex = project.media.findIndex((asset) => asset.id === id);
+  if (existingIndex < 0) return project;
+  const media = [...project.media];
+  media[existingIndex] = { ...media[existingIndex], ...patch };
+  return { ...project, media };
+}
+
 export function claimProxyBackfill(asset: MediaSource, inFlight: Set<string>) {
   if (!shouldBuildProxy(asset, inFlight)) return false;
   inFlight.add(asset.id);
