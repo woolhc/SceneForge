@@ -1,20 +1,37 @@
-import { Loader2, Sparkles, Wand2 } from "lucide-react";
+import { Loader2, Plus, Sparkles, Type, Wand2 } from "lucide-react";
+import { TextTemplatePanel } from "./TextTemplatePanel";
+import type { SubtitleStyle } from "../types";
 
 export function TextPanel({
   script,
   busy,
   onScriptChange,
   onAiSegment,
+  onAddTextLayer,
+  onApplyTextTemplate,
 }: {
   script: string;
   busy: string | null;
   onScriptChange: (script: string) => void;
   onAiSegment: () => void;
+  onAddTextLayer: () => void;
+  onApplyTextTemplate: (style: Partial<SubtitleStyle>) => void;
 }) {
   const segmenting = busy === "segment";
 
   return (
     <div className="panel-content">
+      <div className="text-section">
+        <div className="text-section-title">
+          <Type size={15} />
+          <span>文本图层</span>
+        </div>
+        <button className="panel-primary-action" onClick={onAddTextLayer}>
+          <Plus size={15} />
+          新建文本图层
+        </button>
+      </div>
+      <TextTemplatePanel onApplyTemplate={onApplyTextTemplate} />
       <div className="text-section">
         <div className="text-section-title">
           <Wand2 size={15} />

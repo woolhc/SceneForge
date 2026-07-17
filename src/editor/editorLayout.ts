@@ -29,7 +29,7 @@ export const TIMELINE_ACTIONS = [
 ] as const;
 
 export function inspectorTabsForTrack(kind: TrackKind): InspectorTab[] {
-  if (kind === "subtitle") return ["basic", "subtitle", "animation"];
+  if (kind === "subtitle" || kind === "text") return ["basic", "subtitle", "animation"];
   if (kind === "audio" || kind === "voiceover") return ["basic", "audio"];
   if (kind === "video") return ["basic", "visual", "animation", "audio"];
   return ["basic", "visual", "animation"];
@@ -37,13 +37,13 @@ export function inspectorTabsForTrack(kind: TrackKind): InspectorTab[] {
 
 export function inspectorTabsForSelection(kind: TrackKind, selectedCount: number): InspectorTab[] {
   if (selectedCount > 1) {
-    return [kind === "subtitle" ? "subtitle" : "basic"];
+    return [kind === "subtitle" || kind === "text" ? "subtitle" : "basic"];
   }
   return inspectorTabsForTrack(kind);
 }
 
 export function defaultInspectorTabForTrack(kind: TrackKind): InspectorTab {
-  if (kind === "subtitle") return "subtitle";
+  if (kind === "subtitle" || kind === "text") return "subtitle";
   if (kind === "audio" || kind === "voiceover") return "audio";
   return "basic";
 }

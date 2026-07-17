@@ -21,13 +21,16 @@ assert.equal(defaultInspectorTabForTrack("subtitle"), "subtitle");
 assert.equal(defaultInspectorTabForTrack("audio"), "audio");
 assert.equal(defaultInspectorTabForTrack("voiceover"), "audio");
 assert.equal(defaultInspectorTabForTrack("video"), "basic");
+assert.equal(defaultInspectorTabForTrack("text"), "subtitle");
 
 assert.deepEqual(inspectorTabsForTrack("image"), ["basic", "visual", "animation"]);
 assert.deepEqual(inspectorTabsForTrack("video"), ["basic", "visual", "animation", "audio"]);
 assert.deepEqual(inspectorTabsForTrack("subtitle"), ["basic", "subtitle", "animation"]);
+assert.deepEqual(inspectorTabsForTrack("text"), ["basic", "subtitle", "animation"]);
 
 assert.equal(resolveInspectorTab("image", "audio"), "basic");
 assert.equal(resolveInspectorTab("subtitle", "subtitle"), "subtitle");
+assert.equal(resolveInspectorTab("text", "subtitle"), "subtitle");
 
 assert.deepEqual(
   TIMELINE_ACTIONS.map((action) => action.id),
@@ -62,5 +65,6 @@ assert.deepEqual(editorLayoutsForMode("simple"), {
 });
 assert.equal(inspectorTabForInteraction("keyframe", "video"), "animation");
 assert.deepEqual(inspectorTabsForSelection("subtitle", 2), ["subtitle"]);
+assert.deepEqual(inspectorTabsForSelection("text", 2), ["subtitle"]);
 assert.deepEqual(inspectorTabsForSelection("video", 2), ["basic"]);
 assert.deepEqual(inspectorTabsForSelection("video", 1), ["basic", "visual", "animation", "audio"]);

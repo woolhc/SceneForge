@@ -45,7 +45,7 @@ export function ContextMenu({
 
   const isVideo = trackKind === "video";
   const isAudio = trackKind === "audio" || trackKind === "voiceover";
-  const isSubtitle = trackKind === "subtitle";
+  const isSubtitle = trackKind === "subtitle" || trackKind === "text";
 
   return (
     <div

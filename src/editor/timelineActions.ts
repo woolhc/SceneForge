@@ -6,6 +6,7 @@ export const TRACK_KIND_LABELS: Record<TrackKind, string> = {
   voiceover: "配音",
   audio: "音频",
   subtitle: "字幕",
+  text: "文字",
 };
 
 export function nextTrackName(project: Project, kind: TrackKind) {

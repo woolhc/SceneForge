@@ -123,7 +123,7 @@ export function evaluateFrame(graph: RenderGraph, time: number): EvaluatedFrame 
       )
       .map((layer) => evaluateAudioLayer(layer, evaluatedTime)),
     subtitleLayers: activeLayers
-      .filter((layer) => layer.trackKind === "subtitle")
+      .filter((layer) => layer.trackKind === "subtitle" || layer.trackKind === "text")
       .map((layer) => evaluateSubtitleLayer(layer, evaluatedTime)),
   };
 }
