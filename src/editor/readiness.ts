@@ -13,11 +13,14 @@ export type PendingWhisperAction<T = unknown> = {
 export type ApiReadiness = {
   deepseekReady: boolean;
   pexelsReady: boolean;
+  pixabayReady: boolean;
+  /** 任一素材源已配置 */
+  stockReady: boolean;
   fishAudioReady: boolean;
 };
 
 export type ReadinessIssue = {
-  id: "whisper" | "deepseek" | "pexels" | "fishAudio";
+  id: "whisper" | "deepseek" | "pexels" | "pixabay" | "stock" | "fishAudio";
   severity: "required" | "recommended";
   title: string;
   description: string;
@@ -42,9 +45,13 @@ export function whisperStatusLabel(status: WhisperModelStatus | null | undefined
 }
 
 export function getApiReadiness(settings: AppSettings): ApiReadiness {
+  const pexelsReady = Boolean(settings.pexelsApiKey?.trim());
+  const pixabayReady = Boolean(settings.pixabayApiKey?.trim());
   return {
     deepseekReady: Boolean(settings.deepseekApiKey?.trim()),
-    pexelsReady: Boolean(settings.pexelsApiKey?.trim()),
+    pexelsReady,
+    pixabayReady,
+    stockReady: pexelsReady || pixabayReady,
     fishAudioReady: Boolean(settings.fishAudioApiKey?.trim() || settings.fishAudioReferenceId?.trim() || settings.defaultVoiceId),
   };
 }
@@ -70,12 +77,19 @@ export function getReadinessIssues(settings: AppSettings, whisperStatus: Whisper
       description: "AI 分镜、语义断句和文本优化会受限。",
     });
   }
-  if (!api.pexelsReady) {
+  if (!api.stockReady) {
+    issues.push({
+      id: "stock",
+      severity: "recommended",
+      title: "素材源 Key 未配置",
+      description: "请配置 Pexels 或 Pixabay API Key，以启用自动素材检索。",
+    });
+  } else if (!api.pexelsReady && api.pixabayReady) {
     issues.push({
       id: "pexels",
       severity: "recommended",
-      title: "Pexels Key 未配置",
-      description: "自动素材检索会受限。",
+      title: "仅配置了 Pixabay",
+      description: "Pexels 未配置，将使用 Pixabay 搜索视频/图片。",
     });
   }
   if (!api.fishAudioReady) {

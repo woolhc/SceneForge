@@ -44,6 +44,7 @@ const _isMac =
 const defaultSettings: AppSettings = {
   deepseekApiKey: "",
   pexelsApiKey: "",
+  pixabayApiKey: "",
   ttsBaseUrl: "https://ttsttstts.cas-air.cn",
   fishAudioApiKey: "",
   fishAudioModel: "s1",
@@ -174,7 +175,14 @@ export interface PipelineError {
   context?: unknown;
 }
 
-const RETRYABLE_CODES = new Set(["ASR_TIMEOUT", "PEXELS_429", "NETWORK", "AI_TIMEOUT", "TTS_TIMEOUT"]);
+const RETRYABLE_CODES = new Set([
+  "ASR_TIMEOUT",
+  "PEXELS_429",
+  "PIXABAY_429",
+  "NETWORK",
+  "AI_TIMEOUT",
+  "TTS_TIMEOUT",
+]);
 const MAX_RETRY = 2;
 
 function sleep(ms: number): Promise<void> {
@@ -204,8 +212,46 @@ export function parsePipelineError(e: unknown): PipelineError {
 /** 根据错误消息模式推断 code/retryable（兼容未走 map_pipeline_error 的旧错误） */
 function inferErrorFromMessage(message: string): PipelineError {
   const lower = message.toLowerCase();
-  if (lower.includes("429") || lower.includes("rate limit") || lower.includes("too many requests")) {
-    return { code: "PEXELS_429", message, retryable: true };
+  // 双源都失败时保留完整明细，禁止改写成「请手动切 Pixabay」（自动 fallback 已存在）
+  if (lower.includes("全部素材源") || (lower.includes("pexels") && lower.includes("pixabay"))) {
+    const isQuota =
+      lower.includes("429")
+      || lower.includes("rate limit")
+      || lower.includes("quota")
+      || lower.includes("配额")
+      || lower.includes("限流");
+    return {
+      code: isQuota ? "STOCK_429" : "STOCK_ERROR",
+      message,
+      retryable: isQuota,
+    };
+  }
+  if (
+    lower.includes("429")
+    || lower.includes("rate limit")
+    || lower.includes("too many requests")
+    || lower.includes("quota")
+    || lower.includes("配额")
+    || lower.includes("限流")
+  ) {
+    if (lower.includes("pixabay")) {
+      return {
+        code: "PIXABAY_429",
+        message: message.includes("Pixabay") || message.includes("pixabay")
+          ? message
+          : "Pixabay 触发限流。请稍后再试，或切换其他素材源。",
+        retryable: true,
+      };
+    }
+    if (lower.includes("pexels") || message.includes("Pexels")) {
+      return { code: "PEXELS_429", message, retryable: true };
+    }
+    // 未点名平台时也不要暗示「自动切换不存在」
+    return {
+      code: "STOCK_429",
+      message: message.trim() || "素材源触发限流或配额用尽。系统会自动尝试备用源；若仍失败请检查 Pexels/Pixabay Key。",
+      retryable: true,
+    };
   }
   if (lower.includes("timeout") || lower.includes("timed out") || lower.includes("超时")) {
     return { code: "NETWORK", message, retryable: true };
@@ -238,6 +284,15 @@ async function invokeWithRetry<T>(command: string, args?: Record<string, unknown
 
 async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   if (isTauri) {
+    // 素材搜索失败应立刻切备用源；对 429/配额重试只会拖慢 fallback、浪费额度
+    if (
+      command === "search_pexels_videos"
+      || command === "search_pexels_photos"
+      || command === "search_pixabay_videos"
+      || command === "search_pixabay_photos"
+    ) {
+      return invoke<T>(command, args);
+    }
     return invokeWithRetry<T>(command, args);
   }
   return webFallback<T>(command, args);
@@ -524,6 +579,68 @@ async function webFallback<T>(command: string, args?: Record<string, unknown>): 
       height: portrait ? 1920 : 1080,
       duration: 5,
       source: "pexels",
+    }));
+    return {
+      assets,
+      page,
+      hasMore: page * perPage < totalResults,
+      totalResults,
+    } as PexelsSearchResult as T;
+  }
+
+  if (command === "search_pixabay_videos") {
+    const request = args?.request as { query: string; ratio: string; perPage?: number; page?: number };
+    const portrait = request.ratio === "9:16";
+    const page = request.page ?? 1;
+    const perPage = request.perPage || 3;
+    const totalResults = perPage * 3;
+    const assets: MediaSource[] = Array.from({ length: perPage }).map((_, index) => ({
+      id: uid("pixabay"),
+      kind: "video",
+      title: `${request.query || "Pixabay"} #${(page - 1) * perPage + index + 1}`,
+      url: null,
+      localPath: null,
+      proxyPath: null,
+      proxyStatus: "none",
+      proxyWidth: null,
+      proxyHeight: null,
+      thumbnailUrl: null,
+      width: portrait ? 1080 : 1920,
+      height: portrait ? 1920 : 1080,
+      duration: 12 + index * 2,
+      source: "pixabay",
+      photographer: "Pixabay Demo",
+    }));
+    return {
+      assets,
+      page,
+      hasMore: page * perPage < totalResults,
+      totalResults,
+    } as PexelsSearchResult as T;
+  }
+
+  if (command === "search_pixabay_photos") {
+    const request = args?.request as { query: string; ratio: string; perPage?: number; page?: number };
+    const portrait = request.ratio === "9:16";
+    const page = request.page ?? 1;
+    const perPage = request.perPage || 3;
+    const totalResults = perPage * 3;
+    const assets: MediaSource[] = Array.from({ length: perPage }).map((_, index) => ({
+      id: uid("pixabay-photo"),
+      kind: "image",
+      title: `${request.query || "Pixabay"} #${(page - 1) * perPage + index + 1}`,
+      url: null,
+      localPath: null,
+      proxyPath: null,
+      proxyStatus: "none",
+      proxyWidth: null,
+      proxyHeight: null,
+      thumbnailUrl: null,
+      width: portrait ? 1080 : 1920,
+      height: portrait ? 1920 : 1080,
+      duration: 0,
+      source: "pixabay",
+      photographer: "Pixabay Demo",
     }));
     return {
       assets,
@@ -826,6 +943,10 @@ export const desktopApi = {
     call<PexelsSearchResult>("search_pexels_videos", { request }),
   searchPexelsPhotos: (request: { query: string; ratio: string; perPage?: number; page?: number }) =>
     call<PexelsSearchResult>("search_pexels_photos", { request }),
+  searchPixabayVideos: (request: { query: string; ratio: string; perPage?: number; page?: number }) =>
+    call<PexelsSearchResult>("search_pixabay_videos", { request }),
+  searchPixabayPhotos: (request: { query: string; ratio: string; perPage?: number; page?: number }) =>
+    call<PexelsSearchResult>("search_pixabay_photos", { request }),
   cacheAssetVideo: (asset: MediaSource) =>
     call<MediaSource>("cache_asset_video", { request: { asset } }),
   importMedia: (sourcePath: string) =>

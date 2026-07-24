@@ -8,6 +8,8 @@ export type GeneratePipelineInput = {
   translate: boolean;
   materialDirection?: string;
   audioPath?: string | null;
+  /** 合成版式模板 id；缺省 standard-fill */
+  compositionTemplateId?: string;
 };
 
 type StepStatus = PipelineState["steps"][number]["status"];

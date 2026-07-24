@@ -1,6 +1,7 @@
-import { FolderOpen, Loader2, Save, Settings as SettingsIcon, Trash2, XCircle } from "lucide-react";
+import { ExternalLink, FolderOpen, Loader2, Save, Settings as SettingsIcon, Trash2, XCircle } from "lucide-react";
 import type { AppInfo, AppSettings, FfmpegStatus, WhisperModelStatus } from "../types";
 import { getApiReadiness, whisperStatusLabel } from "../editor/readiness";
+import { PEXELS_HOME_URL, PIXABAY_HOME_URL } from "../library/pexelsAttribution";
 
 const ratios = ["9:16", "16:9", "1:1"];
 
@@ -67,6 +68,16 @@ export function UnifiedSettingsDialog({
                 type="password"
                 value={settings.pexelsApiKey}
                 onChange={(event) => update({ pexelsApiKey: event.target.value })}
+                placeholder="Pexels API Key"
+              />
+            </label>
+            <label>
+              Pixabay Key
+              <input
+                type="password"
+                value={settings.pixabayApiKey || ""}
+                onChange={(event) => update({ pixabayApiKey: event.target.value })}
+                placeholder="Pixabay API Key（备用素材源）"
               />
             </label>
             <label>
@@ -112,6 +123,55 @@ export function UnifiedSettingsDialog({
               />
             </label>
           </div>
+        </section>
+
+        <section className="settings-section">
+          <div className="settings-section-title">素材源致谢</div>
+          <div className="settings-pexels-credit" role="note">
+            <div className="settings-pexels-credit-main">
+              <strong>Photos and videos provided by Pexels</strong>
+              <p>
+                本应用通过 Pexels API 检索免版税图片与视频。展示搜索结果与选用素材时会保留创作者署名；申请更高配额时请附上本页截图。
+              </p>
+            </div>
+            <a
+              className="settings-pexels-credit-link"
+              href={PEXELS_HOME_URL}
+              target="_blank"
+              rel="noreferrer noopener"
+            >
+              <ExternalLink size={14} />
+              访问 Pexels
+            </a>
+          </div>
+          <div className="settings-pexels-credit" role="note" style={{ marginTop: 10 }}>
+            <div className="settings-pexels-credit-main">
+              <strong>Images and videos provided by Pixabay</strong>
+              <p>
+                Pixabay 作为备用素材源。搜索结果与选用素材会显示创作者署名。免费档约 100 次/分钟。
+              </p>
+            </div>
+            <a
+              className="settings-pexels-credit-link"
+              href={PIXABAY_HOME_URL}
+              target="_blank"
+              rel="noreferrer noopener"
+            >
+              <ExternalLink size={14} />
+              访问 Pixabay
+            </a>
+          </div>
+          <p className="settings-hint">
+            官方要求：显著标明素材来源，并为每条素材显示创作者姓名与链接。详见{" "}
+            <a href="https://www.pexels.com/api/documentation/?#guideline-attribution" target="_blank" rel="noreferrer noopener">
+              Pexels Guidelines
+            </a>
+            {" · "}
+            <a href="https://pixabay.com/service/terms/" target="_blank" rel="noreferrer noopener">
+              Pixabay Terms
+            </a>
+            。
+          </p>
         </section>
 
         <section className="settings-section">
@@ -178,6 +238,7 @@ export function UnifiedSettingsDialog({
           <div className="settings-diagnostics">
             <span className={api.deepseekReady ? "ok" : "warn"}>{api.deepseekReady ? "DeepSeek 已配置" : "DeepSeek 未配置"}</span>
             <span className={api.pexelsReady ? "ok" : "warn"}>{api.pexelsReady ? "Pexels 已配置" : "Pexels 未配置"}</span>
+            <span className={api.pixabayReady ? "ok" : "warn"}>{api.pixabayReady ? "Pixabay 已配置" : "Pixabay 未配置"}</span>
             <span className={api.fishAudioReady ? "ok" : "warn"}>{api.fishAudioReady ? "Fish Audio 已配置" : "Fish Audio 未配置"}</span>
             <span className={ffmpeg?.available ? "ok" : "warn"}>{ffmpeg?.available ? `FFmpeg ${ffmpeg.version || "可用"}` : (ffmpeg?.error || "FFmpeg 检测中")}</span>
           </div>

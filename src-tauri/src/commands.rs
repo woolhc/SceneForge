@@ -173,18 +173,34 @@ pub async fn check_ffmpeg() -> FfmpegStatus {
 }
 
 #[tauri::command]
-pub fn load_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
-    let conn = state.db.lock().map_err(map_error)?;
-    storage::load_settings(&conn).map_err(map_error)
-}
-
-#[tauri::command]
 pub fn save_settings(
     state: State<'_, AppState>,
     settings: AppSettings,
 ) -> Result<AppSettings, String> {
+    eprintln!(
+        "[settings] save 收到 key 长度: deepseek={} pexels={} pixabay={} fish={}",
+        settings.deepseek_api_key.trim().len(),
+        settings.pexels_api_key.trim().len(),
+        settings.pixabay_api_key.trim().len(),
+        settings.fish_audio_api_key.trim().len(),
+    );
     let conn = state.db.lock().map_err(map_error)?;
     storage::save_settings(&conn, &settings).map_err(map_error)
+}
+
+/// 仅日志：加载时回读 key 长度，确认存读一致
+#[tauri::command]
+pub fn load_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
+    let conn = state.db.lock().map_err(map_error)?;
+    let s = storage::load_settings(&conn).map_err(map_error)?;
+    eprintln!(
+        "[settings] load 回读 key 长度: deepseek={} pexels={} pixabay={} fish={}",
+        s.deepseek_api_key.trim().len(),
+        s.pexels_api_key.trim().len(),
+        s.pixabay_api_key.trim().len(),
+        s.fish_audio_api_key.trim().len(),
+    );
+    Ok(s)
 }
 
 #[tauri::command]
@@ -577,7 +593,26 @@ pub async fn search_pexels_videos(
     };
     pexels::search_videos(&settings, request)
         .await
-        .map_err(map_error)
+        .map_err(|error| {
+            eprintln!("[pexels] search_videos FAILED: {error:?}");
+            let text = error.to_string();
+            let lower = text.to_lowercase();
+            let (code, retryable) = if lower.contains("配额")
+                || lower.contains("quota")
+                || lower.contains("quota has been exceeded")
+                || lower.contains("429")
+                || lower.contains("限流")
+                || lower.contains("rate limit")
+                || lower.contains("too many requests")
+            {
+                ("PEXELS_429", true)
+            } else if lower.contains("api key") || lower.contains("无权限") || lower.contains("401") {
+                ("PEXELS_AUTH", false)
+            } else {
+                ("PEXELS_ERROR", false)
+            };
+            map_pipeline_error(text, code, retryable)
+        })
 }
 
 /// 搜索 Pexels 图片（图片复用视频轨，作为静态画面）
@@ -592,7 +627,82 @@ pub async fn search_pexels_photos(
     };
     pexels::search_photos(&settings, request)
         .await
-        .map_err(map_error)
+        .map_err(|error| {
+            eprintln!("[pexels] search_photos FAILED: {error:?}");
+            let text = error.to_string();
+            let lower = text.to_lowercase();
+            let (code, retryable) = if lower.contains("配额")
+                || lower.contains("quota")
+                || lower.contains("quota has been exceeded")
+                || lower.contains("429")
+                || lower.contains("限流")
+                || lower.contains("rate limit")
+                || lower.contains("too many requests")
+            {
+                ("PEXELS_429", true)
+            } else if lower.contains("api key") || lower.contains("无权限") || lower.contains("401") {
+                ("PEXELS_AUTH", false)
+            } else {
+                ("PEXELS_ERROR", false)
+            };
+            map_pipeline_error(text, code, retryable)
+        })
+}
+
+#[tauri::command]
+pub async fn search_pixabay_videos(
+    state: State<'_, AppState>,
+    request: PexelsSearchRequest,
+) -> Result<PexelsSearchResult, String> {
+    let settings = {
+        let conn = state.db.lock().map_err(map_error)?;
+        storage::load_settings(&conn).map_err(map_error)?
+    };
+    crate::pixabay::search_videos(&settings, request)
+        .await
+        .map_err(|error| {
+            let text = error.to_string();
+            let lower = text.to_lowercase();
+            let (code, retryable) = if lower.contains("429")
+                || lower.contains("限流")
+                || lower.contains("rate limit")
+            {
+                ("PIXABAY_429", true)
+            } else if lower.contains("api key") || lower.contains("无权限") || lower.contains("401") {
+                ("PIXABAY_AUTH", false)
+            } else {
+                ("PIXABAY_ERROR", false)
+            };
+            map_pipeline_error(text, code, retryable)
+        })
+}
+
+#[tauri::command]
+pub async fn search_pixabay_photos(
+    state: State<'_, AppState>,
+    request: PexelsSearchRequest,
+) -> Result<PexelsSearchResult, String> {
+    let settings = {
+        let conn = state.db.lock().map_err(map_error)?;
+        storage::load_settings(&conn).map_err(map_error)?
+    };
+    crate::pixabay::search_photos(&settings, request)
+        .await
+        .map_err(|error| {
+            let text = error.to_string();
+            let lower = text.to_lowercase();
+            let (code, retryable) = if lower.contains("429")
+                || lower.contains("限流")
+                || lower.contains("rate limit")
+            {
+                ("PIXABAY_429", true)
+            } else if lower.contains("api key") || lower.contains("无权限") || lower.contains("401") {
+                ("PIXABAY_AUTH", false)
+            } else {
+                ("PIXABAY_ERROR", false)
+            };
+            map_pipeline_error(text, code, retryable)
+        })
 }
 
 /// 下载/缓存某个素材到 app 数据目录，更新 local_path 后返回。
@@ -1117,6 +1227,56 @@ fn find_or_create_subtitle_track(project: &mut Project, name: &str, order: u32) 
     tid
 }
 
+/// ASR 合并音频中的偏移 → 时间轴时间。
+/// 合并用的是源媒体时长 (source_out - source_in)，未应用 speed；
+/// 时间轴上片段时长 = source_duration / abs(speed)，因此偏移需除以 speed。
+struct MergeTimelineMapping {
+    merge_offset: f64,
+    source_duration: f64,
+    timeline_start: f64,
+    speed: f64,
+}
+
+fn clip_playback_speed(clip: &Clip) -> f64 {
+    clip.speed.abs().max(0.01)
+}
+
+fn build_merge_timeline_mappings(clips: &[&Clip]) -> Vec<MergeTimelineMapping> {
+    let mut mappings = Vec::with_capacity(clips.len());
+    let mut accumulated = 0.0;
+    for clip in clips {
+        let source_duration = (clip.source_out - clip.source_in).max(0.1);
+        mappings.push(MergeTimelineMapping {
+            merge_offset: accumulated,
+            source_duration,
+            timeline_start: clip.start_on_track,
+            speed: clip_playback_speed(clip),
+        });
+        accumulated += source_duration;
+    }
+    mappings
+}
+
+fn map_merged_time_to_timeline(t: f64, mappings: &[MergeTimelineMapping]) -> f64 {
+    if mappings.is_empty() {
+        return t;
+    }
+    for mapping in mappings {
+        if t >= mapping.merge_offset && t < mapping.merge_offset + mapping.source_duration {
+            return mapping.timeline_start + (t - mapping.merge_offset) / mapping.speed;
+        }
+    }
+    if let Some(mapping) = mappings.last() {
+        if t >= mapping.merge_offset + mapping.source_duration {
+            return mapping.timeline_start + mapping.source_duration / mapping.speed;
+        }
+    }
+    if t < mappings[0].merge_offset {
+        return mappings[0].timeline_start;
+    }
+    t
+}
+
 /// 识别字幕：合并配音轨音频 → whisper 识别 → DeepSeek 整理（可选翻译）→ 生成字幕 clip
 #[tauri::command]
 pub async fn generate_subtitles(
@@ -1276,43 +1436,16 @@ pub async fn generate_subtitles(
     let _ = &audio_dir; // 预留
 
     // 建立合并音频偏移到时间轴偏移的映射（修复字幕时间戳错位）
-    // 合并音频用 concat 拼接，丢弃了 clip 之间的间隙，whisper 时间戳是相对合并音频的
-    // 需要把 cue.start 映射回时间轴：找到 cue 所在的 clip，timeline_start = clip.start_on_track + (cue.start - clip 在合并音频中的偏移)
-    let mut clip_mappings: Vec<(f64, f64, f64)> = Vec::new(); // (merge_offset, clip_audio_duration, timeline_start)
-    let mut accumulated: f64 = 0.0;
-    for clip in &audio_clips {
-        let clip_audio_duration = (clip.source_out - clip.source_in).max(0.1);
-        clip_mappings.push((accumulated, clip_audio_duration, clip.start_on_track));
-        accumulated += clip_audio_duration;
-    }
-    // 单条配音从头开始且无间隙时，映射退化为恒等（cue.start == timeline_start）
-    let single_clip_aligned =
-        audio_clips.len() == 1 && (audio_clips[0].start_on_track - 0.0).abs() < 0.01;
+    // 合并音频用 concat 拼接，丢弃了 clip 之间的间隙，whisper 时间戳是相对合并音频的。
+    // 合并段用源媒体时长；时间轴偏移需 / abs(speed)。
+    let clip_mappings = build_merge_timeline_mappings(&audio_clips);
 
     for cue in &refined {
-        let duration = (cue.end - cue.start).max(0.3);
-        // 把合并音频偏移映射回时间轴偏移
-        let timeline_start = if single_clip_aligned {
-            cue.start
-        } else {
-            let mut mapped = cue.start;
-            for (merge_offset, clip_dur, tl_start) in &clip_mappings {
-                if cue.start >= *merge_offset && cue.start < *merge_offset + *clip_dur {
-                    mapped = tl_start + (cue.start - merge_offset);
-                    break;
-                }
-            }
-            // 如果 cue.start 超出所有 clip 范围（尾部静音），用最后一个 clip 的末尾
-            if let Some((merge_offset, clip_dur, tl_start)) = clip_mappings.last() {
-                if cue.start >= *merge_offset + *clip_dur {
-                    mapped = tl_start + *clip_dur;
-                }
-            }
-            mapped
-        };
-        // words 时间戳是相对合并音频的，需要和 cue.start 一样映射到时间轴
-        // 否则多 clip 场景下 karaoke 高亮与音频错位
-        let delta = timeline_start - cue.start;
+        // 把合并音频偏移映射回时间轴偏移（含 speed）
+        let timeline_start = map_merged_time_to_timeline(cue.start, &clip_mappings);
+        let timeline_end = map_merged_time_to_timeline(cue.end, &clip_mappings);
+        let duration = (timeline_end - timeline_start).max(0.3);
+        // words 时间戳是相对合并音频的，需与 cue 同样映射到时间轴
         let words = if cue.words.is_empty() {
             None
         } else {
@@ -1320,8 +1453,8 @@ pub async fn generate_subtitles(
                 cue.words
                     .iter()
                     .map(|w| WordCue {
-                        start: w.start + delta,
-                        end: w.end + delta,
+                        start: map_merged_time_to_timeline(w.start, &clip_mappings),
+                        end: map_merged_time_to_timeline(w.end, &clip_mappings),
                         text: w.text.clone(),
                         confidence: w.confidence.clone(),
                     })
@@ -1332,8 +1465,8 @@ pub async fn generate_subtitles(
         let zh_words = asr::generate_chinese_words(cue).map(|zh| {
             zh.iter()
                 .map(|w| WordCue {
-                    start: w.start + delta,
-                    end: w.end + delta,
+                    start: map_merged_time_to_timeline(w.start, &clip_mappings),
+                    end: map_merged_time_to_timeline(w.end, &clip_mappings),
                     text: w.text.clone(),
                     confidence: w.confidence.clone(),
                 })
@@ -1974,10 +2107,18 @@ pub async fn transcribe_to_sentences(
     if !path.exists() {
         return Err(format!("音频文件不存在：{audio_path}"));
     }
+    eprintln!(
+        "[ASR] transcribe_to_sentences start: path={:?} whisper_bin={} model={}",
+        path, settings.whisper_bin, settings.whisper_model
+    );
     let (sentences, total_duration, full_text) =
         asr::transcribe_to_sentences(&settings, &state.paths.cache_dir, &path)
             .await
-            .map_err(map_error)?;
+            .map_err(|e| {
+                // 抓真实错误链：Whisper 本地子进程不该出现配额英文，打印完整 anyhow 链定位来源
+                eprintln!("[ASR] transcribe_to_sentences FAILED: {e:?}");
+                map_error(e)
+            })?;
     if sentences.is_empty() {
         return Err("音频识别结果为空，请检查音频文件或 whisper 配置".to_string());
     }
@@ -2113,40 +2254,23 @@ pub async fn transcribe_project_narration(
     let _ = tokio::fs::remove_file(&merged_path).await;
     let raw_cues = raw_cues?;
 
-    let mut mappings: Vec<(f64, f64, f64)> = Vec::new();
-    let mut accumulated = 0.0;
-    for clip in &included_clips {
-        let duration = (clip.source_out - clip.source_in).max(0.1);
-        mappings.push((accumulated, duration, clip.start_on_track));
-        accumulated += duration;
-    }
-    let single_aligned = included_clips.len() == 1 && included_clips[0].start_on_track.abs() < 0.01;
+    let mappings = build_merge_timeline_mappings(&included_clips);
 
     let sentences = raw_cues
         .into_iter()
         .map(|cue| {
-            let timeline_start = if single_aligned {
-                cue.start
-            } else {
-                mappings
-                    .iter()
-                    .find(|(offset, duration, _)| {
-                        cue.start >= *offset && cue.start < *offset + *duration
-                    })
-                    .map(|(offset, _, timeline)| timeline + (cue.start - offset))
-                    .unwrap_or(cue.start)
-            };
-            let delta = timeline_start - cue.start;
+            let timeline_start = map_merged_time_to_timeline(cue.start, &mappings);
+            let timeline_end = map_merged_time_to_timeline(cue.end, &mappings);
             crate::models::TimedSentence {
                 start: timeline_start,
-                end: cue.end + delta,
+                end: timeline_end,
                 text: cue.text,
                 words: cue
                     .words
                     .into_iter()
                     .map(|word| crate::models::WordCue {
-                        start: word.start + delta,
-                        end: word.end + delta,
+                        start: map_merged_time_to_timeline(word.start, &mappings),
+                        end: map_merged_time_to_timeline(word.end, &mappings),
                         text: word.text,
                         confidence: word.confidence,
                     })
@@ -2246,7 +2370,10 @@ pub async fn enrich_segments(
     };
     ai::enrich_segments(&settings, request)
         .await
-        .map_err(map_error)
+        .map_err(|e| {
+            eprintln!("[enrich] enrich_segments FAILED: {e:?}");
+            map_error(e)
+        })
 }
 
 // ============================================================================
@@ -2277,6 +2404,43 @@ pub async fn render_project(
     if let Some(ref ratio) = request.ratio {
         if !ratio.is_empty() {
             project.ratio = ratio.clone();
+        }
+    }
+
+    // 渲染前确保所有远程素材已下载到本地（生成时 bindAssetToClip 只存了 url，未下载）
+    {
+        let cache_dir = state.paths.cache_dir.clone();
+        let mut downloaded = 0u32;
+        let mut failed: Vec<String> = Vec::new();
+        for media in &mut project.media {
+            let local_ok = media
+                .local_path
+                .as_deref()
+                .map(|p| !p.is_empty() && std::path::Path::new(p).is_file())
+                .unwrap_or(false);
+            let is_remote = matches!(media.source.as_str(), "pexels" | "pixabay");
+            let has_url = media.url.as_deref().map(|u| !u.is_empty()).unwrap_or(false);
+            if !local_ok && is_remote && has_url {
+                match ffmpeg::ensure_media_local(&cache_dir, media).await {
+                    Ok(path) => {
+                        media.local_path = Some(path.to_string_lossy().to_string());
+                        downloaded += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("[render] 下载素材失败 {}: {e}", media.id);
+                        failed.push(media.id.clone());
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "[render] 渲染前下载素材：成功 {}，失败 {}",
+            downloaded,
+            failed.len()
+        );
+        if downloaded > 0 {
+            let conn = state.db.lock().map_err(map_error)?;
+            storage::save_project(&conn, &project).map_err(map_error)?;
         }
     }
 
@@ -2378,6 +2542,7 @@ pub async fn render_project(
     )
     .await
     .map_err(|e| {
+        eprintln!("[render] render_project_video FAILED: {e:?}");
         let _ = app_handle.emit(
             "render-progress",
             serde_json::json!({ "progress": 0, "message": format!("渲染失败：{e}") }),

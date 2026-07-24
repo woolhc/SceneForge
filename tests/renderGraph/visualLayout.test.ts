@@ -6,6 +6,9 @@ const layer = {
   x: 25,
   y: 75,
   scale: 40,
+  width: 40,
+  height: 40,
+  fit: "cover",
   rotation: 30,
   effectiveOpacity: 0.6,
 } as EvaluatedVisualLayer;
@@ -29,3 +32,24 @@ assert.deepEqual(visualLayerCssStyle(layer), {
   transform: "translate(-25%, -75%) rotate(30deg)",
   opacity: "0.6",
 });
+
+// 非等比方框（知识卡片中带）
+assert.deepEqual(
+  visualLayerCssStyle({
+    x: 50,
+    y: 40,
+    scale: 100,
+    width: 100,
+    height: 36,
+    rotation: 0,
+    effectiveOpacity: 1,
+  } as EvaluatedVisualLayer),
+  {
+    left: "50%",
+    top: "40%",
+    width: "100%",
+    height: "36%",
+    transform: "translate(-50%, -40%) rotate(0deg)",
+    opacity: "1",
+  },
+);

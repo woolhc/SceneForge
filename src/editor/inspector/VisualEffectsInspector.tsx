@@ -4,6 +4,7 @@ import { toggleVisualEffect } from "../visualEffects";
 const effectOptions = [
   { id: "vignette", label: "暗角" },
   { id: "glow", label: "发光" },
+  { id: "blur", label: "模糊" },
   { id: "mirror", label: "镜像" },
   { id: "invert", label: "反色" },
   { id: "grayscale", label: "灰度" },

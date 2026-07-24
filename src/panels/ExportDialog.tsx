@@ -1,6 +1,10 @@
-import { CheckCircle2, Download, FolderOpen, Loader2, XCircle } from "lucide-react";
-import { useState } from "react";
-import type { RenderConfig } from "../types";
+import { AlertTriangle, CheckCircle2, Download, FolderOpen, Loader2, XCircle } from "lucide-react";
+import { useMemo, useState } from "react";
+import {
+  hasBlockingExportIssues,
+  projectExportPreflight,
+} from "../editor/exportPreflight";
+import type { Project, RenderConfig } from "../types";
 import { desktopApi } from "../tauri";
 
 export type ExportState = "idle" | "exporting" | "done" | "error";
@@ -17,6 +21,7 @@ export function ExportDialog({
   config,
   onConfigChange,
   currentRatio,
+  project,
   onExport,
   onCancel,
   exportState,
@@ -34,6 +39,8 @@ export function ExportDialog({
   onConfigChange: (config: RenderConfig) => void;
   /** 项目当前比例，作为多比例导出勾选框的默认选中项 */
   currentRatio: string;
+  /** 用于导出前数据质量预检；未传则跳过预检 */
+  project?: Project | null;
   onExport: (outputPath: string | null, ratios?: string[]) => void;
   onCancel?: () => void;
   exportState: ExportState;
@@ -49,6 +56,12 @@ export function ExportDialog({
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [savePath, setSavePath] = useState<string | null>(null);
   const [selectedRatios, setSelectedRatios] = useState<string[]>([currentRatio]);
+
+  const preflightIssues = useMemo(
+    () => (project ? projectExportPreflight(project) : []),
+    [project],
+  );
+  const exportBlocked = hasBlockingExportIssues(preflightIssues);
 
   if (!open) return null;
 
@@ -113,6 +126,26 @@ export function ExportDialog({
 
         {exportState === "idle" && (
           <>
+            {preflightIssues.length > 0 && (
+              <div className="export-section">
+                <div className="export-section-title">导出检查</div>
+                <ul className="export-preflight-list">
+                  {preflightIssues.map((issue) => (
+                    <li
+                      key={issue.id}
+                      className={`export-preflight-item ${issue.severity === "error" ? "is-error" : "is-warning"}`}
+                    >
+                      <AlertTriangle size={14} />
+                      <div>
+                        <strong>{issue.title}</strong>
+                        <small>{issue.description}</small>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
             {/* 保存位置 */}
             <div className="export-section">
               <div className="export-section-title">保存位置</div>
@@ -273,7 +306,12 @@ export function ExportDialog({
             {/* 导出按钮 */}
             <div className="modal-actions">
               <button onClick={onClose}>取消</button>
-              <button className="primary-button" onClick={() => onExport(savePath, selectedRatios)}>
+              <button
+                className="primary-button"
+                disabled={exportBlocked}
+                title={exportBlocked ? "请先处理导出检查中的错误项" : undefined}
+                onClick={() => onExport(savePath, selectedRatios)}
+              >
                 <Download size={16} />
                 {selectedRatios.length > 1 ? `开始批量导出 (${selectedRatios.length})` : "开始导出"}
               </button>

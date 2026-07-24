@@ -19,6 +19,8 @@ export type FfmpegStatus = {
 export type AppSettings = {
   deepseekApiKey: string;
   pexelsApiKey: string;
+  /** Pixabay API Key（Pexels 配额不足时的备用素材源） */
+  pixabayApiKey?: string;
   ttsBaseUrl: string;
   fishAudioApiKey?: string;
   fishAudioModel?: string;
@@ -115,8 +117,14 @@ export type MediaSource = {
   width: number;
   height: number;
   duration: number;
-  /** "pexels" | "local" | "tts" */
+  /** "pexels" | "pixabay" | "local" | "tts" */
   source: string;
+  /** 摄影师 / 创作者显示名（Pexels / Pixabay 署名） */
+  photographer?: string | null;
+  /** 创作者主页 */
+  photographerUrl?: string | null;
+  /** 素材在来源平台上的页面 URL */
+  pageUrl?: string | null;
   /** 用户自定标签（素材库筛选用） */
   tags?: string[] | null;
   /** 是否收藏 */
@@ -131,6 +139,11 @@ export type PexelsSearchResult = {
   hasMore: boolean;
   totalResults: number;
 };
+
+/** 素材搜索结果（Pexels / Pixabay 共用结构） */
+export type StockSearchResult = PexelsSearchResult;
+
+export type StockMediaProvider = "pexels" | "pixabay";
 
 export type SubtitleStyle = {
   fontSize: number;
@@ -206,8 +219,14 @@ export type ClipTransform = {
   x: number;
   /** 垂直位置，0-100（百分比，50=居中） */
   y: number;
-  /** 缩放，0-100（百分比，100=原始大小） */
+  /** 缩放，0-100（百分比，100=原始大小）。未设 width/height 时宽高都用 scale% */
   scale: number;
+  /** 盒宽占画布宽 %（0-100）。缺省时回退 scale */
+  width?: number;
+  /** 盒高占画布高 %（0-100）。缺省时回退 scale */
+  height?: number;
+  /** 盒内素材适配：cover 铺满裁切，contain 完整落入。缺省 cover（兼容旧行为） */
+  fit?: "cover" | "contain";
   /** 不透明度，0-100 */
   opacity: number;
   /** 圆角半径（像素），0=直角 */
@@ -216,6 +235,16 @@ export type ClipTransform = {
   mix: string;
   /** T4.2: 旋转角度（度，0=不旋转） */
   rotation?: number;
+};
+
+/** 项目合成版式（知识卡片等模板的应用状态） */
+export type ProjectComposition = {
+  templateId: string;
+  content: {
+    mainTitle?: string;
+    subTitle?: string;
+  };
+  appliedAt?: string;
 };
 
 /** T4.2: 关键帧 */
@@ -263,9 +292,9 @@ export type ClipMask = {
 
 /** 视觉特效项（剪映式"特效"面板） */
 export type ClipVisualEffect = {
-  /** 特效类型：vignette | flicker | shake | glow | mirror | invert | grayscale | chromakey */
+  /** 特效类型：vignette | flicker | shake | glow | blur | mirror | invert | grayscale | chromakey */
   kind: string;
-  /** 强度 0-100；chromakey 下映射为抠像容差（similarity） */
+  /** 强度 0-100；chromakey 下映射为抠像容差（similarity）；blur 映射为模糊半径 */
   intensity: number;
   /** 抠像目标色（十六进制），仅 kind="chromakey" 使用，默认绿幕 #00FF00 */
   chromaKeyColor?: string;
@@ -395,6 +424,8 @@ export type Project = {
   renderConfig: RenderConfig;
   /** 章节标记（剪映式） */
   chapters?: Chapter[];
+  /** 合成版式（知识卡片等）；缺省=标准铺满 */
+  composition?: ProjectComposition | null;
   /** 封面时间点（秒） */
   coverTime?: number | null;
   previewPath?: string | null;

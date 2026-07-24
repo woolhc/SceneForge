@@ -1,15 +1,17 @@
 import { Loader2, Upload } from "lucide-react";
 import { MediaLibrary } from "../library/MediaLibrary";
-import type { MediaSource } from "../types";
+import type { MediaSource, StockMediaProvider } from "../types";
 
 /**
- * 媒体 Tab：Pexels 搜索 + 本地导入 + 素材网格。
+ * 媒体 Tab：Pexels / Pixabay 搜索 + 本地导入 + 素材网格。
  * 点击素材 = 替换当前选中视频 clip（或追加）。
  */
 export function MediaPanel({
   media,
   busy,
   previewingId,
+  provider,
+  onProviderChange,
   onImportLocal,
   onSearchVideos,
   onSearchPhotos,
@@ -22,6 +24,8 @@ export function MediaPanel({
   media: MediaSource[];
   busy: string | null;
   previewingId?: string | null;
+  provider: StockMediaProvider;
+  onProviderChange: (provider: StockMediaProvider) => void;
   onImportLocal: () => void;
   onSearchVideos: (query: string) => void;
   onSearchPhotos: (query: string) => void;
@@ -46,6 +50,8 @@ export function MediaPanel({
         media={media}
         busy={busy}
         previewingId={previewingId}
+        provider={provider}
+        onProviderChange={onProviderChange}
         onSearchVideos={onSearchVideos}
         onSearchPhotos={onSearchPhotos}
         hasMore={hasMore}

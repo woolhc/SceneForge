@@ -171,6 +171,13 @@ pub async fn transcribe_audio(
         crate::tools::NativeTool::Whisper,
         Some(&settings.whisper_bin),
     );
+    eprintln!(
+        "[ASR] whisper resolved: path={} available={} source={:?} (configured={})",
+        whisper.path.display(),
+        whisper.available,
+        whisper.source,
+        settings.whisper_bin
+    );
     if !whisper.available {
         anyhow::bail!(
             "找不到 whisper 可执行程序。应用包未包含 sidecar，系统 PATH 也不可用。\n{}",
@@ -219,6 +226,9 @@ pub async fn transcribe_audio(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        eprintln!("[ASR] whisper exit code={:?} stderr_len={} stdout_len={}", output.status.code(), stderr.len(), stdout.len());
+        eprintln!("[ASR] whisper stderr: {}", stderr.chars().take(500).collect::<String>());
+        eprintln!("[ASR] whisper stdout: {}", stdout.chars().take(500).collect::<String>());
         let detail = if stderr.is_empty() { stdout } else { stderr };
         anyhow::bail!(
             "whisper 识别失败：{}\n{}",
@@ -231,8 +241,8 @@ pub async fn transcribe_audio(
     let json_content = match tokio::fs::read_to_string(&json_path).await {
         Ok(c) => c,
         Err(_) => {
-            // JSON 没生成：可能是 whisper 参数问题，把 stdout 片段附上方便排查
             let stdout_tail = String::from_utf8_lossy(&output.stdout);
+            eprintln!("[ASR] whisper 未生成 JSON。stdout 末尾: {}", stdout_tail.chars().take(500).collect::<String>());
             let hint = if stdout_tail.contains("usage:") || stdout_tail.contains("-m FNAME") {
                 "whisper 打印了帮助信息（通常是参数解析失败）。若输出路径含空格会导致此问题，已改用临时目录。"
             } else {
@@ -248,8 +258,12 @@ pub async fn transcribe_audio(
     };
 
     let _ = tokio::fs::remove_file(&json_path).await;
+    eprintln!("[ASR] whisper JSON 前 200 字: {}", json_content.chars().take(200).collect::<String>());
     let result: WhisperResult = serde_json::from_str(&json_content)
-        .map_err(|e| anyhow::anyhow!("whisper JSON 解析失败：{e}"))?;
+        .map_err(|e| {
+            eprintln!("[ASR] whisper JSON 解析失败：{e}。正文前 300：{}", json_content.chars().take(300).collect::<String>());
+            anyhow::anyhow!("whisper JSON 解析失败：{e}")
+        })?;
 
     // 把词级 segments 打包成 SubtitleCue（每个 cue 含 words）
     Ok(words_to_cues(result.transcription))

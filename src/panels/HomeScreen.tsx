@@ -134,7 +134,7 @@ export function HomeScreen({
         <section className="home-readiness-card">
           <div>
             <strong>开始前还差一点配置</strong>
-            <span>Whisper：{whisperStatusLabel(whisperStatus)} · API：DeepSeek {apiReadiness.deepseekReady ? "已配置" : "未配置"} / Pexels {apiReadiness.pexelsReady ? "已配置" : "未配置"} / Fish {apiReadiness.fishAudioReady ? "已配置" : "未配置"}</span>
+            <span>Whisper：{whisperStatusLabel(whisperStatus)} · API：DeepSeek {apiReadiness.deepseekReady ? "已配置" : "未配置"} / 素材源 {(apiReadiness.pexelsReady || apiReadiness.pixabayReady) ? "已配置" : "未配置"} / Fish {apiReadiness.fishAudioReady ? "已配置" : "未配置"}</span>
           </div>
           <ul>
             {readinessIssues.slice(0, 3).map((issue) => <li key={issue.id}>{issue.title}</li>)}

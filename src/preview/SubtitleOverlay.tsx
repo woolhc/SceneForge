@@ -2,6 +2,7 @@ import Moveable from "react-moveable";
 import { useEffect, useRef, useState } from "react";
 import type { Clip, SubtitleStyle, WordCue } from "../types";
 import { normalizeSubtitleStyle, resolveSubtitleAnchor } from "../editor/subtitles/styleContract";
+import { needsWordSpace } from "../editor/subtitles/wordSpacing";
 import { usePlaybackStore } from "../store/playbackStore";
 import { quantizeSubtitleClock, subtitleNeedsLiveClock } from "./subtitleClock";
 
@@ -58,7 +59,7 @@ export function SubtitleOverlay({
   const rotation = style.rotation ?? 0;
   const fontSize = `${Math.max(8, (style.fontSize ?? 48) * fontScale)}px`;
   const strokeColor = style.strokeColor ?? "#000";
-  const strokeWidth = style.strokeWidth ?? 2;
+  const strokeWidth = (style.strokeWidth ?? 2) * fontScale;
   const baseColor = style.color ?? "#FFFFFF";
   const highlightColor = style.highlightColor ?? "#FFD700";
   const bgColor = style.backgroundColor ?? "none";
@@ -73,15 +74,8 @@ export function SubtitleOverlay({
     ? s.currentTime >= clip.startOnTrack && s.currentTime < clip.startOnTrack + clip.duration
     : true);
   const effectiveTime = currentTime ?? storeTime;
-  // 描边粗细随 strokeWidth 调整（用多个 textShadow 模拟描边）
-  const strokeShadow = strokeWidth > 0
-    ? `${strokeWidth}px ${strokeWidth}px 0 ${strokeColor}, -${strokeWidth}px -${strokeWidth}px 0 ${strokeColor}, ${strokeWidth}px -${strokeWidth}px 0 ${strokeColor}, -${strokeWidth}px ${strokeWidth}px 0 ${strokeColor}`
-    : "none";
-  // 阴影（叠加在描边之后）
-  const shadow = shadowBlur > 0 ? `, 0 ${Math.round(shadowBlur / 3)}px ${shadowBlur}px ${shadowColor}` : "";
-  const finalTextShadow = strokeShadow === "none" && shadow
-    ? shadow.slice(2)
-    : (strokeShadow === "none" ? "none" : strokeShadow + shadow);
+  // 矢量描边（-webkit-text-stroke）代替多重 text-shadow 叠加，避免中文密集笔画产生棋盘噪点
+  const finalTextShadow = shadowBlur > 0 ? `0 ${Math.round(shadowBlur / 3)}px ${shadowBlur}px ${shadowColor}` : "none";
 
   // 逐字高亮：判断是否启用
   const karaokeEnabled = (style.karaoke ?? true) && (clip.words?.length ?? 0) > 0;
@@ -94,13 +88,9 @@ export function SubtitleOverlay({
       // 已播到：word.end <= t 或 word.start <= t < word.end（正在播）
       // 未播到：t < word.start
       const played = t >= w.start;
-      // 智能空格：前后都是 ASCII 字母/数字时，词间加空格（英文用）
+      // 智能空格：与 smartJoin/join_words_with_smart_separator 共用同一套规则
       const prev = words[i - 1];
-      const needSpace =
-        i > 0 &&
-        prev &&
-        /[A-Za-z0-9]$/.test(prev.text) &&
-        /^[A-Za-z0-9]/.test(w.text);
+      const needSpace = i > 0 && !!prev && needsWordSpace(prev.text, w.text);
       return (
         <span key={i} style={{ color: played ? highlightColor : baseColor }}>
           {needSpace ? " " : ""}
@@ -155,6 +145,8 @@ export function SubtitleOverlay({
           lineHeight,
           color: style.color,
           textShadow: finalTextShadow,
+          WebkitTextStroke: strokeWidth > 0 ? `${strokeWidth}px ${strokeColor}` : undefined,
+          paintOrder: "stroke fill",
           letterSpacing: `${letterSpacing * fontScale}px`,
           background: bgColor === "none" ? "transparent" : bgColor,
           padding: bgColor === "none" ? "4px 10px" : `${bgPadding * fontScale}px ${bgPadding * 2 * fontScale}px`,

@@ -22,6 +22,22 @@ type LayerParams = {
   lutData?: Uint8Array | null;
 };
 
+/** 0=none 1=circle 2=rect 3=linear 4=mirror（与 fragment shader 分支一致） */
+export function maskKindCode(kind: string | null | undefined): number {
+  switch (kind) {
+    case "circle":
+      return 1;
+    case "rect":
+      return 2;
+    case "linear":
+      return 3;
+    case "mirror":
+      return 4;
+    default:
+      return 0;
+  }
+}
+
 const VS = `
 attribute vec2 a_position;
 varying vec2 v_canvas;
@@ -63,6 +79,17 @@ float roundedRectAlpha(vec2 p, vec2 halfSize, float radius) {
 
 float maskAlpha(vec2 uv) {
   if (u_maskKind == 0) return 1.0;
+  float feather = max(u_maskFeather, 0.0001);
+  // linear(3)/mirror(4): 投影轴与导出 mask_alpha_expr / CSS linear-gradient 对齐
+  // CSS 0deg 朝上 → 图像 y 向下，方向 (sinθ, -cosθ)
+  if (u_maskKind == 3 || u_maskKind == 4) {
+    vec2 dir = vec2(sin(u_maskRotation), -cos(u_maskRotation));
+    float t = 0.5 + dot(uv - u_maskCenter, dir);
+    float alpha = u_maskKind == 4
+      ? clamp((1.0 - abs(2.0 * t - 1.0)) / feather, 0.0, 1.0)
+      : clamp(t / feather, 0.0, 1.0);
+    return u_maskInvert ? 1.0 - alpha : alpha;
+  }
   vec2 p = uv - u_maskCenter;
   float c = cos(-u_maskRotation);
   float s = sin(-u_maskRotation);
@@ -72,10 +99,10 @@ float maskAlpha(vec2 uv) {
     vec2 r = max(u_maskSize * 0.5, vec2(0.0001));
     dist = length(p / r) - 1.0;
   } else {
+    // rect (2)
     vec2 d = abs(p) - u_maskSize * 0.5;
     dist = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
   }
-  float feather = max(u_maskFeather, 0.0001);
   float alpha = 1.0 - smoothstep(0.0, feather, dist);
   return u_maskInvert ? 1.0 - alpha : alpha;
 }
@@ -283,7 +310,7 @@ export function layerParamsForClip(
     contrast: 1 + (clip?.contrast ?? 0) / 100,
     saturation: 1 + (clip?.saturation ?? 0) / 100,
     cornerRadius: clip?.transform?.cornerRadius ?? 0,
-    maskKind: mask?.kind === "circle" ? 1 : mask?.kind === "rect" ? 2 : 0,
+    maskKind: maskKindCode(mask?.kind),
     maskCx: mask?.cx ?? 0.5,
     maskCy: mask?.cy ?? 0.5,
     maskWidth: mask?.width ?? 1,

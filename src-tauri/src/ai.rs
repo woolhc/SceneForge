@@ -274,6 +274,7 @@ pub async fn enrich_segments(
 
             let status = response.status();
             let body = response.text().await?;
+            eprintln!("[deepseek] enrich status={} body_head={}", status.as_u16(), body.chars().take(200).collect::<String>());
             if !status.is_success() {
                 anyhow::bail!("DeepSeek 富化失败：HTTP {}", status.as_u16());
             }

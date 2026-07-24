@@ -16,7 +16,7 @@ static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 use crate::ffmpeg_expression::{
     compile_keyframe_expression, compile_opacity_alpha_filter, compile_static_opacity_filter,
 };
-use crate::models::{Clip, FfmpegStatus, MediaSource, Project, TrackKind};
+use crate::models::{Clip, ClipTransform, FfmpegStatus, MediaSource, Project, TrackKind};
 use crate::render_graph::compile_render_graph;
 use crate::render_plan::{clips_for_indices, compile_render_plan, RenderUnit as PlannedRenderUnit};
 use crate::source_window::{compile_source_window, SourceWindowPart};
@@ -29,6 +29,66 @@ fn apply_source_window_filter(mut filter: String, part: &SourceWindowPart) -> St
         filter.push_str(&format!(",setpts={:.6}*(PTS-STARTPTS)", 1.0 / part.speed));
     } else {
         filter.push_str(",setpts=PTS-STARTPTS");
+    }
+    filter
+}
+
+/// 解析视觉盒模型：width/height 缺省回退 scale。
+/// `default_contain`：fit 未设置时的默认（base=false/cover，overlay=true/contain，兼容历史）。
+fn resolve_visual_box(
+    tf: &ClipTransform,
+    canvas_w: u32,
+    canvas_h: u32,
+    default_contain: bool,
+) -> (u32, u32, bool) {
+    let scale = tf.scale.max(1.0);
+    let width_pct = tf.width.unwrap_or(scale).clamp(1.0, 100.0);
+    let height_pct = tf.height.unwrap_or(scale).clamp(1.0, 100.0);
+    let box_w = ((canvas_w as f64) * width_pct / 100.0).round().max(1.0) as u32;
+    let box_h = ((canvas_h as f64) * height_pct / 100.0).round().max(1.0) as u32;
+    let contain = match tf.fit.as_deref() {
+        Some("contain") => true,
+        Some("cover") => false,
+        _ => default_contain,
+    };
+    (box_w, box_h, contain)
+}
+
+/// 将源帧缩放到 box 内：contain 完整落入并 pad；cover 铺满裁切。
+/// `pad_opaque`：base 层 letterbox 用实心黑；overlay 用透明以便透出底层。
+fn scale_to_box_filter(box_w: u32, box_h: u32, contain: bool, pad_opaque: bool) -> String {
+    if contain {
+        let color = if pad_opaque { "black" } else { "black@0" };
+        format!(
+            "scale={box_w}:{box_h}:force_original_aspect_ratio=decrease,pad={box_w}:{box_h}:(ow-iw)/2:(oh-ih)/2:color={color}"
+        )
+    } else {
+        format!(
+            "scale={box_w}:{box_h}:force_original_aspect_ratio=increase,crop={box_w}:{box_h}"
+        )
+    }
+}
+
+/// 统一视觉缩放：base 输出画布尺寸（不足则 pad 黑底并按 x/y 定位）；overlay 输出 box 尺寸。
+fn visual_scale_filter(
+    tf: Option<&ClipTransform>,
+    canvas_w: u32,
+    canvas_h: u32,
+    as_base: bool,
+) -> String {
+    let default_tf = ClipTransform::default();
+    let transform = tf.unwrap_or(&default_tf);
+    let (box_w, box_h, contain) =
+        resolve_visual_box(transform, canvas_w, canvas_h, !as_base);
+    let mut filter = scale_to_box_filter(box_w, box_h, contain, as_base);
+    if as_base && (box_w != canvas_w || box_h != canvas_h) {
+        let x_pct = transform.x.clamp(0.0, 100.0) / 100.0;
+        let y_pct = transform.y.clamp(0.0, 100.0) / 100.0;
+        let x = ((canvas_w as f64 - box_w as f64) * x_pct).round() as i64;
+        let y = ((canvas_h as f64 - box_h as f64) * y_pct).round() as i64;
+        filter.push_str(&format!(
+            ",pad={canvas_w}:{canvas_h}:{x}:{y}:color=black"
+        ));
     }
     filter
 }
@@ -1404,9 +1464,7 @@ async fn render_single_pass_video_graph(
 
     let mut filter = String::new();
     for (index, clip) in graph.base_clips.iter().enumerate() {
-        let scale_filter = format!(
-            "scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height}"
-        );
+        let scale_filter = visual_scale_filter(clip.transform.as_ref(), width, height, true);
         let source_crop = clip_source_crop(clip);
         let mut chain = if source_crop.is_empty() {
             scale_filter
@@ -1419,7 +1477,7 @@ async fn render_single_pass_video_graph(
             chain.push_str(",setpts=PTS-STARTPTS");
         }
         chain.push_str(&clip_color_filter(clip));
-        chain.push_str(",format=yuv420p");
+        chain.push_str(",format=yuv420p,setsar=1");
         filter.push_str(&format!("[{index}:v]{chain}[base{index}];"));
     }
     let concat_inputs = (0..graph.base_clips.len())
@@ -1434,16 +1492,15 @@ async fn render_single_pass_video_graph(
         let input_index = graph.base_clips.len() + overlay_index;
         let default_tf = crate::models::ClipTransform::default();
         let transform = clip.transform.as_ref().unwrap_or(&default_tf);
-        let scale_pct = transform.scale.max(1.0) / 100.0;
-        let target_w = ((width as f64) * scale_pct).round().max(1.0) as u32;
-        let target_h = ((height as f64) * scale_pct).round().max(1.0) as u32;
+        let scale_filter = visual_scale_filter(Some(transform), width, height, false);
         let source_crop = clip_source_crop(clip);
         let mut chain = if source_crop.is_empty() {
-            format!("scale={target_w}:{target_h}:force_original_aspect_ratio=decrease")
+            scale_filter
         } else {
             format!(
-                "{},scale={target_w}:{target_h}:force_original_aspect_ratio=decrease",
-                source_crop.trim_start_matches(',')
+                "{},{}",
+                source_crop.trim_start_matches(','),
+                scale_filter
             )
         };
         if (clip.speed - 1.0).abs() > f64::EPSILON {
@@ -1678,12 +1735,9 @@ async fn render_segment_with_overlay(
         };
         let out_label = format!("[v{}]", i);
         let tf = clip.transform.as_ref();
-        // 第一层（底层）：全屏缩放裁切
-        // 其他层：按 scale 缩放，按 x/y 定位
+        // 底层输出画布尺寸；叠加层按盒模型缩放（兼容旧 scale + 新 width/height/fit）
         let scale_expr = if i == 0 {
-            format!(
-                "scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height}"
-            )
+            visual_scale_filter(tf, width, height, true)
         } else {
             let scale_kfs = clip
                 .keyframes
@@ -1702,10 +1756,7 @@ async fn render_segment_with_overlay(
                     "scale=w='{width}*({expr})/100':h='{height}*({expr})/100':eval=frame:force_original_aspect_ratio=decrease"
                 )
             } else {
-                let scale_pct = tf.map(|t| t.scale).unwrap_or(100.0).max(1.0) / 100.0;
-                let target_w = ((width as f64) * scale_pct).round() as u32;
-                let target_h = ((height as f64) * scale_pct).round() as u32;
-                format!("scale={target_w}:{target_h}:force_original_aspect_ratio=decrease")
+                visual_scale_filter(tf, width, height, false)
             }
         };
 
@@ -1986,7 +2037,8 @@ async fn render_single_clip_for_segment(
     };
     let local_path = ensure_media_local(cache_dir, source).await?;
     let scale_filter = format!(
-        "scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},format=yuv420p"
+        "{},format=yuv420p",
+        visual_scale_filter(clip.transform.as_ref(), width, height, true)
     );
     let is_image = source.kind == "image";
     let source_plan = (!is_image).then(|| compile_source_window(clip, seg_start, seg_duration));
@@ -3274,6 +3326,11 @@ fn clip_color_filter(clip: &Clip) -> String {
                     let sigma = 1.0 + intensity * 4.0;
                     parts.push(format!("gblur=sigma={sigma:.2}"));
                 }
+                // 背景虚化：强高斯模糊（知识卡片动态背景等）
+                "blur" => {
+                    let sigma = 2.0 + intensity * 28.0;
+                    parts.push(format!("gblur=sigma={sigma:.2}"));
+                }
                 // 镜像
                 "mirror" => {
                     parts.push("hflip".to_string());
@@ -3411,11 +3468,20 @@ fn mask_alpha_expr(mask: &crate::models::ClipMask) -> String {
             }
         }
         "linear" | "mirror" => {
+            // 与预览 CSS linear-gradient 对齐：
+            // CSS 0deg 朝上 → 图像坐标 y 向下，方向向量 (sinθ, -cosθ)
+            // t≈0.5 为中心面；linear 沿 t 从透明过渡到不透明，mirror 以 t=0.5 为对称可见带
             let f = feather.max(0.0001);
+            let rad = mask.rotation.to_radians();
+            let ux = rad.sin();
+            let uy = -rad.cos();
+            let cx = mask.cx;
+            let cy = mask.cy;
+            let t = format!("(0.5+(X/W-{cx})*{ux:.6}+(Y/H-{cy})*{uy:.6})");
             if mask.kind == "mirror" {
-                format!("255*clip((1-abs(2*X/W-1))/{f},0,1)")
+                format!("255*clip((1-abs(2*{t}-1))/{f},0,1)")
             } else {
-                format!("255*clip((X/W)/{f},0,1)")
+                format!("255*clip(({t})/{f},0,1)")
             }
         }
         _ => "255".to_string(),
@@ -3666,6 +3732,7 @@ mod tests {
             clips,
             render_config: RenderConfig::default(),
             chapters: Vec::new(),
+            composition: None,
             cover_time: None,
             preview_path: None,
             final_path: None,
@@ -3864,4 +3931,71 @@ mod tests {
             .expect("second reverse part missing");
         assert!(first < second);
     }
+
+    #[test]
+    fn mask_alpha_expr_linear_uses_rotation_and_center() {
+        let mask = crate::models::ClipMask {
+            kind: "linear".to_string(),
+            cx: 0.25,
+            cy: 0.75,
+            width: 1.0,
+            height: 1.0,
+            rotation: 90.0,
+            feather: 0.2,
+            invert: false,
+        };
+        let expr = super::mask_alpha_expr(&mask);
+        // 90deg → (sin=1, cos=0) → ux=1, uy=0；中心 (0.25,0.75)
+        assert!(
+            expr.contains("(X/W-0.25)*1.000000"),
+            "linear should project along rotation axis: {expr}"
+        );
+        assert!(
+            expr.contains("(Y/H-0.75)*-0.000000") || expr.contains("(Y/H-0.75)*0.000000") || expr.contains("(Y/H-0.75)*-0.0000"),
+            "linear uy for 90deg should be ~0: {expr}"
+        );
+        assert!(expr.contains("/0.2"), "feather should appear: {expr}");
+        assert!(expr.starts_with("alpha(X,Y)*("), "must multiply existing alpha: {expr}");
+    }
+
+    #[test]
+    fn mask_alpha_expr_mirror_invert_wraps_base() {
+        let mask = crate::models::ClipMask {
+            kind: "mirror".to_string(),
+            cx: 0.5,
+            cy: 0.5,
+            width: 1.0,
+            height: 1.0,
+            rotation: 0.0,
+            feather: 0.1,
+            invert: true,
+        };
+        let expr = super::mask_alpha_expr(&mask);
+        assert!(expr.contains("255-("), "invert should wrap base: {expr}");
+        assert!(expr.contains("abs(2*"), "mirror should use abs(2*t-1): {expr}");
+        // 0deg → (sin=0, cos=1) → ux=0, uy=-1
+        assert!(
+            expr.contains("(Y/H-0.5)*-1.000000"),
+            "0deg mirror should project on -Y: {expr}"
+        );
+    }
+
+    #[test]
+    fn mask_alpha_expr_circle_keeps_normalized_radius() {
+        let mask = crate::models::ClipMask {
+            kind: "circle".to_string(),
+            cx: 0.5,
+            cy: 0.5,
+            width: 0.8,
+            height: 0.6,
+            rotation: 0.0,
+            feather: 0.0,
+            invert: false,
+        };
+        let expr = super::mask_alpha_expr(&mask);
+        assert!(expr.contains("/0.4"), "rx = width/2: {expr}");
+        assert!(expr.contains("/0.3"), "ry = height/2: {expr}");
+        assert!(expr.contains("if(gt("), "hard edge without feather: {expr}");
+    }
+
 }

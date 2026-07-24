@@ -42,6 +42,8 @@ export function VisualLayerOverlay({
     x: transform.x,
     y: transform.y,
     scale: transform.scale,
+    width: transform.width ?? transform.scale,
+    height: transform.height ?? transform.scale,
     rotation: transform.rotation ?? 0,
     effectiveOpacity: 1,
   });

@@ -27,9 +27,8 @@ export function TextTemplatePanel({
               style={{
                 fontFamily: template.style.fontFamily ?? "Noto Sans SC",
                 color: template.style.color ?? "#FFFFFF",
-                textShadow: template.style.strokeColor
-                  ? `1px 1px 0 ${template.style.strokeColor}, -1px -1px 0 ${template.style.strokeColor}, 1px -1px 0 ${template.style.strokeColor}, -1px 1px 0 ${template.style.strokeColor}`
-                  : "none",
+                WebkitTextStroke: template.style.strokeColor ? `1px ${template.style.strokeColor}` : undefined,
+                paintOrder: "stroke fill",
               }}
             >
               文字

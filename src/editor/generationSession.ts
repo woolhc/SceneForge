@@ -123,7 +123,24 @@ export function buildGenerationReport(session: GenerationSession): GenerationRep
 
 export function saveGenerationSession(session: GenerationSession) {
   if (typeof localStorage === "undefined") return;
-  localStorage.setItem(`${STORAGE_PREFIX}${session.projectId}`, JSON.stringify(session));
+  const key = `${STORAGE_PREFIX}${session.projectId}`;
+  const write = () => localStorage.setItem(key, JSON.stringify(session));
+  try {
+    write();
+    return;
+  } catch {
+    // localStorage 配额超限（webview 的 QuotaExceededError，message 为 "The quota has been exceeded."）
+    // 清理同前缀的旧会话后重试；仍失败则放弃持久化——会话仍在内存中，不阻断生成主流程
+  }
+  try {
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(STORAGE_PREFIX) && k !== key) localStorage.removeItem(k);
+    }
+    write();
+  } catch {
+    /* 持久化失败不致命 */
+  }
 }
 
 export function loadGenerationSession(projectId: string): GenerationSession | null {

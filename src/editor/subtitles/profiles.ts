@@ -15,6 +15,14 @@ function canvasSize(ratio: Project["ratio"], resolution: string) {
   return { width: shortEdge, height: Math.round(shortEdge * 16 / 9) };
 }
 
+function compositionPreferredY(templateId: string | undefined | null, bilingual: boolean): number | null {
+  if (templateId === "knowledge-card") {
+    // 底部字幕区：主字幕约 78%，对照约 88%（layout 用 primary 作为 preferredY）
+    return bilingual ? 0.78 : 0.8;
+  }
+  return null;
+}
+
 export function subtitleLayoutProfile(project: Project, bilingual = false): SubtitleLayoutProfile {
   const ratio = project.ratio === "16:9" || project.ratio === "1:1" ? project.ratio : "9:16";
   const { width, height } = canvasSize(ratio, project.renderConfig.resolution);
@@ -32,11 +40,13 @@ export function subtitleLayoutProfile(project: Project, bilingual = false): Subt
     minimumGap: 0.08,
   } as const;
 
+  const compositionY = compositionPreferredY(project.composition?.templateId, bilingual);
+
   if (ratio === "16:9") {
     return {
       ...common,
       safeInsets: { top: 0.06, right: 0.08, bottom: 0.08, left: 0.08 },
-      preferredY: 0.84,
+      preferredY: compositionY ?? 0.84,
       maxWidthRatio: bilingual ? 0.68 : 0.72,
       primaryFontSizeRatio: 0.043,
       secondaryFontSizeRatio: 0.03,
@@ -50,7 +60,7 @@ export function subtitleLayoutProfile(project: Project, bilingual = false): Subt
     return {
       ...common,
       safeInsets: { top: 0.07, right: 0.09, bottom: 0.12, left: 0.09 },
-      preferredY: 0.78,
+      preferredY: compositionY ?? 0.78,
       maxWidthRatio: bilingual ? 0.76 : 0.8,
       primaryFontSizeRatio: 0.046,
       secondaryFontSizeRatio: 0.032,
@@ -60,10 +70,14 @@ export function subtitleLayoutProfile(project: Project, bilingual = false): Subt
     };
   }
 
+  // 知识卡片：底区黑条更高，收紧 bottom inset，避免布局把字幕又抬回中部
+  const isKnowledgeCard = project.composition?.templateId === "knowledge-card";
   return {
     ...common,
-    safeInsets: { top: 0.08, right: 0.14, bottom: 0.18, left: 0.08 },
-    preferredY: 0.7,
+    safeInsets: isKnowledgeCard
+      ? { top: 0.06, right: 0.06, bottom: 0.08, left: 0.06 }
+      : { top: 0.08, right: 0.14, bottom: 0.18, left: 0.08 },
+    preferredY: compositionY ?? 0.7,
     maxWidthRatio: bilingual ? 0.74 : 0.78,
     primaryFontSizeRatio: 0.048,
     secondaryFontSizeRatio: 0.034,
