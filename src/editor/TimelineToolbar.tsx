@@ -6,6 +6,7 @@ import {
   CopyPlus,
   Scissors,
   Trash2,
+  VolumeX,
 } from "lucide-react";
 
 export function TimelineToolbar({
@@ -20,6 +21,7 @@ export function TimelineToolbar({
   onPaste,
   onDuplicate,
   onAddChapter,
+  onMuteAllVideoAudio,
 }: {
   canEditProject: boolean;
   canEditSelection: boolean;
@@ -32,6 +34,7 @@ export function TimelineToolbar({
   onPaste: () => void;
   onDuplicate: () => void;
   onAddChapter: () => void;
+  onMuteAllVideoAudio: () => void;
 }) {
   return (
     <div className="timeline-head">
@@ -60,6 +63,14 @@ export function TimelineToolbar({
         <button onClick={onAddChapter} disabled={!canEditProject} title="在播放头处添加章节标记">
           <Bookmark size={15} />
           章节
+        </button>
+        <button
+          onClick={onMuteAllVideoAudio}
+          disabled={!canEditProject}
+          title="将所有视频轨片段的原声音量设为 0，常用于导入配音后清除素材自带声音"
+        >
+          <VolumeX size={15} />
+          静音视频原声
         </button>
       </div>
       {zoomControls}

@@ -6,6 +6,7 @@ import { positionVisualLayerBox } from "../renderGraph/visualLayout";
 import { getLutData } from "../luts";
 import type { Clip, MediaSource, Project } from "../types";
 import type { EngineState, PreviewRenderer } from "./PreviewRenderer";
+import { previewCssFilter } from "./previewFilters";
 import { WebGLCompositor, layerParamsForClip } from "./WebGLCompositor";
 
 type MP4Buffer = ArrayBuffer & { fileStart?: number };
@@ -380,13 +381,12 @@ export class WebCodecsRenderer implements PreviewRenderer {
     const baseLayer = this.activeBaseLayer();
     const baseClip = baseLayer?.clip ?? null;
     if (!baseLayer || !baseClip) return;
-    const scale = Math.max(0.01, baseLayer.scale / 100);
     const layout = positionVisualLayerBox(
       baseLayer,
       this.canvas.width,
       this.canvas.height,
-      this.canvas.width * scale,
-      this.canvas.height * scale,
+      this.canvas.width * (Math.max(1, baseLayer.width) / 100),
+      this.canvas.height * (Math.max(1, baseLayer.height) / 100),
     );
     if (this.compositor) {
       this.compositor.resize(this.canvas.width || 1, this.canvas.height || 1);
@@ -493,18 +493,20 @@ export class WebCodecsRenderer implements PreviewRenderer {
       const clip = layer.clip;
       const element = this.overlayElements.get(clip.id);
       if (!element || !mediaElementReady(element)) continue;
-      const scale = Math.max(0.01, layer.scale / 100);
       const opacity = layer.effectiveOpacity;
-      const maxWidth = this.canvas.width * scale;
-      const maxHeight = this.canvas.height * scale;
+      const maxWidth = this.canvas.width * (Math.max(1, layer.width) / 100);
+      const maxHeight = this.canvas.height * (Math.max(1, layer.height) / 100);
       const intrinsicWidth =
         element instanceof HTMLVideoElement ? element.videoWidth : element.naturalWidth;
       const intrinsicHeight =
         element instanceof HTMLVideoElement ? element.videoHeight : element.naturalHeight;
       if (!intrinsicWidth || !intrinsicHeight) continue;
-      const fit = Math.min(maxWidth / intrinsicWidth, maxHeight / intrinsicHeight);
-      const drawWidth = intrinsicWidth * fit;
-      const drawHeight = intrinsicHeight * fit;
+      const fitRatio =
+        layer.fit === "cover"
+          ? Math.max(maxWidth / intrinsicWidth, maxHeight / intrinsicHeight)
+          : Math.min(maxWidth / intrinsicWidth, maxHeight / intrinsicHeight);
+      const drawWidth = intrinsicWidth * fitRatio;
+      const drawHeight = intrinsicHeight * fitRatio;
       const layout = positionVisualLayerBox(
         layer,
         this.canvas.width,
@@ -607,11 +609,8 @@ function mediaElementReady(element: HTMLVideoElement | HTMLImageElement) {
 }
 
 function canvasFilter(clip: Clip | null) {
-  if (!clip) return "none";
-  const brightness = 1 + clip.brightness / 100;
-  const contrast = 1 + clip.contrast / 100;
-  const saturation = 1 + clip.saturation / 100;
-  return `brightness(${Math.max(0, brightness)}) contrast(${Math.max(0, contrast)}) saturate(${Math.max(0, saturation)})`;
+  // 与 DOM 预览共用，保证 blur/glow 等特效一致
+  return previewCssFilter(clip);
 }
 
 function applyClipPath(
@@ -624,26 +623,99 @@ function applyClipPath(
   const mask = clip.mask;
   if (!mask && cornerRadius <= 0) return;
   ctx.beginPath();
-  if (mask && !mask.invert && mask.kind === "circle") {
-    ctx.ellipse(
-      -drawWidth / 2 + drawWidth * mask.cx,
-      -drawHeight / 2 + drawHeight * mask.cy,
-      Math.max(1, (drawWidth * mask.width) / 2),
-      Math.max(1, (drawHeight * mask.height) / 2),
-      (mask.rotation * Math.PI) / 180,
-      0,
-      Math.PI * 2,
-    );
-  } else if (mask && !mask.invert && mask.kind === "rect") {
-    const x = -drawWidth / 2 + drawWidth * (mask.cx - mask.width / 2);
-    const y = -drawHeight / 2 + drawHeight * (mask.cy - mask.height / 2);
-    ctx.rect(x, y, drawWidth * mask.width, drawHeight * mask.height);
+  if (mask && (mask.kind === "circle" || mask.kind === "rect" || mask.kind === "linear" || mask.kind === "mirror")) {
+    pathForMask(ctx, mask, drawWidth, drawHeight);
+    // invert 用 evenodd 挖空
+    if (mask.invert && (mask.kind === "circle" || mask.kind === "rect" || mask.kind === "mirror")) {
+      ctx.clip("evenodd");
+      return;
+    }
+    ctx.clip();
+    return;
   } else if (cornerRadius > 0 && "roundRect" in ctx) {
     ctx.roundRect(-drawWidth / 2, -drawHeight / 2, drawWidth, drawHeight, cornerRadius);
   } else {
     ctx.rect(-drawWidth / 2, -drawHeight / 2, drawWidth, drawHeight);
   }
   ctx.clip();
+}
+
+/** Canvas 2D 硬边蒙版路径（feather 由 WebGL 路径处理；此处保证 invert/linear/mirror 可用） */
+function pathForMask(
+  ctx: CanvasRenderingContext2D,
+  mask: NonNullable<Clip["mask"]>,
+  drawWidth: number,
+  drawHeight: number,
+) {
+  const cx = -drawWidth / 2 + drawWidth * mask.cx;
+  const cy = -drawHeight / 2 + drawHeight * mask.cy;
+  if (mask.kind === "circle") {
+    ctx.ellipse(
+      cx,
+      cy,
+      Math.max(1, (drawWidth * mask.width) / 2),
+      Math.max(1, (drawHeight * mask.height) / 2),
+      ((mask.rotation ?? 0) * Math.PI) / 180,
+      0,
+      Math.PI * 2,
+    );
+    if (mask.invert) {
+      // 外框顺时针 + 内椭圆（已画）形成环带；用 evenodd
+      ctx.rect(drawWidth / 2, -drawHeight / 2, -drawWidth, drawHeight);
+    }
+    return;
+  }
+  if (mask.kind === "rect") {
+    const x = -drawWidth / 2 + drawWidth * (mask.cx - mask.width / 2);
+    const y = -drawHeight / 2 + drawHeight * (mask.cy - mask.height / 2);
+    const w = drawWidth * mask.width;
+    const h = drawHeight * mask.height;
+    if (mask.invert) {
+      ctx.rect(-drawWidth / 2, -drawHeight / 2, drawWidth, drawHeight);
+      ctx.rect(x + w, y, -w, h);
+    } else {
+      ctx.rect(x, y, w, h);
+    }
+    return;
+  }
+  // linear / mirror：硬边半平面 / 中心带（无 feather）
+  const angle = ((mask.rotation ?? (mask.kind === "mirror" ? 90 : 0)) * Math.PI) / 180;
+  const ux = Math.sin(angle);
+  const uy = -Math.cos(angle);
+  // 取足够大的半平面多边形
+  const extent = Math.max(drawWidth, drawHeight) * 2;
+  const px = -uy * extent;
+  const py = ux * extent;
+  if (mask.kind === "mirror") {
+    // 可见带：|投影| < 0.25（相对归一化轴约半宽），硬边近似
+    const half = extent * 0.25;
+    const ox = ux * half;
+    const oy = uy * half;
+    ctx.moveTo(cx - ox + px, cy - oy + py);
+    ctx.lineTo(cx + ox + px, cy + oy + py);
+    ctx.lineTo(cx + ox - px, cy + oy - py);
+    ctx.lineTo(cx - ox - px, cy - oy - py);
+    ctx.closePath();
+    if (mask.invert) {
+      ctx.rect(drawWidth / 2, -drawHeight / 2, -drawWidth, drawHeight);
+    }
+    return;
+  }
+  // linear：t>=0.5 侧可见（与导出 t 从中心向 dir 正方向渐显一致的硬边近似）
+  const ox = ux * extent;
+  const oy = uy * extent;
+  if (mask.invert) {
+    ctx.moveTo(cx - px, cy - py);
+    ctx.lineTo(cx - ox - px, cy - oy - py);
+    ctx.lineTo(cx - ox + px, cy - oy + py);
+    ctx.lineTo(cx + px, cy + py);
+  } else {
+    ctx.moveTo(cx - px, cy - py);
+    ctx.lineTo(cx + ox - px, cy + oy - py);
+    ctx.lineTo(cx + ox + px, cy + oy + py);
+    ctx.lineTo(cx + px, cy + py);
+  }
+  ctx.closePath();
 }
 
 async function demuxVideo(src: string): Promise<DecodedClip | null> {

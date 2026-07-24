@@ -2,25 +2,17 @@ import type { SubtitleProtectedRange, TimedSentence, WordCue } from "../../types
 import { breakSubtitleLines } from "./lineBreaker";
 import { primaryFontSize } from "./profiles";
 import type { SubtitleLayoutProfile } from "./types";
+import { needsWordSpace } from "./wordSpacing";
 
 const SENTENCE_ENDERS = new Set(["。", "！", "？", "!", "?", "."]);
 const CLAUSE_ENDERS = new Set(["，", "、", "；", "：", ",", ";", ":"]);
+// 剪映/Netflix/BBC 字幕规范均建议避免让连词孤立留在上一句末尾，应与下一句连在一起。
+const LEADING_CONJUNCTIONS = new Set(["but", "and", "or", "so", "because", "although", "though", "yet", "而", "但", "但是", "所以", "因为", "并且", "而且"]);
 
 function smartJoin(words: WordCue[]) {
   let result = "";
   for (const [index, word] of words.entries()) {
-    if (index > 0) {
-      const previousText = words[index - 1].text;
-      const previous = previousText[previousText.length - 1];
-      const current = word.text[0];
-      const alphanumericBoundary = previous && current && /[a-z0-9]/i.test(previous) && /[a-z0-9]/i.test(current);
-      const punctuationBoundary = previous && current && /[,;:!?]/.test(previous) && /[a-z0-9]/i.test(current);
-      const sentenceBoundary = previous === "."
-        && current
-        && /[a-z0-9]/i.test(current)
-        && !(/^\d+\.$/.test(previousText) && /\d/.test(current));
-      if (alphanumericBoundary || punctuationBoundary || sentenceBoundary) result += " ";
-    }
+    if (index > 0 && needsWordSpace(words[index - 1].text, word.text)) result += " ";
     result += word.text;
   }
   return result.trim();
@@ -67,6 +59,10 @@ function boundaryScore(words: WordCue[], endIndex: number, advice?: SubtitleSegm
   if (gap >= 0.6) score += 55;
   else if (gap >= 0.3) score += 28;
   else if (gap >= 0.18) score += 10;
+  // 连词（but/而/但…）本应引出下一句，若被拉进当前句尾（常见于凑够 minDuration），
+  // 断点会显得突兀、语义割裂：惩罚"以连词收尾"的候选断点，鼓励算法把它留给下一句开头。
+  const lastWordLower = words[endIndex].text.toLowerCase();
+  if (LEADING_CONJUNCTIONS.has(lastWordLower)) score -= 45;
   return score;
 }
 

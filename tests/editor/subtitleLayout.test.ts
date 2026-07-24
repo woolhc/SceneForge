@@ -21,6 +21,13 @@ assert.equal(landscape.canvasWidth, 1920);
 assert.equal(landscape.canvasHeight, 1080);
 assert.equal(primaryFontSize(subtitleLayoutProfile(project("9:16", "4k"))), primaryFontSize(vertical) * 2);
 
+const knowledge = subtitleLayoutProfile({
+  ...project("9:16"),
+  composition: { templateId: "knowledge-card", content: {} },
+}, true);
+assert.equal(knowledge.preferredY, 0.78);
+assert.equal(knowledge.safeInsets.bottom, 0.08);
+
 const maxWidth = vertical.canvasWidth * vertical.maxWidthRatio;
 const lines = breakSubtitleLines("人生最好的状态不是一直向前冲", {
   maxLines: 2,

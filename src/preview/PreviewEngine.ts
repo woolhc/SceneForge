@@ -7,45 +7,7 @@ import type { EvaluatedFrame, RenderGraph } from "../renderGraph/types";
 import { visualLayerCssStyle } from "../renderGraph/visualLayout";
 import { MediaElementPool, type PooledMedia } from "./MediaElementPool";
 import type { EngineState, PreviewRenderer } from "./PreviewRenderer";
-
-function previewCssFilter(clip: Clip | null): string {
-  if (!clip) return "none";
-  const filters = [
-    `brightness(${Math.max(0, 1 + (clip.brightness ?? 0) / 100)})`,
-    `contrast(${Math.max(0, 1 + (clip.contrast ?? 0) / 100)})`,
-    `saturate(${Math.max(0, 1 + (clip.saturation ?? 0) / 100)})`,
-  ];
-  switch (clip.filter) {
-    case "bw":
-      filters.push("grayscale(1)");
-      break;
-    case "sepia":
-      filters.push("sepia(0.8)", "saturate(0.85)");
-      break;
-    case "warm":
-      filters.push("sepia(0.18)", "saturate(1.18)", "hue-rotate(-8deg)");
-      break;
-    case "cool":
-      filters.push("saturate(1.08)", "hue-rotate(10deg)");
-      break;
-    case "vintage":
-      filters.push("sepia(0.35)", "contrast(0.95)", "saturate(0.85)");
-      break;
-    case "cinematic":
-      filters.push("contrast(1.12)", "saturate(0.9)");
-      break;
-    case "fresh":
-      filters.push("brightness(1.04)", "saturate(1.12)");
-      break;
-    case "moody":
-      filters.push("contrast(1.18)", "brightness(0.94)", "saturate(0.85)");
-      break;
-    case "soft":
-      filters.push("contrast(0.94)", "brightness(1.03)", "saturate(0.92)");
-      break;
-  }
-  return filters.join(" ");
-}
+import { previewCssFilter } from "./previewFilters";
 
 /** 把 ClipCrop (0-100 百分比) 转为 CSS clip-path inset() 字符串。无裁剪返回空串。 */
 function cropToClipPath(crop: Clip["crop"] | null | undefined): string {
@@ -85,6 +47,12 @@ export class PreviewEngine implements PreviewRenderer {
   private playing = false;
   private currentTime = 0;
   private lastFrameAt = 0;
+  /**
+   * 音频硬件时钟锚点：{ctxTime, timelineTime} 记录"某个 AudioContext.currentTime 对应的时间线时间"。
+   * RAF 的 performance.now() 增量累加与音频硬件采样时钟是两个独立时钟源，长时间播放会缓慢漂移
+   * （字幕/画面越播越"飘"）。用这个锚点周期性把 RAF 累加时钟拉回音频硬件时钟，音频听感为准。
+   */
+  private audioClockAnchor: { ctxTime: number; timelineTime: number } | null = null;
   private lastPreloadAt = 0;
   private rafId: number | null = null;
   private alignmentInFlight = false;
@@ -183,6 +151,8 @@ export class PreviewEngine implements PreviewRenderer {
     if (this.audioCtx.state === "suspended") {
       void this.audioCtx.resume();
     }
+    // 同步打锚点，避免 startAudioScheduling 的异步间隙里仍用 RAF 累加导致开局就漂
+    this.captureAudioClockAnchor();
     this.startAudioScheduling();
     this.applyVideoAlignment(true);
     this.loop();
@@ -216,6 +186,7 @@ export class PreviewEngine implements PreviewRenderer {
     void this.preloadLookahead();
     this.syncOverlays();
     if (wasPlaying) {
+      this.captureAudioClockAnchor();
       this.startAudioScheduling();
       this.lastFrameAt = performance.now();
       this.loop();
@@ -276,7 +247,7 @@ export class PreviewEngine implements PreviewRenderer {
     const delta = (now - this.lastFrameAt) / 1000;
     this.lastFrameAt = now;
 
-    this.currentTime += delta;
+    this.advanceClockFromMaster(delta);
     const duration = this.getDuration();
     if (this.currentTime >= duration) {
       this.currentTime = duration;
@@ -294,6 +265,52 @@ export class PreviewEngine implements PreviewRenderer {
     this.publish();
     this.rafId = requestAnimationFrame(this.loop);
   };
+
+  /** 记录 AudioContext ↔ 时间线的锚点，供 RAF 主时钟校正。 */
+  private captureAudioClockAnchor() {
+    if (!this.audioCtx || this.audioCtx.state === "closed") return;
+    this.audioClockAnchor = {
+      ctxTime: this.audioCtx.currentTime,
+      timelineTime: this.currentTime,
+    };
+  }
+
+  /**
+   * 主时钟优先级：
+   * 1) 运行中的 AudioContext（Web Audio 配音/BGM 与硬件采样率同源）
+   * 2) 当前正在播的视频元素媒体时钟（无独立音轨、只听视频原声时）
+   * 3) RAF performance.now() 增量（纯画面/时钟不可用时的兜底）
+   */
+  private advanceClockFromMaster(rafDelta: number) {
+    if (this.audioClockAnchor && this.audioCtx?.state === "running") {
+      this.currentTime =
+        this.audioClockAnchor.timelineTime + (this.audioCtx.currentTime - this.audioClockAnchor.ctxTime);
+      return;
+    }
+    const videoTimeline = this.readTimelineTimeFromActiveVideo();
+    if (videoTimeline !== null) {
+      this.currentTime = videoTimeline;
+      return;
+    }
+    this.currentTime += rafDelta;
+  }
+
+  /** 从当前 base 视频元素反推时间线时间；仅在视频确实在播时可用。 */
+  private readTimelineTimeFromActiveVideo(): number | null {
+    if (!(this.videoEl instanceof HTMLVideoElement) || !this.activeBaseClip) return null;
+    const video = this.videoEl;
+    if (video.paused || video.readyState < 2) return null;
+    const clip = this.activeBaseClip;
+    const speed = Math.max(0.0001, Math.abs(clip.speed || 1));
+    const timeline =
+      clip.startOnTrack + (video.currentTime - clip.sourceIn) / speed;
+    if (!Number.isFinite(timeline)) return null;
+    // 防止异常 seek/元数据错误把时间线甩飞
+    if (timeline < clip.startOnTrack - 0.25 || timeline > clip.startOnTrack + clip.duration + 0.25) {
+      return null;
+    }
+    return timeline;
+  }
 
   /** T4.9+: 播放中实时更新活跃音频 clip 的 gain（关键帧 + fadeIn/fadeOut） */
   private updateAudioGainsLive() {
@@ -362,7 +379,7 @@ export class PreviewEngine implements PreviewRenderer {
 
    const item = await this.mediaPool.acquire(media.id, src, kind);
    item.el.style.zIndex = "3";
-   item.el.style.objectFit = "cover";
+   item.el.style.objectFit = evaluated.fit === "contain" ? "contain" : "cover";
    // base 层也读取 clip.transform（图片底层需要支持位置/缩放/旋转/不透明度）
    const layout = visualLayerCssStyle(evaluated);
    item.el.style.inset = "auto";
@@ -377,13 +394,25 @@ export class PreviewEngine implements PreviewRenderer {
    item.el.style.clipPath = cropPath || "";
    item.el.style.opacity = layout.opacity;
    item.el.style.filter = previewCssFilter(clip);
+   // 主轨也应用蒙版（此前仅 overlay 路径有，导致 base 设蒙版预览无效）
+   this.applyOverlayMask(item.el, clip.mask);
 
    if (kind === "video") {
      const video = item.el as HTMLVideoElement;
-     video.playbackRate = rate;
-     const seekThreshold = 0.3 + rate * 0.2;
-     if (force || !sameMediaContinuous || Math.abs(video.currentTime - targetSourceTime) > seekThreshold) {
+     const drift = video.currentTime - targetSourceTime;
+     const absDrift = Math.abs(drift);
+     // 硬 seek：切换素材/强制对齐/偏差过大时直接跳转
+     const hardSeekThreshold = 0.18 + rate * 0.1;
+     if (force || !sameMediaContinuous || absDrift > hardSeekThreshold) {
+       video.playbackRate = rate;
        await this.mediaPool.seekTo(item, Math.min(Math.max(0, targetSourceTime), Math.max(0, (media.duration || 0) - 0.05)));
+     } else if (this.playing && absDrift > 0.035) {
+       // 软校正：视频略慢/略快时微调 playbackRate，避免 0.3s 容差内越漂越远
+       // drift > 0 表示视频超前 → 略减速；drift < 0 表示落后 → 略加速
+       const correction = Math.max(0.9, Math.min(1.1, 1 - drift * 0.8));
+       video.playbackRate = Math.max(0.05, rate * correction);
+     } else {
+       video.playbackRate = rate;
      }
      if (item.gain) {
        const audioLayer = this.evaluatedFrame()?.audioLayers.find((layer) => layer.id === clip.id);
@@ -528,7 +557,8 @@ export class PreviewEngine implements PreviewRenderer {
       const cssFilter = previewCssFilter(clip);
       // T4.x: 裁剪（crop）+ 入场/出场转场近似（fade 类）
       const cropPath = cropToClipPath(clip.crop);
-      const styleSignature = JSON.stringify({ layout, mix: tf?.mix ?? "", mask: m ?? null, cssFilter, cropPath });
+      const objectFit = evaluated.fit === "contain" ? "contain" : "cover";
+      const styleSignature = JSON.stringify({ layout, mix: tf?.mix ?? "", mask: m ?? null, cssFilter, cropPath, objectFit });
       if (this.overlayStyleSignatures.get(clip.id) !== styleSignature) {
         this.overlayStyleSignatures.set(clip.id, styleSignature);
         v.style.left = layout.left;
@@ -539,6 +569,7 @@ export class PreviewEngine implements PreviewRenderer {
         v.style.opacity = layout.opacity;
         v.style.filter = cssFilter;
         v.style.clipPath = cropPath || "";
+        v.style.objectFit = objectFit;
         if (tf?.mix) {
           (v.style.mixBlendMode as string) = tf.mix;
         } else {
@@ -552,14 +583,22 @@ export class PreviewEngine implements PreviewRenderer {
       const rate = evaluated.speed;
       if (v instanceof HTMLVideoElement) {
         v.playbackRate = rate;
-        const seekThreshold = 0.3 + rate * 0.2;
-        if (Math.abs(v.currentTime - targetSourceTime) > seekThreshold) {
+        const drift = v.currentTime - targetSourceTime;
+        const absDrift = Math.abs(drift);
+        const hardSeekThreshold = 0.18 + rate * 0.1;
+        if (absDrift > hardSeekThreshold) {
+          v.playbackRate = rate;
           try {
             v.currentTime = Math.min(
               Math.max(0, targetSourceTime),
               Math.max(0, (media?.duration || 0) - 0.05),
             );
           } catch { /* metadata not ready */ }
+        } else if (this.playing && absDrift > 0.035) {
+          const correction = Math.max(0.9, Math.min(1.1, 1 - drift * 0.8));
+          v.playbackRate = Math.max(0.05, rate * correction);
+        } else {
+          v.playbackRate = rate;
         }
         if (this.playing && v.paused) {
           void v.play().catch(() => {});
@@ -574,7 +613,7 @@ export class PreviewEngine implements PreviewRenderer {
   }
 
   private applyOverlayMask(el: HTMLElement, mask: Clip["mask"]) {
-    el.style.clipPath = "";
+    // 不清理 clipPath：crop 与 mask 可叠加（crop 用 clip-path，mask 用 mask-image）
     el.style.maskImage = "";
     el.style.webkitMaskImage = "";
     el.style.maskComposite = "";
@@ -668,6 +707,7 @@ export class PreviewEngine implements PreviewRenderer {
     );
     if (audioMedia.length === 0) return;
     const ctx = await this.ensureAudioContext();
+    let loadedNew = false;
     for (const media of audioMedia) {
       if (this.audioBuffers.has(media.id)) continue;
       const src = resolveSrc(media);
@@ -677,9 +717,16 @@ export class PreviewEngine implements PreviewRenderer {
         const buf = await resp.arrayBuffer();
         const audioBuffer = await ctx.decodeAudioData(buf);
         this.audioBuffers.set(media.id, audioBuffer);
+        loadedNew = true;
       } catch {
         /* 单个失败不阻塞 */
       }
+    }
+    // 播放中才加载完 buffer 时，补一次调度，否则整段配音会静音、主时钟也没有真实音频源可对齐
+    if (loadedNew && this.playing) {
+      this.stopAudioScheduling();
+      this.captureAudioClockAnchor();
+      this.startAudioScheduling();
     }
   }
 
@@ -692,6 +739,7 @@ export class PreviewEngine implements PreviewRenderer {
     void this.ensureAudioContext().then((ctx) => {
       if (!this.playing || !this.project) return;
       const now = ctx.currentTime;
+      this.audioClockAnchor = { ctxTime: now, timelineTime: this.currentTime };
       const audioTrackIds = new Set(
         this.project.tracks.filter((t) => t.kind === "voiceover" || t.kind === "audio").map((t) => t.id),
       );
@@ -718,24 +766,35 @@ export class PreviewEngine implements PreviewRenderer {
 
         const node = ctx.createBufferSource();
         node.buffer = buffer;
-        // playbackRate 在 start 时固定，speedCurve 用瞬时速度（近似）
+        // playbackRate 在 start 时固定；曲线变速取当前瞬时速度（完整动态曲线需分段 AudioBufferSource）
         node.playbackRate.value = evaluated.speed;
         const gain = ctx.createGain();
         const vol = evaluated.volume;
-        // T4.9: fadeIn/fadeOut 用 linearRampToValueAtTime
+        // T4.9: fadeIn/fadeOut 用 linearRamp；有 volume 关键帧时按时间线采样分段 ramp
         const fadeIn = Math.max(0, clip.fadeIn ?? 0);
         const fadeOut = Math.max(0, clip.fadeOut ?? 0);
         const startAt = now + whenOffset;
         const endAt = startAt + remainingDuration;
-        if (fadeIn > 0.001 && offsetIntoClip < fadeIn) {
-          // 还在 fadeIn 区间内：从 0 ramp 到 vol
+        const volumeKfs = clip.keyframes?.volume;
+        if (volumeKfs && volumeKfs.length > 0 && this.renderGraph) {
+          // 每 50ms 采样一次 volume 关键帧（含 fade 乘子）
+          const step = 0.05;
+          let t = 0;
+          while (t <= remainingDuration + 1e-6) {
+            const timelineT = this.currentTime + whenOffset + t;
+            const layer = evaluateFrame(this.renderGraph, timelineT).audioLayers.find((l) => l.id === clip.id);
+            const g = layer?.gain ?? vol;
+            if (t === 0) gain.gain.setValueAtTime(g, startAt);
+            else gain.gain.linearRampToValueAtTime(g, startAt + t);
+            t += step;
+          }
+        } else if (fadeIn > 0.001 && offsetIntoClip < fadeIn) {
           gain.gain.setValueAtTime(0, startAt);
           gain.gain.linearRampToValueAtTime(vol, startAt + fadeIn);
         } else {
           gain.gain.value = vol;
         }
-        if (fadeOut > 0.001 && remainingDuration > fadeOut) {
-          // fadeOut：在 clip 结束前 ramp 到 0
+        if ((!volumeKfs || volumeKfs.length === 0) && fadeOut > 0.001 && remainingDuration > fadeOut) {
           gain.gain.setValueAtTime(vol, endAt - fadeOut);
           gain.gain.linearRampToValueAtTime(0, endAt);
         }
@@ -766,6 +825,7 @@ export class PreviewEngine implements PreviewRenderer {
     });
     this.activeAudioSources.clear();
     this.clipGainNodes.clear();
+    this.audioClockAnchor = null;
   }
 
   /** T4.9: 播放中实时改某 clip 音量（找到活跃 GainNode 直接赋值） */

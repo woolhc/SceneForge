@@ -1,4 +1,4 @@
-import { ArrowDown, ArrowUp, Clock3, Eye, EyeOff, Image as ImageIcon, Lock, Mic2, MicOff, SlidersHorizontal, Trash2, Type, Unlock, Video } from "lucide-react";
+import { AlertTriangle, ArrowDown, ArrowUp, Clock3, Eye, EyeOff, Image as ImageIcon, Lock, Mic2, MicOff, SlidersHorizontal, Trash2, Type, Unlock, Video } from "lucide-react";
 import React, { useEffect, useRef, useState } from "react";
 import type { Clip, ClipKeyframes, Keyframe, MediaSource, Track } from "../types";
 import { desktopApi } from "../tauri";
@@ -291,12 +291,13 @@ function TimelineTrackInner({
         const clipWidthPx = (widthPct / 100) * timelineWidth;
         const isVideoKind = track.kind === "video" || track.kind === "image";
         const showFilmstrip = isVideoKind && source && source.kind === "video" && clipWidthPx > 60;
+        const isUnbound = isVideoKind && !clip.sourceId;
         const showHandles = true;
         const markers = keyframeMarkers(clip);
         return (
           <div
             key={clip.id}
-            className={`clip ${track.kind} ${clip.id === selectedClipId ? "selected" : ""} ${selectedClipIds?.includes(clip.id) ? "multi-selected" : ""}`}
+            className={`clip ${track.kind} ${clip.id === selectedClipId ? "selected" : ""} ${selectedClipIds?.includes(clip.id) ? "multi-selected" : ""} ${isUnbound ? "clip-unbound" : ""}`}
             style={{
               left: `${leftPct}%`,
               width: `${widthPct}%`,
@@ -325,6 +326,7 @@ function TimelineTrackInner({
               />
             )}
             <span className="clip-label" style={{ textShadow: "0 1px 3px rgba(0,0,0,0.9)", position: "relative", zIndex: 2 }}>
+              {isUnbound && <AlertTriangle size={12} className="clip-unbound-icon" />}
               {track.kind === "video" || track.kind === "image"
                 ? source?.title || "未绑素材"
                 : clip.text || track.name}

@@ -6,6 +6,7 @@ mod ffmpeg_expression;
 mod lut_data;
 mod models;
 mod pexels;
+mod pixabay;
 mod render_graph;
 mod render_plan;
 mod source_window;
@@ -68,6 +69,8 @@ pub fn run() {
             commands::segment_script,
             commands::search_pexels_videos,
             commands::search_pexels_photos,
+            commands::search_pixabay_videos,
+            commands::search_pixabay_photos,
             commands::cache_asset_video,
             commands::generate_narration,
             commands::generate_audio,

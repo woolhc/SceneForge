@@ -121,9 +121,8 @@ export function SubtitlePanel({
                 style={{
                   fontFamily: preset.style.fontFamily ?? "Noto Sans SC",
                   color: preset.style.color ?? "#FFFFFF",
-                  textShadow: preset.style.strokeColor
-                    ? `1px 1px 0 ${preset.style.strokeColor}, -1px -1px 0 ${preset.style.strokeColor}, 1px -1px 0 ${preset.style.strokeColor}, -1px 1px 0 ${preset.style.strokeColor}`
-                    : "none",
+                  WebkitTextStroke: preset.style.strokeColor ? `1px ${preset.style.strokeColor}` : undefined,
+                  paintOrder: "stroke fill",
                 }}
               >
                 字幕

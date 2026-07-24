@@ -42,6 +42,36 @@ export function toggleTrackHidden(project: Project, trackId: string) {
   };
 }
 
+/** 项目是否已有配音轨片段（有则新建视频默认静音，避免原声与旁白叠音/接缝电音）。 */
+export function projectHasVoiceoverClips(project: Project): boolean {
+  const voiceoverTrackIds = new Set(
+    project.tracks.filter((track) => track.kind === "voiceover").map((track) => track.id),
+  );
+  if (voiceoverTrackIds.size === 0) return false;
+  return project.clips.some((clip) => voiceoverTrackIds.has(clip.trackId));
+}
+
+/**
+ * 新建视频/图片轨片段时的默认音量。
+ * 已有配音时默认 0（用户可手动开原声）；无配音时保持 1。
+ */
+export function defaultVideoClipVolume(project: Project): number {
+  return projectHasVoiceoverClips(project) ? 0 : 1;
+}
+
+/** 一键静音所有视频轨片段的原声（volume=0），常用于导入配音后清除素材自带声音。 */
+export function muteAllVideoClips(project: Project) {
+  const videoTrackIds = new Set(
+    project.tracks.filter((track) => track.kind === "video").map((track) => track.id),
+  );
+  return {
+    ...project,
+    clips: project.clips.map((clip) =>
+      videoTrackIds.has(clip.trackId) && clip.volume !== 0 ? { ...clip, volume: 0 } : clip,
+    ),
+  };
+}
+
 export function moveTrack(project: Project, trackId: string, direction: "up" | "down") {
   const sorted = [...project.tracks].sort((a, b) => a.order - b.order);
   const index = sorted.findIndex((track) => track.id === trackId);

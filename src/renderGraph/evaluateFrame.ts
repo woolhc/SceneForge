@@ -1,4 +1,5 @@
 import { timelineToSourceTime } from "../editor/clipTimeMap";
+import { resolveVisualBox } from "../editor/composition/resolveVisualBox";
 import { sampleAllKeyframes } from "../editor/keyframes";
 import { speedAtTimelineTime } from "../editor/speedCurve";
 import { transitionDuration, transitionName } from "../editor/transitions";
@@ -49,7 +50,17 @@ function evaluateVisualLayer(layer: RenderLayer, time: number): EvaluatedVisualL
   const remaining = Math.max(0, clip.duration - relativeTime);
   const sampled = sampleAllKeyframes(clip.keyframes, relativeTime);
   const transform = clip.transform;
-  const opacity = clamp(sampled.opacity ?? transform?.opacity ?? 100, 0, 100);
+  const box = resolveVisualBox({
+    x: sampled.x ?? transform?.x,
+    y: sampled.y ?? transform?.y,
+    scale: sampled.scale ?? transform?.scale,
+    width: transform?.width,
+    height: transform?.height,
+    fit: transform?.fit,
+    opacity: sampled.opacity ?? transform?.opacity,
+    rotation: sampled.rotation ?? transform?.rotation,
+  });
+  const opacity = clamp(box.opacity, 0, 100);
   const transitionInProgress = transitionProgress(clip.transitionIn, relativeTime, 0.5);
   const transitionOutProgress = transitionProgress(clip.transitionOut, remaining, 0.5);
   return {
@@ -57,11 +68,14 @@ function evaluateVisualLayer(layer: RenderLayer, time: number): EvaluatedVisualL
     relativeTime,
     sourceTime: timelineToSourceTime(clip, relativeTime),
     speed: evaluatedSpeed(layer, relativeTime),
-    x: sampled.x ?? transform?.x ?? 50,
-    y: sampled.y ?? transform?.y ?? 50,
+    x: box.x,
+    y: box.y,
     scale: sampled.scale ?? transform?.scale ?? 100,
+    width: box.width,
+    height: box.height,
+    fit: box.fit,
     opacity,
-    rotation: sampled.rotation ?? transform?.rotation ?? 0,
+    rotation: box.rotation,
     transitionInProgress,
     transitionOutProgress,
     effectiveOpacity: (opacity / 100) * transitionInProgress * transitionOutProgress,

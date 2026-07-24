@@ -31,6 +31,9 @@ pub struct FfmpegStatus {
 pub struct AppSettings {
     pub deepseek_api_key: String,
     pub pexels_api_key: String,
+    /// Pixabay API Key（Pexels 配额不足时的备用素材源）
+    #[serde(default)]
+    pub pixabay_api_key: String,
     pub tts_base_url: String,
     #[serde(default)]
     pub fish_audio_api_key: String,
@@ -112,6 +115,7 @@ impl Default for AppSettings {
         Self {
             deepseek_api_key: String::new(),
             pexels_api_key: String::new(),
+            pixabay_api_key: String::new(),
             tts_base_url: "https://ttsttstts.cas-air.cn".to_string(),
             fish_audio_api_key: String::new(),
             fish_audio_model: default_fish_audio_model(),
@@ -256,8 +260,17 @@ pub struct MediaSource {
     pub width: u32,
     pub height: u32,
     pub duration: f64,
-    /// 来源标识："pexels" | "local" | "tts"
+    /// 来源标识："pexels" | "pixabay" | "local" | "tts"
     pub source: String,
+    /// 摄影师 / 创作者显示名（Pexels / Pixabay 署名）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub photographer: Option<String>,
+    /// 创作者主页
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub photographer_url: Option<String>,
+    /// 素材在来源平台上的页面 URL
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_url: Option<String>,
     /// 用户自定标签（素材库筛选用）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
@@ -286,6 +299,9 @@ impl Default for MediaSource {
             height: 0,
             duration: 0.0,
             source: String::new(),
+            photographer: None,
+            photographer_url: None,
+            page_url: None,
             tags: None,
             favorite: None,
             last_used_at: None,
@@ -485,6 +501,15 @@ pub struct ClipTransform {
     /// 缩放，0-100（百分比，100=原始大小）。画中画默认 100=全屏覆盖
     #[serde(default = "default_transform_scale")]
     pub scale: f64,
+    /// 盒宽占画布宽 %；缺省时回退 scale
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<f64>,
+    /// 盒高占画布高 %；缺省时回退 scale
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<f64>,
+    /// 盒内适配："cover" | "contain"；缺省 cover
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fit: Option<String>,
     /// 不透明度，0-100（百分比）
     #[serde(default = "default_transform_opacity")]
     pub opacity: f64,
@@ -615,6 +640,9 @@ impl Default for ClipTransform {
             x: default_transform_xy(),
             y: default_transform_xy(),
             scale: default_transform_scale(),
+            width: None,
+            height: None,
+            fit: None,
             opacity: default_transform_opacity(),
             corner_radius: 0,
             mix: default_transform_mix(),
@@ -906,6 +934,9 @@ pub struct Project {
     /// 章节标记（剪映式"添加章节"，时间轴上的导航锚点）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chapters: Vec<Chapter>,
+    /// 合成版式（知识卡片等）；None=标准铺满
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composition: Option<ProjectComposition>,
     /// 封面时间点（秒，0=未设置；导出时用作 -frames 1 抽帧或 embed 为 metadata）
     #[serde(default)]
     pub cover_time: Option<f64>,
@@ -913,6 +944,26 @@ pub struct Project {
     pub final_path: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// 项目合成版式状态
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectComposition {
+    pub template_id: String,
+    #[serde(default)]
+    pub content: CompositionContent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CompositionContent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_title: Option<String>,
 }
 
 /// 章节标记（剪映式）

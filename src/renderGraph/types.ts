@@ -25,6 +25,11 @@ export type EvaluatedVisualLayer = RenderLayer & {
   x: number;
   y: number;
   scale: number;
+  /** 盒宽占画布宽 %；缺省时与 scale 相同 */
+  width: number;
+  /** 盒高占画布高 %；缺省时与 scale 相同 */
+  height: number;
+  fit: "cover" | "contain";
   opacity: number;
   rotation: number;
   transitionInProgress: number;

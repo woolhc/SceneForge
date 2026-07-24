@@ -73,6 +73,8 @@ assert.equal(
 assert.deepEqual(getApiReadiness(settings), {
   deepseekReady: false,
   pexelsReady: true,
+  pixabayReady: false,
+  stockReady: true,
   fishAudioReady: false,
 });
 assert.deepEqual(getReadinessIssues(settings, modelStatus()).map((issue) => issue.id), [

@@ -47,6 +47,7 @@ import type {
   VoiceProfile,
   WhisperModelDownloadProgress,
   WhisperModelStatus,
+  StockMediaProvider,
 } from "./types";
 import { DEFAULT_SUBTITLE_STYLE, DEFAULT_TEXT_LAYER_STYLE, DEFAULT_TRANSFORM, DEFAULT_CROP, videoWidthForProject } from "./types";
 import type { AiSegment } from "./types";
@@ -76,14 +77,17 @@ import { SpeedCurveEditor } from "./components/SpeedCurveEditor";
 import { ToastContainer } from "./components/Toast";
 import {
   TRACK_KIND_LABELS,
+  defaultVideoClipVolume,
   deleteTrack,
   moveTrack,
+  muteAllVideoClips,
   nextTrackName,
   toggleTrackHidden,
   toggleTrackLocked,
   toggleTrackMuted,
 } from "./editor/timelineActions";
 import { runGeneratePipeline, type GeneratePipelineInput } from "./editor/pipeline";
+import { applyComposition, compositionMediaRatio, getCompositionTemplate } from "./editor/composition";
 import { mergeCachedMediaSource, updateMediaSource } from "./editor/mediaCache";
 import { selectAssetCandidate, type AssetSelectionResult } from "./editor/assetSelection";
 import { buildTranscriptSubtitleProject, prepareTranscriptSubtitles } from "./editor/subtitleFromTranscript";
@@ -100,6 +104,7 @@ import {
   type SubtitleCuePatch,
 } from "./editor/subtitles/document";
 import { normalizeSubtitleStyle, resolveSubtitleAnchor } from "./editor/subtitles/styleContract";
+import { needsWordSpace } from "./editor/subtitles/wordSpacing";
 import {
   buildGenerationReport,
   createGenerationSession,
@@ -314,15 +319,12 @@ function SubtitleItem({ clip, currentTime, fontScale }: {
     ? (s?.animationOut && s.animationOut !== "none" ? `anim-${s.animationOut}` : "")
     : (s?.animationIn && s.animationIn !== "none" ? `anim-${s.animationIn}` : "");
   // 描边/阴影/背景/字间距/行高
-  const strokeWidth = s?.strokeWidth ?? 2;
+  const strokeWidth = (s?.strokeWidth ?? 2) * fontScale;
   const strokeColor = s?.strokeColor ?? "#000";
-  const strokeShadow = strokeWidth > 0
-    ? `${strokeWidth}px ${strokeWidth}px 0 ${strokeColor}, -${strokeWidth}px -${strokeWidth}px 0 ${strokeColor}, ${strokeWidth}px -${strokeWidth}px 0 ${strokeColor}, -${strokeWidth}px ${strokeWidth}px 0 ${strokeColor}`
-    : "none";
   const shadowBlur = s?.shadowBlur ?? 0;
   const shadowColor = s?.shadowColor ?? "#000";
-  const shadow = shadowBlur > 0 ? `, 0 ${Math.round(shadowBlur / 3)}px ${shadowBlur}px ${shadowColor}` : "";
-  const finalTextShadow = strokeShadow === "none" && shadow ? shadow.slice(2) : (strokeShadow === "none" ? "none" : strokeShadow + shadow);
+  // 矢量描边（-webkit-text-stroke）代替多重 text-shadow 叠加，避免中文密集笔画产生棋盘噪点
+  const finalTextShadow = shadowBlur > 0 ? `0 ${Math.round(shadowBlur / 3)}px ${shadowBlur}px ${shadowColor}` : "none";
   const bgColor = s?.backgroundColor ?? "none";
   const bgPadding = s?.backgroundPadding ?? 4;
   const letterSpacing = s?.letterSpacing ?? 0;
@@ -343,6 +345,8 @@ function SubtitleItem({ clip, currentTime, fontScale }: {
         lineHeight,
         color: baseColor,
         textShadow: finalTextShadow,
+        WebkitTextStroke: strokeWidth > 0 ? `${strokeWidth}px ${strokeColor}` : undefined,
+        paintOrder: "stroke fill",
         letterSpacing: `${letterSpacing * fontScale}px`,
         background: bgColor === "none" ? "transparent" : bgColor,
         padding: bgColor === "none" ? "4px 10px" : `${bgPadding * fontScale}px ${bgPadding * 2 * fontScale}px`,
@@ -367,11 +371,7 @@ function SubtitleItem({ clip, currentTime, fontScale }: {
                   <br />
                   {clip.words.map((w, i, arr) => {
                     const prev = arr[i - 1];
-                    const needSpace =
-                      i > 0 &&
-                      prev &&
-                      /[A-Za-z0-9]$/.test(prev.text) &&
-                      /^[A-Za-z0-9]/.test(w.text);
+                    const needSpace = i > 0 && !!prev && needsWordSpace(prev.text, w.text);
                     return (
                       <span key={i} style={{ color: currentTime >= w.start ? highlightColor : baseColor }}>
                         {needSpace ? " " : ""}
@@ -384,11 +384,7 @@ function SubtitleItem({ clip, currentTime, fontScale }: {
             }
             return clip.words.map((w, i, arr) => {
               const prev = arr[i - 1];
-              const needSpace =
-                i > 0 &&
-                prev &&
-                /[A-Za-z0-9]$/.test(prev.text) &&
-                /^[A-Za-z0-9]/.test(w.text);
+              const needSpace = i > 0 && !!prev && needsWordSpace(prev.text, w.text);
               return (
                 <span key={i} style={{ color: currentTime >= w.start ? highlightColor : baseColor }}>
                   {needSpace ? " " : ""}
@@ -512,7 +508,8 @@ function arrangeSegmentsToClips(
         sourceIn: 0,
         sourceOut: vDuration,
         speed: 1,
-        volume: 1,
+        // 分镜编排通常同步生成配音轨：视频原声默认静音，避免导出接缝电音
+        volume: voiceoverTrackId ? 0 : 1,
         fadeIn: 0,
         fadeOut: 0,
       brightness: 0,
@@ -570,6 +567,7 @@ export function App() {
   const [settings, setSettings] = useState<AppSettings>({
     deepseekApiKey: "",
     pexelsApiKey: "",
+    pixabayApiKey: "",
     ttsBaseUrl: "https://ttsttstts.cas-air.cn",
     fishAudioApiKey: "",
     fishAudioModel: "s1",
@@ -613,6 +611,10 @@ export function App() {
     page: number;
     hasMore: boolean;
   } | null>(null);
+  const [libraryProvider, setLibraryProvider] = useState<StockMediaProvider>("pexels");
+  /** 本会话 Pexels 已配额失败时，后续搜素材直接优先 Pixabay */
+  const stockPreferPixabayRef = useRef(false);
+  const stockFallbackNotifiedRef = useRef(false);
   const [assetCachingIds, setAssetCachingIds] = useState<Set<string>>(new Set());
   const activeToolTab = useUiStore((s) => s.activeToolTab);
   const setActiveToolTab = useUiStore((s) => s.setActiveToolTab);
@@ -1837,8 +1839,10 @@ export function App() {
       startPipeline,
       updateStep: updatePipelineStep,
       createSession: async () => {
-        const project = await desktopApi.createProject({ title: "一键生成", ratio: input.ratio });
-        const saved = await desktopApi.saveProject({ ...project, script: input.script });
+        const template = getCompositionTemplate(input.compositionTemplateId);
+        const ratio = template.id === "standard-fill" ? input.ratio : template.canvasRatio;
+        const project = await desktopApi.createProject({ title: "一键生成", ratio });
+        const saved = await desktopApi.saveProject({ ...project, script: input.script, ratio });
         pipelineProject = saved;
         projectRef.current = saved;
         setProject(saved);
@@ -1910,9 +1914,11 @@ export function App() {
           throw new Error("生成会话缺少旁白或转写结果");
         }
         setStatus("正在用 AI 富化分镜并构建真实时间线...");
+        const template = getCompositionTemplate(input.compositionTemplateId);
+        const ratio = template.id === "standard-fill" ? input.ratio : template.canvasRatio;
         const segments = await desktopApi.enrichSegments({
           sentences: session.transcript.sentences,
-          ratio: input.ratio,
+          ratio,
           materialDirection: input.materialDirection || "auto",
         });
         const current = pipelineProject;
@@ -1922,7 +1928,7 @@ export function App() {
           session.narrationSourceId,
           session.transcript,
           segments,
-          input.ratio,
+          ratio,
         );
         pipelineProject = saved;
         return persistSession(updateGenerationSession(session, { stage: "timeline_ready", segments }));
@@ -1935,19 +1941,58 @@ export function App() {
         const usedAssetIds = new Set<string>();
         const results: AssetSelectionResult[] = [];
         let completed = 0;
+        // 主画面素材比例跟版式 media 区走，而不是画布比例
+        // knowledge-card 画布 9:16，但中间条带要 16:9 横版
+        const mediaRatio = compositionMediaRatio(input.compositionTemplateId, current.ratio);
+        // 全部素材源都失败时再跳过剩余分镜，避免只 Pexels 限流就放弃 Pixabay
+        let stockBlockedMessage: string | null = null;
         // 绑定操作顺序执行，避免多个 saveProject 竞争导致后完成的旧快照覆盖新素材。
         for (const [index, clip] of videoClips.entries()) {
           const segment = session.segments[index];
           const query = clip.visualQuery || segment?.visualQuery || segment?.text?.slice(0, 24) || "nature landscape";
-          const result = await searchScoreAndBindAsset(current.id, clip.id, query, current.ratio, clip.duration, {
+          if (stockBlockedMessage) {
+            results.push({
+              clipId: clip.id,
+              query,
+              candidates: [],
+              selected: null,
+              confidence: 0,
+              requiresManualSelection: true,
+              reason: stockBlockedMessage,
+            });
+            completed += 1;
+            setStatus(`素材源均不可用，跳过剩余分镜：${completed}/${videoClips.length}`);
+            continue;
+          }
+          const result = await searchScoreAndBindAsset(current.id, clip.id, query, mediaRatio, clip.duration, {
             materialDirection: input.materialDirection,
             usedAssetIds,
             minimumConfidence: 0.52,
           });
           if (result.selected) usedAssetIds.add(result.selected.id);
-          results.push(result);
+          const reasonText = result.reason || "";
+          // 仅当「全部素材源失败」时封锁后续请求；单一源配额失败会由 searchStockVideos 自动切源
+          const allSourcesFailed = /全部素材源/.test(reasonText)
+            || (/pexels/i.test(reasonText) && /pixabay/i.test(reasonText));
+          if (allSourcesFailed && !result.selected) {
+            // 保留双源明细，不要再被改写成「请手动切换」
+            stockBlockedMessage = reasonText;
+            results.push({ ...result, reason: stockBlockedMessage });
+          } else {
+            results.push(result);
+          }
           completed += 1;
           setStatus(`正在评分匹配素材：${completed}/${videoClips.length}`);
+          if (index < videoClips.length - 1 && !stockBlockedMessage) {
+            await new Promise((resolve) => setTimeout(resolve, 180));
+          }
+        }
+        if (stockBlockedMessage) {
+          pushToast({
+            type: "warning",
+            message: stockBlockedMessage,
+            duration: 10000,
+          });
         }
         pipelineProject = projectRef.current?.id === current.id ? projectRef.current : current;
         return persistSession(updateGenerationSession(session, { stage: "assets_selected", assetResults: results }));
@@ -1963,7 +2008,13 @@ export function App() {
           input.translate,
           "natural",
         );
-        const saved = subtitleResult.project;
+        // 字幕建完后套版式：一次写对主画面盒模型 / 标题层 / 字幕 y
+        const template = getCompositionTemplate(input.compositionTemplateId);
+        const composed = applyComposition(subtitleResult.project, template, {
+          mainTitle: undefined,
+          subTitle: undefined,
+        });
+        const saved = await desktopApi.saveProject(composed);
         pipelineProject = saved;
         projectRef.current = saved;
         setProject(saved);
@@ -2123,6 +2174,14 @@ export function App() {
       if (failed > 0) {
         pushToast({ type: "warning", message: `${failed} 段素材匹配失败` });
       }
+      const unboundCount = videoClips.length - boundCount;
+      if (unboundCount > 0) {
+        pushToast({
+          type: "warning",
+          message: `${unboundCount} 段片段未绑定素材，请在时间线中查看橙色标记的片段并手动补充`,
+          duration: 10000,
+        });
+      }
       detectAssetDuplication(saved);
       setStatus(`分镜方案已执行：${segments.length} 段，已匹配 ${boundCount}/${videoClips.length} 段素材`);
       setEdlSegments(null); // 关闭预览面板
@@ -2131,6 +2190,139 @@ export function App() {
     } finally {
       setEdlBusy(false);
     }
+  }
+
+
+  /**
+   * 按素材源搜索视频。
+   * 不依赖前端 settings 缓存判断 Key 是否存在——后端会校验；
+   * 任一源失败（配额/鉴权/未配置）自动尝试下一个。
+   * 会话内若 Pexels 已确认配额失败，后续请求直接优先 Pixabay，避免每个分镜先撞墙。
+   */
+  async function searchStockVideos(options: {
+    query: string;
+    ratio: string;
+    perPage?: number;
+    page?: number;
+    prefer?: StockMediaProvider;
+  }) {
+    const prefer =
+      options.prefer
+      || (stockPreferPixabayRef.current ? "pixabay" : null)
+      || libraryProvider
+      || "pexels";
+    const order: StockMediaProvider[] =
+      prefer === "pixabay" ? ["pixabay", "pexels"] : ["pexels", "pixabay"];
+    const errors: string[] = [];
+    for (const provider of order) {
+      try {
+        const result =
+          provider === "pixabay"
+            ? await desktopApi.searchPixabayVideos({
+                query: options.query,
+                ratio: options.ratio,
+                perPage: options.perPage,
+                page: options.page,
+              })
+            : await desktopApi.searchPexelsVideos({
+                query: options.query,
+                ratio: options.ratio,
+                perPage: options.perPage,
+                page: options.page,
+              });
+        // 首源失败后备用源成功 → 记会话偏好 + 轻提示一次
+        if (provider === "pixabay" && order[0] === "pexels" && errors.length > 0) {
+          stockPreferPixabayRef.current = true;
+          if (!stockFallbackNotifiedRef.current) {
+            stockFallbackNotifiedRef.current = true;
+            pushToast({
+              type: "info",
+              message: "Pexels 不可用，已自动切换到 Pixabay 继续搜素材",
+              duration: 5000,
+            });
+          }
+          if (libraryProvider !== "pixabay") setLibraryProvider("pixabay");
+        }
+        return { ...result, provider };
+      } catch (error) {
+        const parsed = parsePipelineError(error);
+        errors.push(`${provider}: ${parsed.message}`);
+        // Pexels 配额/限流：后续分镜直接优先 Pixabay
+        if (
+          provider === "pexels"
+          && (/429|配额|限流|quota|rate limit/i.test(parsed.message) || parsed.code === "PEXELS_429")
+        ) {
+          stockPreferPixabayRef.current = true;
+        }
+      }
+    }
+    throw new Error(
+      errors.length
+        ? `全部素材源搜索失败。${errors.join(" | ")}`
+        : "请先在设置中配置 Pexels 或 Pixabay API Key",
+    );
+  }
+
+  async function searchStockPhotos(options: {
+    query: string;
+    ratio: string;
+    perPage?: number;
+    page?: number;
+    prefer?: StockMediaProvider;
+  }) {
+    const prefer =
+      options.prefer
+      || (stockPreferPixabayRef.current ? "pixabay" : null)
+      || libraryProvider
+      || "pexels";
+    const order: StockMediaProvider[] =
+      prefer === "pixabay" ? ["pixabay", "pexels"] : ["pexels", "pixabay"];
+    const errors: string[] = [];
+    for (const provider of order) {
+      try {
+        const result =
+          provider === "pixabay"
+            ? await desktopApi.searchPixabayPhotos({
+                query: options.query,
+                ratio: options.ratio,
+                perPage: options.perPage,
+                page: options.page,
+              })
+            : await desktopApi.searchPexelsPhotos({
+                query: options.query,
+                ratio: options.ratio,
+                perPage: options.perPage,
+                page: options.page,
+              });
+        if (provider === "pixabay" && order[0] === "pexels" && errors.length > 0) {
+          stockPreferPixabayRef.current = true;
+          if (!stockFallbackNotifiedRef.current) {
+            stockFallbackNotifiedRef.current = true;
+            pushToast({
+              type: "info",
+              message: "Pexels 不可用，已自动切换到 Pixabay 继续搜素材",
+              duration: 5000,
+            });
+          }
+          if (libraryProvider !== "pixabay") setLibraryProvider("pixabay");
+        }
+        return { ...result, provider };
+      } catch (error) {
+        const parsed = parsePipelineError(error);
+        errors.push(`${provider}: ${parsed.message}`);
+        if (
+          provider === "pexels"
+          && (/429|配额|限流|quota|rate limit/i.test(parsed.message) || parsed.code === "PEXELS_429")
+        ) {
+          stockPreferPixabayRef.current = true;
+        }
+      }
+    }
+    throw new Error(
+      errors.length
+        ? `全部素材源搜索失败。${errors.join(" | ")}`
+        : "请先在设置中配置 Pexels 或 Pixabay API Key",
+    );
   }
 
   /** 为指定视频 clip 搜素材并绑定。
@@ -2148,7 +2340,8 @@ export function App() {
     },
   ): Promise<AssetSelectionResult> {
     try {
-      const { assets } = await desktopApi.searchPexelsVideos({ query, ratio, perPage: 8 });
+      // 略降 perPage，减少配额消耗；Pexels 失败自动 fallback 到 Pixabay
+      const { assets } = await searchStockVideos({ query, ratio, perPage: 6 });
       setAssetCandidates((previous) => ({ ...previous, [clipId]: assets }));
       const result = selectAssetCandidate(assets, {
         clipId,
@@ -2164,6 +2357,7 @@ export function App() {
       }
       return result;
     } catch (error) {
+      const parsed = parsePipelineError(error);
       return {
         clipId,
         query,
@@ -2171,7 +2365,7 @@ export function App() {
         selected: null,
         confidence: 0,
         requiresManualSelection: true,
-        reason: error instanceof Error ? error.message : String(error),
+        reason: parsed.message,
       };
     }
   }
@@ -2184,7 +2378,9 @@ export function App() {
     ratio?: string,
     targetDuration?: number,
   ): Promise<boolean> {
-    const effectiveRatio = ratio || projectRef.current?.ratio || "9:16";
+    const current = projectRef.current;
+    const effectiveRatio = ratio
+      || compositionMediaRatio(current?.composition?.templateId, current?.ratio || "9:16");
     const result = await searchScoreAndBindAsset(projectId, clipId, query, effectiveRatio, targetDuration, {
       minimumConfidence: 0,
     });
@@ -2303,7 +2499,7 @@ export function App() {
       updateSelectedClip({ visualQuery: query });
     }
     try {
-      const { assets } = await desktopApi.searchPexelsVideos({ query, ratio: project.ratio, perPage: 8 });
+      const { assets } = await searchStockVideos({ query, ratio: project.ratio, perPage: 8 });
       setAssetCandidates((previous) => ({ ...previous, [selectedClip.id]: assets }));
       if (assets[0]) {
         await bindAssetToClip(project.id, selectedClip.id, assets[0]);
@@ -2881,19 +3077,25 @@ export function App() {
     void persist(next, asset.favorite ? `已取消收藏：${asset.title}` : `已收藏：${asset.title}`);
   }
 
-  /** 搜索 Pexels，结果加入素材库（而非直接绑到某 clip） */
+  /** 搜索素材库（当前选中源；失败可在 searchStock* 内跨源 fallback） */
   async function handleSearchPexelsLibrary(query: string) {
     if (!project) return;
     setBusy("library-search");
-    setStatus(`正在搜索 Pexels 视频：${query}`);
+    const brand = libraryProvider === "pixabay" ? "Pixabay" : "Pexels";
+    setStatus(`正在搜索 ${brand} 视频：${query}`);
     try {
-      const { assets, page, hasMore } = await desktopApi.searchPexelsVideos({ query, ratio: project.ratio, perPage: 8 });
-      // 合并去重加入素材库
+      const { assets, page, hasMore, provider } = await searchStockVideos({
+        query,
+        ratio: project.ratio,
+        perPage: 8,
+        prefer: libraryProvider,
+      });
+      if (provider !== libraryProvider) setLibraryProvider(provider);
       const existing = new Set(project.media.map((m) => m.id));
       const additions = assets.filter((a) => !existing.has(a.id));
       const next: Project = { ...project, media: [...project.media, ...additions] };
       setLibraryPagination({ query, mode: "video", page, hasMore });
-      void persist(next, `已加入 ${additions.length} 个视频素材到素材库`);
+      void persist(next, `已加入 ${additions.length} 个视频素材到素材库（${provider === "pixabay" ? "Pixabay" : "Pexels"}）`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -2901,18 +3103,25 @@ export function App() {
     }
   }
 
-  /** 搜索 Pexels 图片，结果加入素材库 */
+  /** 搜索图片到素材库 */
   async function handleSearchPexelsPhotos(query: string) {
     if (!project) return;
     setBusy("library-search");
-    setStatus(`正在搜索 Pexels 图片：${query}`);
+    const brand = libraryProvider === "pixabay" ? "Pixabay" : "Pexels";
+    setStatus(`正在搜索 ${brand} 图片：${query}`);
     try {
-      const { assets, page, hasMore } = await desktopApi.searchPexelsPhotos({ query, ratio: project.ratio, perPage: 8 });
+      const { assets, page, hasMore, provider } = await searchStockPhotos({
+        query,
+        ratio: project.ratio,
+        perPage: 8,
+        prefer: libraryProvider,
+      });
+      if (provider !== libraryProvider) setLibraryProvider(provider);
       const existing = new Set(project.media.map((m) => m.id));
       const additions = assets.filter((a) => !existing.has(a.id));
       const next: Project = { ...project, media: [...project.media, ...additions] };
       setLibraryPagination({ query, mode: "photo", page, hasMore });
-      void persist(next, `已加入 ${additions.length} 张图片到素材库`);
+      void persist(next, `已加入 ${additions.length} 张图片到素材库（${provider === "pixabay" ? "Pixabay" : "Pexels"}）`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -2920,7 +3129,7 @@ export function App() {
     }
   }
 
-  /** 加载 Pexels 搜索结果的下一页，追加到素材库 */
+  /** 加载搜索结果的下一页，追加到素材库（固定当前源，避免分页串源） */
   async function handleLoadMorePexels() {
     if (!project || !libraryPagination || !libraryPagination.hasMore) return;
     const { query, mode, page } = libraryPagination;
@@ -2930,8 +3139,12 @@ export function App() {
       const nextPage = page + 1;
       const result =
         mode === "video"
-          ? await desktopApi.searchPexelsVideos({ query, ratio: project.ratio, perPage: 8, page: nextPage })
-          : await desktopApi.searchPexelsPhotos({ query, ratio: project.ratio, perPage: 8, page: nextPage });
+          ? libraryProvider === "pixabay"
+            ? await desktopApi.searchPixabayVideos({ query, ratio: project.ratio, perPage: 8, page: nextPage })
+            : await desktopApi.searchPexelsVideos({ query, ratio: project.ratio, perPage: 8, page: nextPage })
+          : libraryProvider === "pixabay"
+            ? await desktopApi.searchPixabayPhotos({ query, ratio: project.ratio, perPage: 8, page: nextPage })
+            : await desktopApi.searchPexelsPhotos({ query, ratio: project.ratio, perPage: 8, page: nextPage });
       const existing = new Set(project.media.map((m) => m.id));
       const additions = result.assets.filter((a) => !existing.has(a.id));
       const next: Project = { ...project, media: [...project.media, ...additions] };
@@ -2980,7 +3193,7 @@ export function App() {
       };
       void persist(next, `已替换素材：${asset.title}`);
       // Pexels 素材需后台缓存下载
-      if (asset.source === "pexels" && !asset.localPath) {
+      if ((asset.source === "pexels" || asset.source === "pixabay") && !asset.localPath) {
         void cacheAssetForProject(next.id, selectedClip.id, asset);
       }
       return;
@@ -3001,7 +3214,10 @@ export function App() {
       sourceIn: 0,
       sourceOut: clipDuration,
       speed: 1,
-      volume: 1,
+      volume:
+        targetTrack.kind === "video" || targetTrack.kind === "image"
+          ? defaultVideoClipVolume(projectWithTrack)
+          : 1,
       fadeIn: 0,
       fadeOut: 0,
       brightness: 0,
@@ -3014,7 +3230,7 @@ export function App() {
     const next: Project = insertClipToTrack(projectWithTrack, targetTrack.id, newClip, endTime);
     void persist(next, `已添加到时间线：${asset.title}`);
     setSelectedClipId(newClip.id);
-    if (asset.source === "pexels" && !asset.localPath) {
+    if ((asset.source === "pexels" || asset.source === "pixabay") && !asset.localPath) {
       void cacheAssetForProject(next.id, newClip.id, asset);
     }
   }
@@ -3065,7 +3281,10 @@ export function App() {
       sourceIn: 0,
       sourceOut: clipDuration,
       speed: 1,
-      volume: 1,
+      volume:
+        track.kind === "video" || track.kind === "image"
+          ? defaultVideoClipVolume(current)
+          : 1,
       fadeIn: 0,
       fadeOut: 0,
       brightness: 0,
@@ -3084,7 +3303,7 @@ export function App() {
     const next = insertClipToTrack(nextWithMedia, trackId, newClip, finalStart);
     void persist(next, `已添加到${track.name}：${asset.title}`);
     setSelectedClipId(newClip.id);
-    if (asset.source === "pexels" && !asset.localPath) {
+    if ((asset.source === "pexels" || asset.source === "pixabay") && !asset.localPath) {
       void cacheAssetForProject(next.id, newClip.id, asset);
     }
   }
@@ -3110,6 +3329,10 @@ export function App() {
   const handleTimelineToggleHidden = useCallback((trackId: string) => {
     if (!project) return;
     void persist(toggleTrackHidden(project, trackId), "已切换显示");
+  }, [project]);
+  const handleMuteAllVideoAudio = useCallback(() => {
+    if (!project) return;
+    void persist(muteAllVideoClips(project), "已静音所有视频原声");
   }, [project]);
 
   // 章节标记：在播放头处添加/删除
@@ -3224,7 +3447,7 @@ export function App() {
         onClose={() => { setShowGenerate(false); resetPipeline(); }}
         voiceProfiles={voiceProfiles}
         hasDeepSeekKey={!!settings.deepseekApiKey}
-        hasPexelsKey={!!settings.pexelsApiKey}
+        hasPexelsKey={!!(settings.pexelsApiKey || settings.pixabayApiKey)}
         hasFishAudioKey={!!settings.fishAudioApiKey}
         hasFishAudioVoice={!!settings.fishAudioReferenceId}
         pipeline={pipeline}
@@ -3357,6 +3580,8 @@ export function App() {
                 busy={busy}
                 previewingId={previewingAsset?.id}
                 onImportLocal={handleImportLocal}
+                provider={libraryProvider}
+                onProviderChange={setLibraryProvider}
                 onSearchVideos={handleSearchPexelsLibrary}
                 onSearchPhotos={handleSearchPexelsPhotos}
                 hasMore={libraryPagination?.hasMore ?? false}
@@ -3628,7 +3853,8 @@ export function App() {
                       fontWeight: 700,
                       lineHeight: 1.4,
                       color: s.color,
-                      textShadow: `1px 1px 0 ${s.strokeColor}, -1px -1px 0 ${s.strokeColor}, 1px -1px 0 ${s.strokeColor}, -1px 1px 0 ${s.strokeColor}`,
+                      WebkitTextStroke: (s.strokeWidth ?? 2) > 0 ? `${(s.strokeWidth ?? 2) * fontScale}px ${s.strokeColor}` : undefined,
+                      paintOrder: "stroke fill",
                       padding: "4px 10px",
                       textAlign: "center",
                       whiteSpace: "pre-wrap",
@@ -3949,6 +4175,16 @@ export function App() {
                         {selectedSource.proxyStatus === "failed" ? " · 代理失败" : ""}
                       </small>
                     )}
+                    {(selectedSource?.source === "pexels" || selectedSource?.source === "pixabay") && (
+                      <small className="bound-asset-credit">
+                        {selectedSource.photographer
+                          ? `${selectedSource.kind === "image" ? "Photo" : "Video"} by ${selectedSource.photographer} · `
+                          : ""}
+                        <a href={selectedSource.photographerUrl || selectedSource.pageUrl || (selectedSource.source === "pixabay" ? "https://pixabay.com" : "https://www.pexels.com")} target="_blank" rel="noreferrer noopener">
+                          Provided by {selectedSource.source === "pixabay" ? "Pixabay" : "Pexels"}
+                        </a>
+                      </small>
+                    )}
                   </div>
                   {/* 画面关键词（可编辑，用于 AI 搜索替换素材） */}
                   <label className="style-field inspector-category inspector-category-basic">
@@ -3974,20 +4210,35 @@ export function App() {
                   {/* 搜索结果候选区 */}
                   {assetCandidates[selectedClip.id]?.length ? (
                     <div className="asset-candidates inspector-category inspector-category-basic">
-                      {assetCandidates[selectedClip.id].slice(0, 8).map((asset, idx) => (
-                        <button
-                          key={asset.id}
-                          className="asset-candidate"
-                          onClick={() => project && bindAssetToClip(project.id, selectedClip.id, asset)}
-                          title={asset.title || asset.id}
-                        >
-                          {asset.thumbnailUrl ? (
-                            <img src={desktopApi.mediaSrc(asset.thumbnailUrl) ?? undefined} alt="" />
-                          ) : (
-                            <span>{asset.title || `素材 ${idx + 1}`}</span>
-                          )}
-                        </button>
-                      ))}
+                      <div className="asset-candidates-credit">
+                        Photos &amp; videos provided by{" "}
+                        <a href="https://www.pexels.com" target="_blank" rel="noreferrer noopener">
+                          Pexels
+                        </a>
+                      </div>
+                      {assetCandidates[selectedClip.id].slice(0, 8).map((asset, idx) => {
+                        const credit = asset.photographer
+                          ? `${asset.kind === "image" ? "Photo" : "Video"} by ${asset.photographer}`
+                          : null;
+                        const tip = [asset.title || asset.id, credit, asset.source === "pexels" ? "Provided by Pexels" : asset.source === "pixabay" ? "Provided by Pixabay" : null]
+                          .filter(Boolean)
+                          .join(" · ");
+                        return (
+                          <button
+                            key={asset.id}
+                            className="asset-candidate"
+                            onClick={() => project && bindAssetToClip(project.id, selectedClip.id, asset)}
+                            title={tip}
+                          >
+                            {asset.thumbnailUrl ? (
+                              <img src={desktopApi.mediaSrc(asset.thumbnailUrl) ?? undefined} alt="" />
+                            ) : (
+                              <span>{asset.title || `素材 ${idx + 1}`}</span>
+                            )}
+                            {credit ? <small className="asset-candidate-credit">{credit}</small> : null}
+                          </button>
+                        );
+                      })}
                     </div>
                   ) : null}
                   {/* 分离音频 / 分离人声 */}
@@ -4336,6 +4587,7 @@ export function App() {
           onPaste={pasteClip}
           onDuplicate={duplicateSelectedClip}
           onAddChapter={handleAddChapter}
+          onMuteAllVideoAudio={handleMuteAllVideoAudio}
           addTrackMenu={(
             <div className="add-track-menu">
               <button onClick={() => setShowAddTrackMenu((v) => !v)} disabled={!project} title="添加轨道">
@@ -4583,6 +4835,7 @@ export function App() {
           }
         }}
         currentRatio={project?.ratio ?? "9:16"}
+        project={project}
         onExport={handleRenderFinal}
         onCancel={() => { void desktopApi.cancelRender(); }}
         exportState={exportState}
