@@ -82,6 +82,12 @@ export function usePreviewEngine(
       disposed = true;
       clearInterval(timer);
       clearTimeout(stop);
+      // 组件卸载时必须释放引擎——否则 AudioContext、媒体元素池、RAF 全部泄漏
+      if (engineRef.current) {
+        engineRef.current.dispose();
+        engineRef.current = null;
+      }
+      lastUiStateRef.current = null;
     };
   }, [active, onTick, stageRef]);
 

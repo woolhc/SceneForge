@@ -135,7 +135,7 @@ pub async fn run_with_timeout(cmd: &mut Command, secs: u64) -> anyhow::Result<Ou
     }
 }
 
-async fn run_with_timeout_and_cancel(
+pub(crate) async fn run_with_timeout_and_cancel(
     cmd: &mut Command,
     secs: u64,
     cancel_flag: Option<&std::sync::atomic::AtomicBool>,
@@ -509,13 +509,31 @@ pub async fn ensure_media_local(cache_dir: &Path, source: &MediaSource) -> anyho
     let ext = url_ext(url).unwrap_or_else(|| "mp4".to_string());
     let output_path = video_dir.join(format!("{}.{}", sanitize_file_stem(&source.id), ext));
     if !output_path.exists() || output_path.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
+        // 先写 .part 临时文件，下载完成后原子 rename——
+        // 避免中途断网/退出留下半截文件被下次当作有效缓存（半截 mp4 会导致渲染花屏且无法自愈）
+        let part_path = video_dir.join(format!("{}.{}.part", sanitize_file_stem(&source.id), ext));
         let response = http_client().get(url).send().await?.error_for_status()?;
+        let expected_len = response.content_length();
         let mut stream = response.bytes_stream();
-        let mut file = tokio::fs::File::create(&output_path).await?;
+        let mut file = tokio::fs::File::create(&part_path).await?;
+        let mut written: u64 = 0;
         while let Some(chunk) = stream.next().await {
-            file.write_all(&chunk?).await?;
+            let chunk = chunk?;
+            written += chunk.len() as u64;
+            file.write_all(&chunk).await?;
         }
         file.flush().await?;
+        drop(file);
+        if let Some(expected) = expected_len {
+            if written != expected {
+                let _ = tokio::fs::remove_file(&part_path).await;
+                anyhow::bail!(
+                    "素材下载不完整（{written}/{expected} 字节），已丢弃：{}",
+                    source.id
+                );
+            }
+        }
+        tokio::fs::rename(&part_path, &output_path).await?;
     }
     Ok(output_path)
 }
@@ -1053,7 +1071,7 @@ pub async fn render_project_video(
                 Box::new(move |frac: f64| cb(85 + (frac * 14.0) as u32, "正在烧录字幕和混音..."));
             f
         });
-        let result = burn_subtitle_and_mix_audio(
+        let (result, degraded) = burn_subtitle_and_mix_audio(
             cache_dir,
             projects_dir,
             project,
@@ -1067,7 +1085,10 @@ pub async fn render_project_video(
         )
         .await?;
         if let Some(cb) = progress_cb {
-            cb(100, "渲染完成");
+            match degraded {
+                Some(warning) => cb(100, &format!("渲染完成（{warning}）")),
+                None => cb(100, "渲染完成"),
+            }
         }
         return Ok(result);
     }
@@ -1112,6 +1133,7 @@ pub async fn render_project_video(
                         &encoder,
                         target_w,
                         target_h,
+                        cancel_flag,
                     )
                     .await?
                 } else {
@@ -1127,6 +1149,7 @@ pub async fn render_project_video(
                         &encoder,
                         target_w,
                         target_h,
+                        cancel_flag,
                     )
                     .await?
                 };
@@ -1173,30 +1196,6 @@ pub async fn render_project_video(
         };
         if active_clips.is_empty() {
             eprintln!("段 {seg_index:03}: 类型=black 时长={render_duration:.2}s（空段）");
-        }
-        // 诊断：记录每段输出文件大小 + ffprobe 时长
-        if let Ok(meta) = tokio::fs::metadata(&path).await {
-            let size_kb = meta.len() / 1024;
-            let probe_dur = crate::tools::command(crate::tools::NativeTool::Ffprobe)
-                .args([
-                    "-v",
-                    "error",
-                    "-show_entries",
-                    "format=duration",
-                    "-of",
-                    "default=noprint_wrappers=1:nokey=1",
-                    &path.to_string_lossy(),
-                ])
-                .output()
-                .await
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .unwrap_or_else(|| "?".to_string());
-            eprintln!(
-                "段 {seg_index:03}: 类型=overlay 时长={render_duration:.2}s 实际={probe_dur}s 大小={size_kb}KB clips={}",
-                active_clips.iter().map(|c| c.id.as_str()).collect::<Vec<_>>().join(",")
-            );
         }
         segment_paths.push(path);
     }
@@ -1387,7 +1386,7 @@ pub async fn render_project_video(
             Box::new(move |frac: f64| cb(85 + (frac * 14.0) as u32, "正在烧录字幕和混音..."));
         f
     });
-    let result = burn_subtitle_and_mix_audio(
+    let (result, degraded) = burn_subtitle_and_mix_audio(
         cache_dir,
         projects_dir,
         project,
@@ -1400,9 +1399,12 @@ pub async fn render_project_video(
         burn_on_progress.as_deref(),
     )
     .await?;
-    // T3.3: 进度 100%
+    // T3.3: 进度 100%；字幕/混音降级时把告警带到进度文案，前端可见
     if let Some(cb) = progress_cb {
-        cb(100, "渲染完成");
+        match degraded {
+            Some(warning) => cb(100, &format!("渲染完成（{warning}）")),
+            None => cb(100, "渲染完成"),
+        }
     }
     Ok(result)
 }
@@ -1590,6 +1592,7 @@ async fn render_black_segment(
     encoder: &str,
     width: u32,
     height: u32,
+    cancel_flag: Option<&std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<PathBuf> {
     let (enc_name, enc_extra) =
         encoder_args(encoder, preview, Some(project.render_config.bitrate_mbps));
@@ -1616,10 +1619,9 @@ async fn render_black_segment(
         "+faststart".to_string(),
         output_path.to_string_lossy().to_string(),
     ]);
-    let output = crate::tools::command(crate::tools::NativeTool::Ffmpeg)
-        .args(&args)
-        .output()
-        .await?;
+    let mut seg_cmd = crate::tools::command(crate::tools::NativeTool::Ffmpeg);
+    seg_cmd.args(&args);
+    let output = run_with_timeout_and_cancel(&mut seg_cmd, 1800, cancel_flag).await?;
     if !output.status.success() {
         anyhow::bail!(
             "渲染黑屏段 {} 失败：{}",
@@ -1644,6 +1646,7 @@ async fn render_segment_with_overlay(
     encoder: &str,
     width: u32,
     height: u32,
+    cancel_flag: Option<&std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<PathBuf> {
     let fps = project.render_config.fps;
 
@@ -1662,6 +1665,7 @@ async fn render_segment_with_overlay(
             encoder,
             width,
             height,
+            cancel_flag,
         )
         .await;
     }
@@ -1896,10 +1900,9 @@ async fn render_segment_with_overlay(
     let output_path = segment_dir.join(format!("seg-{:03}.mp4", seg_index));
     args.push(output_path.to_string_lossy().to_string());
 
-    let output = crate::tools::command(crate::tools::NativeTool::Ffmpeg)
-        .args(&args)
-        .output()
-        .await?;
+    let mut seg_cmd = crate::tools::command(crate::tools::NativeTool::Ffmpeg);
+    seg_cmd.args(&args);
+    let output = run_with_timeout_and_cancel(&mut seg_cmd, 1800, cancel_flag).await?;
     if !output.status.success() {
         anyhow::bail!(
             "叠加渲染段 {} 失败：{}",
@@ -1935,24 +1938,28 @@ async fn render_transition_unit(
     let prev_path = if prev_clips.is_empty() {
         render_black_segment(
             &work_dir, project, duration, 0, preview, encoder, width, height,
+            cancel_flag,
         )
         .await?
     } else {
         render_segment_with_overlay(
             cache_dir, &work_dir, project, prev_clips, start, duration, 0, preview, encoder, width,
             height,
+            cancel_flag,
         )
         .await?
     };
     let next_path = if next_clips.is_empty() {
         render_black_segment(
             &work_dir, project, duration, 1, preview, encoder, width, height,
+            cancel_flag,
         )
         .await?
     } else {
         render_segment_with_overlay(
             cache_dir, &work_dir, project, next_clips, boundary, duration, 1, preview, encoder,
             width, height,
+            cancel_flag,
         )
         .await?
     };
@@ -2013,6 +2020,7 @@ async fn render_single_clip_for_segment(
     encoder: &str,
     width: u32,
     height: u32,
+    cancel_flag: Option<&std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<PathBuf> {
     let source = match project
         .media
@@ -2031,6 +2039,7 @@ async fn render_single_clip_for_segment(
                 encoder,
                 width,
                 height,
+                cancel_flag,
             )
             .await;
         }
@@ -2055,6 +2064,7 @@ async fn render_single_clip_for_segment(
             encoder,
             width,
             height,
+            cancel_flag,
         )
         .await;
     }
@@ -2076,6 +2086,7 @@ async fn render_single_clip_for_segment(
             &scale_filter,
             clip,
             parts,
+            cancel_flag,
         )
         .await;
     }
@@ -2105,7 +2116,9 @@ async fn render_single_clip_for_segment(
         args.push("-i".to_string());
         args.push(local_str);
     } else {
-        let part = source_part.expect("video source window checked above");
+        let Some(part) = source_part else {
+            anyhow::bail!("内部错误：曲线变速源窗口缺失（clip {}）", clip.id);
+        };
         args.push("-ss".to_string());
         args.push(format!("{:.3}", part.source_start));
         args.push("-t".to_string());
@@ -2137,10 +2150,9 @@ async fn render_single_clip_for_segment(
     args.push("+faststart".to_string());
     args.push(output_path.to_string_lossy().to_string());
 
-    let output = crate::tools::command(crate::tools::NativeTool::Ffmpeg)
-        .args(&args)
-        .output()
-        .await?;
+    let mut seg_cmd = crate::tools::command(crate::tools::NativeTool::Ffmpeg);
+    seg_cmd.args(&args);
+    let output = run_with_timeout_and_cancel(&mut seg_cmd, 1800, cancel_flag).await?;
     if !output.status.success() {
         anyhow::bail!(
             "渲染段 {} 失败：{}",
@@ -2164,6 +2176,7 @@ async fn render_source_window_parts_for_segment(
     scale_filter: &str,
     clip: &Clip,
     parts: &[SourceWindowPart],
+    cancel_flag: Option<&std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<PathBuf> {
     if parts.is_empty() {
         return render_black_segment(
@@ -2175,6 +2188,7 @@ async fn render_source_window_parts_for_segment(
             encoder,
             width,
             height,
+            cancel_flag,
         )
         .await;
     }
@@ -2221,10 +2235,9 @@ async fn render_source_window_parts_for_segment(
         args.push(format!("{:.3}", part.timeline_duration));
         args.push(part_path.to_string_lossy().to_string());
 
-        let output = crate::tools::command(crate::tools::NativeTool::Ffmpeg)
-            .args(&args)
-            .output()
-            .await?;
+        let mut part_cmd = crate::tools::command(crate::tools::NativeTool::Ffmpeg);
+        part_cmd.args(&args);
+        let output = run_with_timeout_and_cancel(&mut part_cmd, 1800, cancel_flag).await?;
         if !output.status.success() {
             anyhow::bail!(
                 "曲线变速子段 {}-{} 渲染失败：{}",
@@ -2246,6 +2259,7 @@ async fn render_source_window_parts_for_segment(
             encoder,
             width,
             height,
+            cancel_flag,
         )
         .await;
     }
@@ -2265,23 +2279,22 @@ async fn render_source_window_parts_for_segment(
         .collect::<String>();
     tokio::fs::write(&list_path, list_content).await?;
 
-    let output = crate::tools::command(crate::tools::NativeTool::Ffmpeg)
-        .args([
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            &list_path.to_string_lossy(),
-            "-c",
-            "copy",
-            "-movflags",
-            "+faststart",
-            &output_path.to_string_lossy(),
-        ])
-        .output()
-        .await?;
+    let mut concat_cmd = crate::tools::command(crate::tools::NativeTool::Ffmpeg);
+    concat_cmd.args([
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        &list_path.to_string_lossy(),
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        &output_path.to_string_lossy(),
+    ]);
+    let output = run_with_timeout_and_cancel(&mut concat_cmd, 1800, cancel_flag).await?;
     if !output.status.success() {
         anyhow::bail!(
             "曲线变速段 {} 拼接失败：{}",
@@ -2306,7 +2319,7 @@ async fn burn_subtitle_and_mix_audio(
     cancel_flag: Option<&std::sync::atomic::AtomicBool>,
     total_duration_secs: f64,
     on_progress: Option<&(dyn Fn(f64) + Send + Sync)>,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<(PathBuf, Option<String>)> {
     let render_dir = projects_dir.join(&project.id).join("renders");
     let output_path = render_dir.join(if preview { "preview.mp4" } else { "final.mp4" });
 
@@ -2335,11 +2348,11 @@ async fn burn_subtitle_and_mix_audio(
     let has_subtitles = !subtitle_clips.is_empty();
     let has_audio = audio_clips.iter().any(|c| c.source_id.is_some());
 
-    // 无字幕且无配音 → 直接拷贝
+    // 无字幕且无配音 → 直接拷贝（非降级，本来就没有可烧录内容）
     if !has_subtitles && !has_audio {
         check_cancel(cancel_flag)?;
         tokio::fs::copy(video_input, &output_path).await?;
-        return Ok(output_path);
+        return Ok((output_path, None));
     }
 
     // 生成 .ass 字幕文件（subtitle_mode="none" 或 "srt" 时跳过烧录）
@@ -2550,16 +2563,24 @@ async fn burn_subtitle_and_mix_audio(
         retry_cmd.args(&retry_args);
         let retry_output = run_with_timeout_and_cancel(&mut retry_cmd, 1800, cancel_flag).await?;
         if !retry_output.status.success() {
-            // 最终回退：无字幕无混音的裸拷贝
+            // 最终回退：无字幕无混音的裸拷贝——必须让用户知道成片被降级了
             eprintln!(
                 "无字幕重试也失败，输出裸视频：{}",
                 String::from_utf8_lossy(&retry_output.stderr).trim()
             );
             check_cancel(cancel_flag)?;
             tokio::fs::copy(video_input, &output_path).await?;
+            return Ok((
+                output_path,
+                Some("字幕烧录与混音均失败，成片不含字幕和声音".to_string()),
+            ));
         }
+        return Ok((
+            output_path,
+            Some("字幕烧录失败，成片已降级为无字幕版本".to_string()),
+        ));
     }
-    Ok(output_path)
+    Ok((output_path, None))
 }
 
 /// 生成 .ass 字幕文件内容（含样式：字体/字号/颜色/位置/描边）

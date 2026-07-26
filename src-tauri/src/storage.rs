@@ -28,6 +28,8 @@ pub struct AppState {
     pub render_lock: tokio::sync::Mutex<()>,
     /// T3.3: 取消标志（render_project 每段检查，cancel_render 置位）
     pub render_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 转写（Whisper）取消标志：一键生成中最耗时的一步，必须可取消
+    pub transcribe_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Whisper 模型下载互斥锁、取消标志与活动状态。
     pub whisper_download_lock: tokio::sync::Mutex<()>,
     pub whisper_download_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -64,6 +66,7 @@ impl AppState {
             },
             render_lock: tokio::sync::Mutex::new(()),
             render_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            transcribe_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             whisper_download_lock: tokio::sync::Mutex::new(()),
             whisper_download_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             whisper_download_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

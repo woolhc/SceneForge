@@ -23,6 +23,28 @@ function cropToClipPath(crop: Clip["crop"] | null | undefined): string {
 }
 
 /**
+ * crop 的放大补偿 transform（追加到布局 transform 之后）。
+ * 导出端语义是「crop 源帧 → scale 铺满画框」（ffmpeg crop→scale）；
+ * 预览若只用 clip-path 遮边，裁剪后画面缩在角落，与导出构图完全不同。
+ * 这里以 crop 区域中心为基准放大 1/w、1/h 倍，把裁剪区铺满原盒子。
+ * transform 组合序（自右向左）：先 scale（中心 origin）→ 再 translate 把 crop 中心拉回盒中心。
+ */
+function cropCompensateTransform(crop: Clip["crop"] | null | undefined): string {
+  if (!crop) return "";
+  const { x, y, width, height } = crop;
+  if (x <= 0 && y <= 0 && width >= 100 && height >= 100) return "";
+  const w = Math.max(1, Math.min(100, width));
+  const h = Math.max(1, Math.min(100, height));
+  const sx = 100 / w;
+  const sy = 100 / h;
+  const cx = x + w / 2; // crop 中心（元素坐标 %）
+  const cy = y + h / 2;
+  const dx = -(cx - 50) * sx;
+  const dy = -(cy - 50) * sy;
+  return ` translate(${dx.toFixed(3)}%, ${dy.toFixed(3)}%) scale(${sx.toFixed(4)}, ${sy.toFixed(4)})`;
+}
+
+/**
  * 实时预览引擎：按统一的 currentTime 时钟，同步调度
  *  - 视频轨：主 <video> 元素 + 一个预加载 <video>（提前加载下一个 clip）
  *  - 配音/音频轨：Web Audio API 预加载 AudioBuffer，精确调度
@@ -105,6 +127,11 @@ export class PreviewEngine implements PreviewRenderer {
     if (ratioChanged || prevId !== project?.id) {
       this.pause();
       this.currentTime = 0;
+    }
+    // 清理新项目不再引用的解码音频（PCM AudioBuffer 每分钟约 20MB，跨项目累积会撑爆内存）
+    const liveMediaIds = new Set((project?.media ?? []).map((m) => m.id));
+    for (const id of [...this.audioBuffers.keys()]) {
+      if (!liveMediaIds.has(id)) this.audioBuffers.delete(id);
     }
     this.lastPublishedVideoClip = null;
     this.lastPublishedOverlayIds = "";
@@ -378,6 +405,7 @@ export class PreviewEngine implements PreviewRenderer {
      Math.abs(rate - Math.max(0.0001, Math.abs(previousClip.speed || 1))) < 0.01;
 
    const item = await this.mediaPool.acquire(media.id, src, kind);
+   this.mediaPool.setProtected(media.id);
    item.el.style.zIndex = "3";
    item.el.style.objectFit = evaluated.fit === "contain" ? "contain" : "cover";
    // base 层也读取 clip.transform（图片底层需要支持位置/缩放/旋转/不透明度）
@@ -388,9 +416,9 @@ export class PreviewEngine implements PreviewRenderer {
    item.el.style.width = layout.width;
    item.el.style.height = layout.height;
    item.el.style.transformOrigin = "center center";
-   item.el.style.transform = layout.transform;
    // T4.x: 裁剪 + 入场/出场转场近似（fade 类）
    const cropPath = cropToClipPath(clip.crop);
+   item.el.style.transform = layout.transform + cropCompensateTransform(clip.crop);
    item.el.style.clipPath = cropPath || "";
    item.el.style.opacity = layout.opacity;
    item.el.style.filter = previewCssFilter(clip);
@@ -454,6 +482,9 @@ export class PreviewEngine implements PreviewRenderer {
       })
       .sort((a, b) => a.startOnTrack - b.startOnTrack);
 
+    // 当前正在展示的 media：预加载绝不能碰它的 seek，否则与 applyVideoAlignment
+    // 互相拉扯播放位置（画面来回跳/卡顿）
+    const activeMediaId = this.activeBaseClip?.sourceId ?? null;
     for (const clip of mediaClips) {
       const media = this.findMedia(clip.sourceId);
       const src = media ? this.resolveSrc(media) : null;
@@ -461,7 +492,7 @@ export class PreviewEngine implements PreviewRenderer {
       const kind = media.kind === "image" ? "image" : "video";
       const item = await this.mediaPool.acquire(media.id, src, kind);
       if (item.el !== this.videoEl) item.el.style.opacity = "0";
-      if (kind === "video") {
+      if (kind === "video" && media.id !== activeMediaId) {
         const evaluationTime = Math.max(this.currentTime, clip.startOnTrack);
         const target = this.renderGraph
           ? evaluateFrame(this.renderGraph, evaluationTime).visualLayers.find((layer) => layer.id === clip.id)?.sourceTime
@@ -477,10 +508,16 @@ export class PreviewEngine implements PreviewRenderer {
     const media = this.findMedia(next.sourceId);
     const src = media ? this.resolveSrc(media) : null;
     if (!media || !src || media.kind === "image") return;
+    if (media.id === activeMediaId) return; // 分割自同一素材：无需预热
     const item = await this.mediaPool.acquire(media.id, src, "video");
     await this.mediaPool.seekTo(item, Math.max(0, next.sourceIn));
-    if (item.gain) item.gain.gain.value = 0;
     const video = item.el as HTMLVideoElement;
+    if (item.gain) {
+      item.gain.gain.value = 0;
+    } else {
+      // AudioContext 路由失败时 gain 为 null：必须回退 muted，否则预热起播会提前出声
+      video.muted = true;
+    }
     if (this.playing && video.paused) void video.play().catch(() => {});
     } finally {
       this.preloadInFlight = false;
@@ -530,7 +567,9 @@ export class PreviewEngine implements PreviewRenderer {
         v.className = "stage-overlay-video";
         v.crossOrigin = "anonymous";
         if (v instanceof HTMLVideoElement) {
-          v.muted = true; // 叠加层不发声（音频由主混音管）
+          // 初始静音防加载抢跑；每帧按 audioLayers 的 gain 同步（与导出混音语义一致：
+          // 导出会把未静音视频轨的原声混入，预览必须能听到，否则所听非所得）
+          v.muted = true;
           v.playsInline = true;
         }
         v.style.position = "absolute";
@@ -558,14 +597,15 @@ export class PreviewEngine implements PreviewRenderer {
       // T4.x: 裁剪（crop）+ 入场/出场转场近似（fade 类）
       const cropPath = cropToClipPath(clip.crop);
       const objectFit = evaluated.fit === "contain" ? "contain" : "cover";
-      const styleSignature = JSON.stringify({ layout, mix: tf?.mix ?? "", mask: m ?? null, cssFilter, cropPath, objectFit });
+      const cropComp = cropCompensateTransform(clip.crop);
+      const styleSignature = JSON.stringify({ layout, mix: tf?.mix ?? "", mask: m ?? null, cssFilter, cropPath, cropComp, objectFit });
       if (this.overlayStyleSignatures.get(clip.id) !== styleSignature) {
         this.overlayStyleSignatures.set(clip.id, styleSignature);
         v.style.left = layout.left;
         v.style.top = layout.top;
         v.style.width = layout.width;
         v.style.height = layout.height;
-        v.style.transform = layout.transform;
+        v.style.transform = layout.transform + cropComp;
         v.style.opacity = layout.opacity;
         v.style.filter = cssFilter;
         v.style.clipPath = cropPath || "";
@@ -582,6 +622,15 @@ export class PreviewEngine implements PreviewRenderer {
       const targetSourceTime = evaluated.sourceTime;
       const rate = evaluated.speed;
       if (v instanceof HTMLVideoElement) {
+        // overlay 原声：按 audioLayers 的 gain（含 clip 音量/淡入淡出/轨道静音）实时同步
+        const audioLayer = this.evaluatedFrame()?.audioLayers.find((layer) => layer.id === clip.id);
+        const gainValue = audioLayer?.gain ?? 0;
+        if (this.playing && gainValue > 0.001) {
+          v.muted = false;
+          v.volume = Math.min(1, gainValue);
+        } else {
+          v.muted = true;
+        }
         v.playbackRate = rate;
         const drift = v.currentTime - targetSourceTime;
         const absDrift = Math.abs(drift);
@@ -824,7 +873,14 @@ export class PreviewEngine implements PreviewRenderer {
       }
     });
     this.activeAudioSources.clear();
-    this.clipGainNodes.clear();
+    // 只清一次性 BufferSource 的 gain；媒体池视频元素的常驻 gain 保留，
+    // 否则 pause/seek 后播放中调音量(setClipVolume)会静默失效
+    const pooledGains = new Set(
+      this.mediaPool.values().map((item) => item.gain).filter(Boolean),
+    );
+    for (const [clipId, gain] of [...this.clipGainNodes]) {
+      if (!pooledGains.has(gain)) this.clipGainNodes.delete(clipId);
+    }
     this.audioClockAnchor = null;
   }
 
