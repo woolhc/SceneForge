@@ -156,6 +156,16 @@ pub async fn transcribe_audio(
     cache_dir: &Path,
     audio_path: &Path,
 ) -> anyhow::Result<Vec<SubtitleCue>> {
+    transcribe_audio_cancellable(settings, cache_dir, audio_path, None).await
+}
+
+/// 可取消版本：cancel_flag 置位后立刻 kill whisper 子进程返回错误。
+pub async fn transcribe_audio_cancellable(
+    settings: &AppSettings,
+    cache_dir: &Path,
+    audio_path: &Path,
+    cancel_flag: Option<&std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<Vec<SubtitleCue>> {
     let app_data_dir = cache_dir.parent().unwrap_or(cache_dir);
     let model_path = crate::tools::resolve_whisper_model(&settings.whisper_model, app_data_dir)
         .ok_or_else(|| {
@@ -170,13 +180,6 @@ pub async fn transcribe_audio(
     let whisper = crate::tools::resolve(
         crate::tools::NativeTool::Whisper,
         Some(&settings.whisper_bin),
-    );
-    eprintln!(
-        "[ASR] whisper resolved: path={} available={} source={:?} (configured={})",
-        whisper.path.display(),
-        whisper.available,
-        whisper.source,
-        settings.whisper_bin
     );
     if !whisper.available {
         anyhow::bail!(
@@ -214,7 +217,7 @@ pub async fn transcribe_audio(
         "auto",
         "-np", // 不打印进度（替代旧版 --no-print-progress）
     ]);
-    let output = crate::ffmpeg::run_with_timeout(&mut cmd, 1800)
+    let output = crate::ffmpeg::run_with_timeout_and_cancel(&mut cmd, 1800, cancel_flag)
         .await
         .map_err(|e| {
             anyhow::anyhow!(
@@ -258,7 +261,6 @@ pub async fn transcribe_audio(
     };
 
     let _ = tokio::fs::remove_file(&json_path).await;
-    eprintln!("[ASR] whisper JSON 前 200 字: {}", json_content.chars().take(200).collect::<String>());
     let result: WhisperResult = serde_json::from_str(&json_content)
         .map_err(|e| {
             eprintln!("[ASR] whisper JSON 解析失败：{e}。正文前 300：{}", json_content.chars().take(300).collect::<String>());
@@ -276,8 +278,9 @@ pub async fn transcribe_to_sentences(
     settings: &AppSettings,
     cache_dir: &Path,
     audio_path: &Path,
+    cancel_flag: Option<&std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<(Vec<crate::models::TimedSentence>, f64, String)> {
-    let cues = transcribe_audio(settings, cache_dir, audio_path).await?;
+    let cues = transcribe_audio_cancellable(settings, cache_dir, audio_path, cancel_flag).await?;
     if cues.is_empty() {
         return Ok((vec![], 0.0, String::new()));
     }

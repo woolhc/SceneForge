@@ -94,34 +94,60 @@ pub async fn generate_waveform(
 }
 
 /// 在系统文件管理器中显示文件（macOS=Finder, Windows=Explorer）
+/// 只允许 app 数据目录或用户主目录内的路径，防止被 XSS 放大为任意路径探测/应用拉起。
 #[tauri::command]
-pub fn reveal_path(path: String) -> Result<(), String> {
+pub fn reveal_path(state: State<'_, AppState>, path: String) -> Result<(), String> {
     let p = std::path::Path::new(&path);
     if !p.exists() {
         return Err(format!("文件不存在：{path}"));
     }
+    let canonical = p
+        .canonicalize()
+        .map_err(|e| format!("路径无法解析：{e}"))?;
+    let app_data = state
+        .paths
+        .app_data_dir
+        .canonicalize()
+        .unwrap_or_else(|_| state.paths.app_data_dir.clone());
+    let home = dirs_home();
+    let allowed = canonical.starts_with(&app_data)
+        || home
+            .as_deref()
+            .map(|h| canonical.starts_with(h))
+            .unwrap_or(false);
+    if !allowed {
+        return Err("路径不在允许范围内".to_string());
+    }
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")
-            .args(["-R", &path])
+            .arg("-R")
+            .arg(&canonical)
             .spawn()
             .map_err(map_error)?;
     }
     #[cfg(target_os = "windows")]
     {
         std::process::Command::new("explorer")
-            .args(["/select,", &path])
+            .arg("/select,")
+            .arg(&canonical)
             .spawn()
             .map_err(map_error)?;
     }
     #[cfg(target_os = "linux")]
     {
         std::process::Command::new("xdg-open")
-            .arg(p.parent().unwrap_or(std::path::Path::new(".")))
+            .arg(canonical.parent().unwrap_or(std::path::Path::new(".")))
             .spawn()
             .map_err(map_error)?;
     }
     Ok(())
+}
+
+fn dirs_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
 }
 
 /// 读取 LUT .cube 文件内容（从打包的 luts/ 目录）
@@ -177,30 +203,14 @@ pub fn save_settings(
     state: State<'_, AppState>,
     settings: AppSettings,
 ) -> Result<AppSettings, String> {
-    eprintln!(
-        "[settings] save 收到 key 长度: deepseek={} pexels={} pixabay={} fish={}",
-        settings.deepseek_api_key.trim().len(),
-        settings.pexels_api_key.trim().len(),
-        settings.pixabay_api_key.trim().len(),
-        settings.fish_audio_api_key.trim().len(),
-    );
     let conn = state.db.lock().map_err(map_error)?;
     storage::save_settings(&conn, &settings).map_err(map_error)
 }
 
-/// 仅日志：加载时回读 key 长度，确认存读一致
 #[tauri::command]
 pub fn load_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
     let conn = state.db.lock().map_err(map_error)?;
-    let s = storage::load_settings(&conn).map_err(map_error)?;
-    eprintln!(
-        "[settings] load 回读 key 长度: deepseek={} pexels={} pixabay={} fish={}",
-        s.deepseek_api_key.trim().len(),
-        s.pexels_api_key.trim().len(),
-        s.pixabay_api_key.trim().len(),
-        s.fish_audio_api_key.trim().len(),
-    );
-    Ok(s)
+    storage::load_settings(&conn).map_err(map_error)
 }
 
 #[tauri::command]
@@ -703,6 +713,15 @@ pub async fn search_pixabay_photos(
             };
             map_pipeline_error(text, code, retryable)
         })
+}
+
+/// 取消正在进行的 Whisper 转写（一键生成中最耗时的一步）
+#[tauri::command]
+pub fn cancel_transcribe(state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .transcribe_cancel
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
 }
 
 /// 下载/缓存某个素材到 app 数据目录，更新 local_path 后返回。
@@ -2107,18 +2126,21 @@ pub async fn transcribe_to_sentences(
     if !path.exists() {
         return Err(format!("音频文件不存在：{audio_path}"));
     }
-    eprintln!(
-        "[ASR] transcribe_to_sentences start: path={:?} whisper_bin={} model={}",
-        path, settings.whisper_bin, settings.whisper_model
-    );
-    let (sentences, total_duration, full_text) =
-        asr::transcribe_to_sentences(&settings, &state.paths.cache_dir, &path)
-            .await
-            .map_err(|e| {
-                // 抓真实错误链：Whisper 本地子进程不该出现配额英文，打印完整 anyhow 链定位来源
-                eprintln!("[ASR] transcribe_to_sentences FAILED: {e:?}");
-                map_error(e)
-            })?;
+    // 每次转写前重置取消标志
+    state
+        .transcribe_cancel
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let (sentences, total_duration, full_text) = asr::transcribe_to_sentences(
+        &settings,
+        &state.paths.cache_dir,
+        &path,
+        Some(&state.transcribe_cancel),
+    )
+    .await
+    .map_err(|e| {
+        eprintln!("[ASR] transcribe_to_sentences FAILED: {e:?}");
+        map_pipeline_error(e, "WHISPER_FAILED", false)
+    })?;
     if sentences.is_empty() {
         return Err("音频识别结果为空，请检查音频文件或 whisper 配置".to_string());
     }

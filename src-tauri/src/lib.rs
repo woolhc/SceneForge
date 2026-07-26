@@ -91,6 +91,7 @@ pub fn run() {
             commands::generate_filmstrip,
             commands::render_project,
             commands::cancel_render,
+            commands::cancel_transcribe,
         ])
         .run(tauri::generate_context!())
         .expect("error while running SceneForge");

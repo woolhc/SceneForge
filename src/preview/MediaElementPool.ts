@@ -14,6 +14,7 @@ export type PooledMedia = {
 
 export class MediaElementPool {
   private items = new Map<string, PooledMedia>();
+  private protectedMediaId: string | null = null;
 
   constructor(
     private container: HTMLElement,
@@ -157,6 +158,9 @@ export class MediaElementPool {
     } catch {
       gain = null;
       sourceNode = null;
+      // 无法接入 WebAudio 时退回元素级静音，由调用方显式解除——
+      // 否则预加载起播的元素会直通扬声器且无法控制音量
+      video.muted = true;
     }
 
     return { mediaId, kind, el: video, gain, sourceNode, lastUsed, seekTarget: null, seeked: false, styleSignature: null };
@@ -175,15 +179,22 @@ export class MediaElementPool {
     }
   }
 
+  /** 淘汰最久未用的元素；protectedMediaId（当前正在播放的 media）永不淘汰，避免播放中黑屏 */
   private evictLRU() {
     while (this.items.size > this.limit) {
       let oldest: PooledMedia | null = null;
       for (const item of this.items.values()) {
+        if (item.mediaId === this.protectedMediaId) continue;
         if (!oldest || item.lastUsed < oldest.lastUsed) oldest = item;
       }
       if (!oldest) break;
       this.release(oldest.mediaId);
     }
+  }
+
+  /** 标记当前活跃 media（LRU 淘汰豁免） */
+  setProtected(mediaId: string | null) {
+    this.protectedMediaId = mediaId;
   }
 
   private applyBaseStyle(el: HTMLElement) {

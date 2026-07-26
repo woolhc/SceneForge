@@ -27,6 +27,7 @@ export function GenerateWizard({
   hasFishAudioVoice,
   pipeline,
   onStart,
+  onCancel,
 }: {
   open: boolean;
   onClose: () => void;
@@ -36,6 +37,8 @@ export function GenerateWizard({
   hasFishAudioKey: boolean;
   hasFishAudioVoice: boolean;
   pipeline: PipelineState;
+  /** 生成运行中点「取消」：中断当前耗时步骤（转写/渲染） */
+  onCancel?: () => void;
   onStart: (input: {
     script: string;
     ratio: string;
@@ -139,12 +142,20 @@ export function GenerateWizard({
               )}
             </div>
           )}
-          {(pipeline.error || pipeline.report) && (
+          {(pipeline.error || pipeline.report) ? (
             <div className="wizard-actions">
               <button className="primary-button" onClick={onClose}>
                 {pipeline.report ? "进入编辑器" : "关闭"}
               </button>
             </div>
+          ) : (
+            onCancel && (
+              <div className="wizard-actions">
+                <button className="danger-button" onClick={onCancel}>
+                  取消生成
+                </button>
+              </div>
+            )
           )}
         </div>
       </div>

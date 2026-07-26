@@ -486,19 +486,21 @@ function arrangeSegmentsToClips(
   const voiceoverTrackId = pickPrimaryTrack(tracks, "voiceover");
   const clips: Clip[] = [];
   let cursor = 0;
-  // 视频轨游标：音频模式下让视频 clip 首尾相接，填满句子间停顿（字幕仍按真实时间）
-  let videoCursor = 0;
   const isAudioMode = segments.some((s) => (s.start ?? 0) !== 0 || (s.end ?? 0) !== 0);
-  for (const seg of segments) {
+  for (const [index, seg] of segments.entries()) {
     // 音频模式：用 whisper 真实时间；文案模式：累加 estimatedDuration
     const hasRealTime = (seg.start ?? 0) !== 0 || (seg.end ?? 0) !== 0;
     const start = hasRealTime ? (seg.start ?? cursor) : cursor;
     const duration = hasRealTime ? ((seg.end ?? 0) - (seg.start ?? 0)) : seg.estimatedDuration;
     // 视频轨（占位，sourceId 暂空，等用户绑定素材）
-    // 音频模式下首尾相接：startOnTrack = 前一个 clip 的 end，duration 延伸到当前句 end
+    // 音频模式下首尾相接：startOnTrack = 本句真实开始时间，结束延伸到下一句真实开始
+    // （画面切换点必须踩在语音真正开始的瞬间；停顿由本句的画面撑满，而不是下一句提前抢跑）
     if (videoTrackId) {
-      const vStart = isAudioMode ? videoCursor : cursor;
-      const vDuration = isAudioMode ? ((seg.end ?? (videoCursor + duration)) - videoCursor) : duration;
+      const vStart = isAudioMode ? start : cursor;
+      const nextStart = isAudioMode ? segments[index + 1]?.start : undefined;
+      const vDuration = isAudioMode
+        ? Math.max(0.05, (nextStart ?? (seg.end ?? (start + duration))) - start)
+        : duration;
       clips.push({
         id: newClipId(),
         trackId: videoTrackId,
@@ -519,7 +521,6 @@ function arrangeSegmentsToClips(
         transitionIn: null,
         transitionOut: null,
       });
-      videoCursor = vStart + vDuration;
     }
     // 字幕不再自动生成 —— 改由「识别字幕」按钮通过 ASR 语音识别 + AI 整理生成
     // 配音轨（sourceId 暂空，等生成配音后填充）
@@ -691,11 +692,14 @@ export function App() {
 
   // 监听导出进度事件
   useEffect(() => {
+    // disposed 标志防 StrictMode/快速卸载竞态：listen() resolve 前 cleanup 已执行时，
+    // resolve 后立刻注销，避免 listener 永久泄漏（与 whisper listener 同款模式）
+    let disposed = false;
     let unlisten: (() => void) | null = null;
     async function setup() {
       if ("__TAURI_INTERNALS__" in window) {
         const { listen } = await import("@tauri-apps/api/event");
-        unlisten = await listen<{ progress: number; message: string; etaSeconds?: number }>(
+        const off = await listen<{ progress: number; message: string; etaSeconds?: number }>(
           "render-progress",
           (event) => {
             setExportProgress(event.payload.progress);
@@ -703,10 +707,18 @@ export function App() {
             setExportEtaSeconds(event.payload.etaSeconds ?? null);
           },
         );
+        if (disposed) {
+          off();
+        } else {
+          unlisten = off;
+        }
       }
     }
     void setup();
-    return () => { if (unlisten) unlisten(); };
+    return () => {
+      disposed = true;
+      if (unlisten) unlisten();
+    };
   }, []);
   // 预览区/时间线可调高度（时间线占视口的百分比）
   const [timelineHeightPct, setTimelineHeightPct] = useState(35);
@@ -1356,6 +1368,10 @@ export function App() {
       await refreshWhisperModelStatus();
       setShowSettings(false);
       setStatus("设置已保存");
+    } catch (error) {
+      const parsed = parsePipelineError(error);
+      setStatus(`设置保存失败：${parsed.message}`);
+      pushToast({ type: "error", message: `设置保存失败：${parsed.message}` });
     } finally {
       setBusy(null);
     }
@@ -1378,6 +1394,10 @@ export function App() {
         }
       }
       setStatus("项目已删除");
+    } catch (error) {
+      const parsed = parsePipelineError(error);
+      setStatus(`删除项目失败：${parsed.message}`);
+      pushToast({ type: "error", message: `删除项目失败：${parsed.message}` });
     } finally {
       setBusy(null);
     }
@@ -2041,6 +2061,24 @@ export function App() {
         if (session) persistSession(recordGenerationError(session, session.stage, parsed.message, parsed.retryable));
         failRunningPipelineStep(parsed.message);
         setStatus(`生成失败：${parsed.message}`);
+        // 早期失败（还没产出任何内容）时自动清理空壳项目，避免反复失败堆积垃圾"一键生成"项目
+        const emptyStages = new Set([undefined, "created", "narration_ready"]);
+        const shellProject = pipelineProject;
+        if (shellProject && emptyStages.has(session?.stage) && shellProject.clips.length === 0) {
+          void (async () => {
+            try {
+              await desktopApi.deleteProject(shellProject.id);
+              await refreshProjects();
+              if (projectRef.current?.id === shellProject.id) {
+                projectRef.current = null;
+                setProject(null);
+                setView("home");
+              }
+            } catch {
+              /* 清理失败不影响错误展示 */
+            }
+          })();
+        }
       },
     });
   }
@@ -3452,6 +3490,12 @@ export function App() {
         hasFishAudioVoice={!!settings.fishAudioReferenceId}
         pipeline={pipeline}
         onStart={(input) => handleGeneratePipeline(input)}
+        onCancel={() => {
+          // 取消最耗时的两个后端步骤；管线在当前 await 抛错后走统一 fail 路径
+          void desktopApi.cancelTranscribe().catch(() => {});
+          void desktopApi.cancelRender().catch(() => {});
+          setStatus("正在取消生成...");
+        }}
         onError={(msg) => setStatus(msg)}
       />
       {showSettings && (

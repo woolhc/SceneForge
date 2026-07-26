@@ -128,7 +128,7 @@ pub async fn segment_script(
         .post("https://api.deepseek.com/chat/completions")
         .bearer_auth(api_key)
         .json(&json!({
-            "model": "deepseek-chat",
+            "model": "deepseek-v4-flash",
             "messages": [
                 { "role": "system", "content": system_prompt },
                 { "role": "user", "content": user_prompt }
@@ -258,7 +258,7 @@ pub async fn enrich_segments(
                 .post("https://api.deepseek.com/chat/completions")
                 .bearer_auth(api_key)
                 .json(&json!({
-                    "model": "deepseek-chat",
+                    "model": "deepseek-v4-flash",
                     "messages": [
                         {
                             "role": "system",
@@ -505,7 +505,7 @@ pub async fn advise_subtitle_breaks(
 
     let client = crate::ffmpeg::http_client();
     let mut last_error: Option<anyhow::Error> = None;
-    for model in ["deepseek-v4-flash", "deepseek-chat"] {
+    for model in ["deepseek-v4-flash", "deepseek-v4-pro"] {
         let response = client
             .post("https://api.deepseek.com/chat/completions")
             .bearer_auth(api_key)

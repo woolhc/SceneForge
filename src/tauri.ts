@@ -820,6 +820,10 @@ async function webFallback<T>(command: string, args?: Record<string, unknown>): 
     } as T;
   }
 
+  if (command === "cancel_transcribe") {
+    return undefined as T;
+  }
+
   if (command === "cancel_render") {
     return undefined as T;
   }
@@ -1014,4 +1018,5 @@ export const desktopApi = {
     call<RenderResult>("render_project", { request }),
   /** T3.3: 取消正在进行的渲染任务 */
   cancelRender: () => call<void>("cancel_render"),
+  cancelTranscribe: () => call<void>("cancel_transcribe"),
 };
