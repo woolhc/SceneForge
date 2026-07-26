@@ -486,19 +486,21 @@ function arrangeSegmentsToClips(
   const voiceoverTrackId = pickPrimaryTrack(tracks, "voiceover");
   const clips: Clip[] = [];
   let cursor = 0;
-  // 视频轨游标：音频模式下让视频 clip 首尾相接，填满句子间停顿（字幕仍按真实时间）
-  let videoCursor = 0;
   const isAudioMode = segments.some((s) => (s.start ?? 0) !== 0 || (s.end ?? 0) !== 0);
-  for (const seg of segments) {
+  for (const [index, seg] of segments.entries()) {
     // 音频模式：用 whisper 真实时间；文案模式：累加 estimatedDuration
     const hasRealTime = (seg.start ?? 0) !== 0 || (seg.end ?? 0) !== 0;
     const start = hasRealTime ? (seg.start ?? cursor) : cursor;
     const duration = hasRealTime ? ((seg.end ?? 0) - (seg.start ?? 0)) : seg.estimatedDuration;
     // 视频轨（占位，sourceId 暂空，等用户绑定素材）
-    // 音频模式下首尾相接：startOnTrack = 前一个 clip 的 end，duration 延伸到当前句 end
+    // 音频模式下首尾相接：startOnTrack = 本句真实开始时间，结束延伸到下一句真实开始
+    // （画面切换点必须踩在语音真正开始的瞬间；停顿由本句的画面撑满，而不是下一句提前抢跑）
     if (videoTrackId) {
-      const vStart = isAudioMode ? videoCursor : cursor;
-      const vDuration = isAudioMode ? ((seg.end ?? (videoCursor + duration)) - videoCursor) : duration;
+      const vStart = isAudioMode ? start : cursor;
+      const nextStart = isAudioMode ? segments[index + 1]?.start : undefined;
+      const vDuration = isAudioMode
+        ? Math.max(0.05, (nextStart ?? (seg.end ?? (start + duration))) - start)
+        : duration;
       clips.push({
         id: newClipId(),
         trackId: videoTrackId,
@@ -519,7 +521,6 @@ function arrangeSegmentsToClips(
         transitionIn: null,
         transitionOut: null,
       });
-      videoCursor = vStart + vDuration;
     }
     // 字幕不再自动生成 —— 改由「识别字幕」按钮通过 ASR 语音识别 + AI 整理生成
     // 配音轨（sourceId 暂空，等生成配音后填充）
