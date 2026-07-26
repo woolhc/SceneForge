@@ -187,6 +187,18 @@ pub struct ReplaceVoiceSampleRequest {
     pub bytes: Vec<u8>,
 }
 
+/// P2-2 贴纸：前端 canvas 渲染 emoji/形状为 PNG 字节，后端落盘为 image 素材
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveStickerRequest {
+    /// 贴纸标识（emoji 本身或形状名），用于稳定文件名与素材去重
+    pub sticker_id: String,
+    pub title: String,
+    pub bytes: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoicePreviewRequest {

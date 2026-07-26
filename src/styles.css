@@ -5803,3 +5803,131 @@ textarea {
   opacity: 0.45;
   text-decoration: none;
 }
+
+
+/* P2-2 贴纸库面板 */
+.sticker-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 4px 2px;
+}
+
+.sticker-group-title {
+  font-size: 12px;
+  color: #9aa3ad;
+  margin-bottom: 6px;
+}
+
+.sticker-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+}
+
+.sticker-cell {
+  aspect-ratio: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #17191b;
+  border: 1px solid #2a2f35;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: border-color 0.15s, transform 0.1s;
+}
+
+.sticker-cell:hover:not(:disabled) {
+  border-color: #34d399;
+  transform: scale(1.06);
+}
+
+.sticker-cell:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.sticker-glyph {
+  font-size: 24px;
+  line-height: 1;
+}
+
+
+/* P2-4 背景音乐面板 */
+.bgm-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-bottom: 12px;
+  margin-bottom: 12px;
+  border-bottom: 1px solid #2a2f35;
+}
+
+.bgm-import {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  justify-content: center;
+}
+
+.bgm-remove {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  justify-content: center;
+}
+
+.bgm-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.bgm-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: #17191b;
+  border: 1px solid #2a2f35;
+  border-radius: 8px;
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+}
+
+.bgm-item:hover:not(:disabled) {
+  border-color: #34d399;
+}
+
+.bgm-item.active {
+  border-color: #34d399;
+  background: rgba(52, 211, 153, 0.08);
+}
+
+.bgm-item-meta {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+
+.bgm-item-meta span {
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bgm-item-meta small {
+  font-size: 11px;
+  color: #9aa3ad;
+}
+
+.bgm-item-badge {
+  font-size: 11px;
+  color: #34d399;
+  flex-shrink: 0;
+}

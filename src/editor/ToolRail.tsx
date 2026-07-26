@@ -1,9 +1,10 @@
-import { Captions, Music, Sparkles, Type, Video, WandSparkles } from "lucide-react";
+import { Captions, Music, Smile, Sparkles, Type, Video, WandSparkles } from "lucide-react";
 import { TOOL_TABS, type ToolTab } from "./editorLayout";
 
 const ICONS = {
   media: Video,
   text: Type,
+  sticker: Smile,
   audio: Music,
   subtitle: Captions,
   transition: WandSparkles,

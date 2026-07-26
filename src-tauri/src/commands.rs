@@ -1950,6 +1950,50 @@ pub async fn import_media(
     })
 }
 
+/// P2-2 贴纸：把前端渲染好的 PNG 字节存为可复用的 image 素材。
+/// 同一 sticker_id 幂等（文件名稳定），预览/导出直接走现有 image overlay 路径。
+#[tauri::command]
+pub async fn save_sticker_image(
+    state: State<'_, AppState>,
+    request: crate::models::SaveStickerRequest,
+) -> Result<MediaSource, String> {
+    if request.bytes.is_empty() {
+        return Err("贴纸图像数据为空".to_string());
+    }
+    let sticker_dir = state.paths.cache_dir.join("stickers");
+    tokio::fs::create_dir_all(&sticker_dir)
+        .await
+        .map_err(map_error)?;
+    // sticker_id 可能是 emoji（非 ASCII），文件名用十六进制编码保证跨平台安全
+    let stem: String = request
+        .sticker_id
+        .bytes()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let file_path = sticker_dir.join(format!("sticker-{stem}.png"));
+    tokio::fs::write(&file_path, &request.bytes)
+        .await
+        .map_err(map_error)?;
+    let path_str = file_path.to_string_lossy().to_string();
+    Ok(MediaSource {
+        id: format!("sticker-{stem}"),
+        kind: "image".to_string(),
+        title: request.title,
+        url: None,
+        local_path: Some(path_str.clone()),
+        proxy_path: None,
+        proxy_status: Some("none".to_string()),
+        proxy_width: None,
+        proxy_height: None,
+        thumbnail_url: Some(path_str),
+        width: request.width.max(1),
+        height: request.height.max(1),
+        duration: 0.0,
+        source: "sticker".to_string(),
+        ..Default::default()
+    })
+}
+
 /// 为任意本地媒体生成缩略图，返回 asset 可访问的本地路径。
 #[tauri::command]
 pub async fn generate_thumbnail(

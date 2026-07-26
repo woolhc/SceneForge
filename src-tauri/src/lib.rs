@@ -87,6 +87,7 @@ pub fn run() {
             commands::advise_subtitle_breaks,
             commands::enrich_segments,
             commands::import_media,
+            commands::save_sticker_image,
             commands::generate_thumbnail,
             commands::generate_filmstrip,
             commands::render_project,

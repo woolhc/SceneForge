@@ -7,7 +7,7 @@ import type { EvaluatedFrame, RenderGraph } from "../renderGraph/types";
 import { visualLayerCssStyle } from "../renderGraph/visualLayout";
 import { MediaElementPool, type PooledMedia } from "./MediaElementPool";
 import type { EngineState, PreviewRenderer } from "./PreviewRenderer";
-import { previewCssFilter } from "./previewFilters";
+import { previewCssFilter, previewCssTransformExtra, previewVignetteBoxShadow } from "./previewFilters";
 
 /** 把 ClipCrop (0-100 百分比) 转为 CSS clip-path inset() 字符串。无裁剪返回空串。 */
 function cropToClipPath(crop: Clip["crop"] | null | undefined): string {
@@ -418,10 +418,11 @@ export class PreviewEngine implements PreviewRenderer {
    item.el.style.transformOrigin = "center center";
    // T4.x: 裁剪 + 入场/出场转场近似（fade 类）
    const cropPath = cropToClipPath(clip.crop);
-   item.el.style.transform = layout.transform + cropCompensateTransform(clip.crop);
+   item.el.style.transform = layout.transform + cropCompensateTransform(clip.crop) + previewCssTransformExtra(clip);
    item.el.style.clipPath = cropPath || "";
    item.el.style.opacity = layout.opacity;
    item.el.style.filter = previewCssFilter(clip);
+   item.el.style.boxShadow = previewVignetteBoxShadow(clip);
    // 主轨也应用蒙版（此前仅 overlay 路径有，导致 base 设蒙版预览无效）
    this.applyOverlayMask(item.el, clip.mask);
 
@@ -598,14 +599,17 @@ export class PreviewEngine implements PreviewRenderer {
       const cropPath = cropToClipPath(clip.crop);
       const objectFit = evaluated.fit === "contain" ? "contain" : "cover";
       const cropComp = cropCompensateTransform(clip.crop);
-      const styleSignature = JSON.stringify({ layout, mix: tf?.mix ?? "", mask: m ?? null, cssFilter, cropPath, cropComp, objectFit });
+      const fxTransform = previewCssTransformExtra(clip);
+      const vignetteShadow = previewVignetteBoxShadow(clip);
+      const styleSignature = JSON.stringify({ layout, mix: tf?.mix ?? "", mask: m ?? null, cssFilter, cropPath, cropComp, fxTransform, vignetteShadow, objectFit });
       if (this.overlayStyleSignatures.get(clip.id) !== styleSignature) {
         this.overlayStyleSignatures.set(clip.id, styleSignature);
         v.style.left = layout.left;
         v.style.top = layout.top;
         v.style.width = layout.width;
         v.style.height = layout.height;
-        v.style.transform = layout.transform + cropComp;
+        v.style.transform = layout.transform + cropComp + fxTransform;
+        v.style.boxShadow = vignetteShadow;
         v.style.opacity = layout.opacity;
         v.style.filter = cssFilter;
         v.style.clipPath = cropPath || "";

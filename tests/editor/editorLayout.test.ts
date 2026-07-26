@@ -13,7 +13,7 @@ import {
 
 assert.deepEqual(
   TOOL_TABS.map((tab) => tab.id),
-  ["media", "text", "audio", "subtitle", "transition", "effects"],
+  ["media", "text", "sticker", "audio", "subtitle", "transition", "effects"],
   "all editor capabilities must have a stable primary tool entry",
 );
 

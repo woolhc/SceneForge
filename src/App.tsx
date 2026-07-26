@@ -150,6 +150,8 @@ import {
 } from "./timeline/clipInteraction";
 import { realignTimeline } from "./timeline/realignTimeline";
 import { MediaPanel } from "./panels/MediaPanel";
+import { StickerPanel } from "./panels/StickerPanel";
+import { BgmPanel } from "./panels/BgmPanel";
 import { TextPanel } from "./panels/TextPanel";
 import { AudioPanel } from "./panels/AudioPanel";
 import { TransitionPanel } from "./panels/TransitionPanel";
@@ -1645,6 +1647,168 @@ export function App() {
   }
 
   /** 添加一个独立文本图层：没有文字轨时自动创建，插入位置取播放头 */
+  /** P2-4: BGM clip 识别——audio 轨上名为"背景音乐"的轨道里的 clip */
+  const BGM_TRACK_NAME = "背景音乐";
+  const activeBgmSourceId = (() => {
+    if (!project) return null;
+    const bgmTrack = project.tracks.find((track) => track.kind === "audio" && track.name === BGM_TRACK_NAME);
+    if (!bgmTrack) return null;
+    return project.clips.find((clip) => clip.trackId === bgmTrack.id)?.sourceId ?? null;
+  })();
+
+  /** P2-4: 把音频素材设为背景音乐——铺满全片,30% 音量,首尾 2s 淡入淡出 */
+  async function handleApplyBgm(asset: MediaSource) {
+    const current = projectRef.current;
+    if (!current) return;
+    if (!asset.duration || asset.duration <= 0) {
+      pushToast({ type: "warning", message: "该音频没有时长信息，无法设为背景音乐" });
+      return;
+    }
+    setBusy("bgm");
+    try {
+      const totalDuration = Math.max(1, projectOutputDuration(current));
+      let bgmTrack = current.tracks.find((track) => track.kind === "audio" && track.name === BGM_TRACK_NAME);
+      let tracks = current.tracks;
+      if (!bgmTrack) {
+        const maxOrder = current.tracks.reduce((max, track) => Math.max(max, track.order), -1);
+        bgmTrack = {
+          id: newTrackId("audio"),
+          kind: "audio",
+          name: BGM_TRACK_NAME,
+          order: maxOrder + 1,
+          muted: false,
+          locked: false,
+        };
+        tracks = [...current.tracks, bgmTrack];
+      }
+      // 清掉旧 BGM clip,再铺新的(素材短于全片时循环平铺)
+      const bgmTrackId = bgmTrack.id;
+      const withoutOld = current.clips.filter((clip) => clip.trackId !== bgmTrackId);
+      const fade = Math.min(2, asset.duration / 4);
+      const newClips: Clip[] = [];
+      let cursor = 0;
+      while (cursor < totalDuration - 0.05) {
+        const remaining = totalDuration - cursor;
+        const clipDuration = Math.min(asset.duration, remaining);
+        const isFirst = cursor === 0;
+        const isLast = remaining <= asset.duration + 0.05;
+        newClips.push({
+          id: newClipId(),
+          trackId: bgmTrackId,
+          sourceId: asset.id,
+          startOnTrack: cursor,
+          duration: clipDuration,
+          sourceIn: 0,
+          sourceOut: clipDuration,
+          speed: 1,
+          volume: 0.3,
+          fadeIn: isFirst ? fade : 0,
+          fadeOut: isLast ? Math.min(fade, clipDuration / 2) : 0,
+          brightness: 0,
+          contrast: 0,
+          saturation: 0,
+          transitionIn: null,
+          transitionOut: null,
+        });
+        cursor += clipDuration;
+      }
+      const media = current.media.some((m) => m.id === asset.id)
+        ? current.media
+        : [...current.media, asset];
+      const next: Project = { ...current, media, tracks, clips: [...withoutOld, ...newClips] };
+      await persist(next, `已设为背景音乐：${asset.title}`);
+    } catch (error) {
+      const parsed = parsePipelineError(error);
+      pushToast({ type: "error", message: `设置背景音乐失败：${parsed.message}` });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /** P2-4: 移除背景音乐(删 BGM 轨上全部 clip,轨道保留) */
+  async function handleRemoveBgm() {
+    const current = projectRef.current;
+    if (!current) return;
+    const bgmTrack = current.tracks.find((track) => track.kind === "audio" && track.name === BGM_TRACK_NAME);
+    if (!bgmTrack) return;
+    setBusy("bgm");
+    try {
+      const next: Project = {
+        ...current,
+        clips: current.clips.filter((clip) => clip.trackId !== bgmTrack.id),
+      };
+      await persist(next, "已移除背景音乐");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /** P2-2: 贴纸 → 后端落盘为 image 素材 → 加到贴纸/图片轨播放头处(默认 3 秒) */
+  async function handleAddSticker(payload: {
+    stickerId: string;
+    title: string;
+    bytes: number[];
+    width: number;
+    height: number;
+  }) {
+    const current = projectRef.current;
+    if (!current) return;
+    setBusy("sticker");
+    try {
+      const asset = await desktopApi.saveStickerImage(payload);
+      const media = current.media.some((m) => m.id === asset.id)
+        ? current.media.map((m) => (m.id === asset.id ? { ...m, ...asset } : m))
+        : [...current.media, asset];
+      // 复用/新建一条 image 轨承载贴纸(命名"贴纸轨",与主图轨分开)
+      let stickerTrack = current.tracks
+        .filter((track) => track.kind === "image" && track.name.includes("贴纸"))
+        .sort((a, b) => a.order - b.order)[0];
+      let tracks = current.tracks;
+      if (!stickerTrack) {
+        const maxOrder = current.tracks.reduce((max, track) => Math.max(max, track.order), -1);
+        stickerTrack = {
+          id: newTrackId("image"),
+          kind: "image",
+          name: "贴纸轨",
+          order: maxOrder + 1,
+          muted: false,
+          locked: false,
+        };
+        tracks = [...current.tracks, stickerTrack];
+      }
+      const startOnTrack = usePlaybackStore.getState().currentTime;
+      const newClip: Clip = {
+        id: newClipId(),
+        trackId: stickerTrack.id,
+        sourceId: asset.id,
+        startOnTrack,
+        duration: 3,
+        sourceIn: 0,
+        sourceOut: 3,
+        speed: 1,
+        volume: 0,
+        fadeIn: 0,
+        fadeOut: 0,
+        brightness: 0,
+        contrast: 0,
+        saturation: 0,
+        // 贴纸默认小尺寸盒(画布 22%),放画面右上区域,用户可拖动
+        transform: { x: 78, y: 18, scale: 22, opacity: 100, cornerRadius: 0, mix: "" },
+        transitionIn: null,
+        transitionOut: null,
+      };
+      const next: Project = { ...current, media, tracks, clips: [...current.clips, newClip] };
+      await persist(next, `已添加${payload.title}`);
+      setSelectedClipId(newClip.id);
+    } catch (error) {
+      const parsed = parsePipelineError(error);
+      setStatus(`添加贴纸失败：${parsed.message}`);
+      pushToast({ type: "error", message: `添加贴纸失败：${parsed.message}` });
+    } finally {
+      setBusy(null);
+    }
+  }
+
   function handleAddTextLayer() {
     if (!project) return;
     const existingTrack = project.tracks
@@ -3645,6 +3809,9 @@ export function App() {
                 onApplyTextTemplate={handleApplyTextTemplate}
               />
             )}
+            {activeToolTab === "sticker" && (
+              <StickerPanel busy={busy} onAddSticker={handleAddSticker} />
+            )}
             {activeToolTab === "subtitle" && (
               <div className="panel-content subtitle-editor-panel">
                 <SubtitlePanel
@@ -3669,6 +3836,15 @@ export function App() {
               </div>
             )}
             {activeToolTab === "audio" && (
+              <>
+              <BgmPanel
+                media={project?.media || []}
+                busy={busy}
+                activeBgmSourceId={activeBgmSourceId}
+                onImportAudio={handleImportLocal}
+                onApplyBgm={handleApplyBgm}
+                onRemoveBgm={handleRemoveBgm}
+              />
               <AudioPanel
                 voiceProfiles={voiceProfiles}
                 defaultVoiceId={settings.defaultVoiceId ?? null}
@@ -3700,6 +3876,7 @@ export function App() {
                 onNewVoiceNameChange={setNewVoiceName}
                 onNewVoiceReferenceTextChange={setNewVoiceReferenceText}
               />
+              </>
             )}
             {activeToolTab === "transition" && (
               <TransitionPanel

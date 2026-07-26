@@ -820,6 +820,26 @@ async function webFallback<T>(command: string, args?: Record<string, unknown>): 
     } as T;
   }
 
+  if (command === "save_sticker_image") {
+    const request = args?.request as { stickerId: string; title: string; width: number; height: number };
+    return {
+      id: `sticker-${request.stickerId}`,
+      kind: "image",
+      title: request.title,
+      url: null,
+      localPath: null,
+      proxyPath: null,
+      proxyStatus: "none",
+      proxyWidth: null,
+      proxyHeight: null,
+      thumbnailUrl: null,
+      width: request.width,
+      height: request.height,
+      duration: 0,
+      source: "sticker",
+    } as MediaSource as T;
+  }
+
   if (command === "cancel_transcribe") {
     return undefined as T;
   }
@@ -955,6 +975,8 @@ export const desktopApi = {
     call<MediaSource>("cache_asset_video", { request: { asset } }),
   importMedia: (sourcePath: string) =>
     call<MediaSource>("import_media", { request: { sourcePath } }),
+  saveStickerImage: (request: { stickerId: string; title: string; bytes: number[]; width: number; height: number }) =>
+    call<MediaSource>("save_sticker_image", { request }),
   generateThumbnail: (sourcePath: string, at = 0.5) =>
     call<string>("generate_thumbnail", { request: { sourcePath, at } }),
   /** T4.7: 生成视频胶片条缩略图（均匀取帧） */

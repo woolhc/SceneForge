@@ -1,7 +1,7 @@
 import type { TrackKind } from "../types";
 
 export type EditorMode = "professional" | "simple";
-export type ToolTab = "media" | "text" | "audio" | "subtitle" | "transition" | "effects";
+export type ToolTab = "media" | "text" | "sticker" | "audio" | "subtitle" | "transition" | "effects";
 export type InspectorTab = "basic" | "visual" | "animation" | "audio" | "subtitle";
 
 export interface ToolTabDefinition {
@@ -12,6 +12,7 @@ export interface ToolTabDefinition {
 export const TOOL_TABS: readonly ToolTabDefinition[] = [
   { id: "media", label: "媒体" },
   { id: "text", label: "文本" },
+  { id: "sticker", label: "贴纸" },
   { id: "audio", label: "音频" },
   { id: "subtitle", label: "字幕" },
   { id: "transition", label: "转场" },
