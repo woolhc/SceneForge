@@ -15,7 +15,7 @@ export function TextPanel({
   onScriptChange: (script: string) => void;
   onAiSegment: () => void;
   onAddTextLayer: () => void;
-  onApplyTextTemplate: (style: Partial<SubtitleStyle>) => void;
+  onApplyTextTemplate: (template: { style: Partial<SubtitleStyle>; decoration?: { background?: string; boxShadow?: string; borderRadius?: number; padding?: string } }) => void;
 }) {
   const segmenting = busy === "segment";
 

@@ -2,15 +2,14 @@ import type { SubtitleStyle } from "../types";
 
 /**
  * 花字/文字模板（剪映式一键应用，用于独立文本图层）。
- * decoration（背景图/边框图）暂缺素材，先只提供纯样式模板；
- * decorationId：可选装饰素材 id（花字背景/边框等），当前模板渲染不含装饰，仅影响预览卡片外观。
+ * decoration 提供 CSS 渐变背景/描边/发光等花字装饰效果（无需外部图片素材）。
  */
 export type TextTemplate = {
   id: string;
   name: string;
   category: "标题" | "花字" | "综艺" | "简约";
   style: Partial<SubtitleStyle>;
-  decoration?: { backgroundImage?: string; borderImage?: string };
+  decoration?: { background?: string; boxShadow?: string; borderRadius?: number; padding?: string };
 };
 
 export const TEXT_TEMPLATES: TextTemplate[] = [

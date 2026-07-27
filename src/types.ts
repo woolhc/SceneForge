@@ -186,6 +186,14 @@ export type SubtitleStyle = {
   animationOut?: string;
   /** T4.8: 动画时长（秒，默认 0.3） */
   animationDuration?: number;
+  /** 花字装饰：CSS 背景（渐变/纯色） */
+  decorationBackground?: string | null;
+  /** 花字装饰：CSS box-shadow（发光/投影） */
+  decorationBoxShadow?: string | null;
+  /** 花字装饰：圆角 */
+  decorationBorderRadius?: number | null;
+  /** 花字装饰：内边距（CSS string 如 "8px 20px"） */
+  decorationPadding?: string | null;
   /** 花字装饰模板 id（关联 textTemplates.ts 的 TextTemplate.decoration）。仅预览生效，导出降级为纯文字。 */
   decorationId?: string | null;
 };

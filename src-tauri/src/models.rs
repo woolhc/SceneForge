@@ -415,6 +415,18 @@ pub struct SubtitleStyle {
     /// T4.8: 动画时长（秒）
     #[serde(default = "default_anim_duration")]
     pub animation_duration: f64,
+    /// 花字装饰：CSS 背景
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoration_background: Option<String>,
+    /// 花字装饰：CSS box-shadow
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoration_box_shadow: Option<String>,
+    /// 花字装饰：圆角
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoration_border_radius: Option<f64>,
+    /// 花字装饰：内边距
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoration_padding: Option<String>,
     /// 花字装饰模板 id。仅预览生效，导出时降级为纯文字样式。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoration_id: Option<String>,
@@ -450,6 +462,10 @@ impl Default for SubtitleStyle {
             animation_out: String::new(),
             animation_duration: default_anim_duration(),
             decoration_id: None,
+            decoration_background: None,
+            decoration_box_shadow: None,
+            decoration_border_radius: None,
+            decoration_padding: None,
         }
     }
 }

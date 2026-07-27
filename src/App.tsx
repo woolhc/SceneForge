@@ -1525,9 +1525,23 @@ export function App() {
   }
 
   /** 应用花字模板到当前选中的文本图层；未选中文本图层时提示先新建 */
-  function handleApplyTextTemplate(style: Partial<SubtitleStyle>) {
+  function handleApplyTextTemplate(template: { style: Partial<SubtitleStyle>; decoration?: { background?: string; boxShadow?: string; borderRadius?: number; padding?: string } }) {
     if (selectedClip && selectedClipTrack?.kind === "text") {
-      updateSelectedClip({ subtitleStyle: { ...(selectedClip.subtitleStyle ?? DEFAULT_TEXT_LAYER_STYLE), ...style } });
+      const decorationStyle: Partial<SubtitleStyle> = template.decoration
+        ? {
+            decorationBackground: template.decoration.background ?? null,
+            decorationBoxShadow: template.decoration.boxShadow ?? null,
+            decorationBorderRadius: template.decoration.borderRadius ?? null,
+            decorationPadding: template.decoration.padding ?? null,
+          }
+        : {};
+      updateSelectedClip({
+        subtitleStyle: {
+          ...(selectedClip.subtitleStyle ?? DEFAULT_TEXT_LAYER_STYLE),
+          ...template.style,
+          ...decorationStyle,
+        },
+      });
       return;
     }
     setStatus("请先新建或选中一个文本图层，再应用花字模板");

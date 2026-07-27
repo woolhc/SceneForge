@@ -6,7 +6,7 @@ import type { SubtitleStyle } from "../types";
 export function TextTemplatePanel({
   onApplyTemplate,
 }: {
-  onApplyTemplate: (style: Partial<SubtitleStyle>) => void;
+  onApplyTemplate: (template: { style: Partial<SubtitleStyle>; decoration?: { background?: string; boxShadow?: string; borderRadius?: number; padding?: string } }) => void;
 }) {
   return (
     <div className="text-section">
@@ -20,7 +20,7 @@ export function TextTemplatePanel({
             key={template.id}
             className="subtitle-preset-card"
             title={`${template.category} · ${template.name}`}
-            onClick={() => onApplyTemplate(template.style)}
+            onClick={() => onApplyTemplate(template)}
           >
             <span
               className="subtitle-preset-preview"
