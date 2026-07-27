@@ -256,6 +256,24 @@ pub fn http_client() -> &'static reqwest::Client {
     })
 }
 
+
+/// 用 ffprobe 探测媒体时长（秒），30s 超时。tts/其它模块统一走这里。
+pub async fn probe_duration(path: &std::path::Path) -> anyhow::Result<f64> {
+    let mut cmd = crate::tools::command(crate::tools::NativeTool::Ffprobe);
+    cmd.args([
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        &path.to_string_lossy(),
+    ]);
+    let output = run_with_timeout(&mut cmd, 30).await?;
+    if !output.status.success() {
+        anyhow::bail!("ffprobe 探测时长失败");
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(text.parse::<f64>().unwrap_or(0.0))
+}
+
 pub fn collect_mix_audio_clips(project: &Project) -> Vec<&Clip> {
     let mut audio_clips: Vec<&Clip> = project
         .clips

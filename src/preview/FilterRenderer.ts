@@ -48,6 +48,10 @@ export class FilterRenderer {
     uniform float u_temperature;
     uniform float u_tint;
     uniform bool u_useLut;
+    uniform bool u_useChromaKey;
+    uniform vec3 u_chromaKeyColor;
+    uniform float u_chromaKeySimilarity;
+    uniform float u_chromaKeyBlend;
 
     void main() {
       vec4 color = texture2D(u_image, v_texCoord);
@@ -88,7 +92,17 @@ export class FilterRenderer {
         color.rgb = mix(c0, c1, f);
       }
 
-      gl_FragColor = vec4(clamp(color.rgb, 0.0, 1.0), 1.0);
+      // chromakey: 把接近目标色的像素变透明（导出端 colorkey 等效）
+      float alpha = 1.0;
+      if (u_useChromaKey) {
+        float dist = distance(color.rgb, u_chromaKeyColor);
+        if (dist < u_chromaKeySimilarity) {
+          alpha = 0.0;
+        } else if (dist < u_chromaKeySimilarity + u_chromaKeyBlend) {
+          alpha = (dist - u_chromaKeySimilarity) / max(u_chromaKeyBlend, 0.001);
+        }
+      }
+      gl_FragColor = vec4(clamp(color.rgb, 0.0, 1.0), alpha);
     }
   `;
 
@@ -255,11 +269,14 @@ export class FilterRenderer {
     const hasColor = (clip.brightness ?? 0) !== 0 || (clip.contrast ?? 0) !== 0 || (clip.saturation ?? 0) !== 0
       || (clip.temperature ?? 0) !== 0 || (clip.tint ?? 0) !== 0;
     const hasLut = clip.filter && clip.filter !== "none" && this.currentLutName === clip.filter;
-    const needsRender = hasColor || hasLut;
+    const chromaEffect = (clip.visualEffects ?? []).find((e) => e.kind === "chromakey");
+    const hasChromaKey = !!chromaEffect;
+    const needsRender = hasColor || hasLut || hasChromaKey;
 
     if (!needsRender) {
       // 无滤镜 → 清空 canvas（透明），让下面的 video 直接显示
       this.canvas.style.display = "none";
+      if (this.video) this.video.style.opacity = "";
       return;
     }
     this.canvas.style.display = "block";
@@ -301,6 +318,24 @@ export class FilterRenderer {
     gl.uniform1f(gl.getUniformLocation(this.program, "u_temperature"), temperature);
     gl.uniform1f(gl.getUniformLocation(this.program, "u_tint"), tint);
     gl.uniform1i(gl.getUniformLocation(this.program, "u_useLut"), hasLut ? 1 : 0);
+
+    // chromakey uniforms
+    if (hasChromaKey && chromaEffect) {
+      const hex = chromaEffect.chromaKeyColor || "#00FF00";
+      const r = parseInt(hex.slice(1, 3), 16) / 255;
+      const g = parseInt(hex.slice(3, 5), 16) / 255;
+      const b = parseInt(hex.slice(5, 7), 16) / 255;
+      const intensity = Math.max(0, Math.min(100, chromaEffect.intensity)) / 100;
+      gl.uniform1i(gl.getUniformLocation(this.program, "u_useChromaKey"), 1);
+      gl.uniform3f(gl.getUniformLocation(this.program, "u_chromaKeyColor"), r, g, b);
+      gl.uniform1f(gl.getUniformLocation(this.program, "u_chromaKeySimilarity"), 0.01 + intensity * 0.4);
+      gl.uniform1f(gl.getUniformLocation(this.program, "u_chromaKeyBlend"), intensity * 0.2);
+      // 隐藏底层 video 元素：canvas 的透明像素（被抠掉的区域）才能显示下层画面
+      if (this.video) this.video.style.opacity = "0";
+    } else {
+      gl.uniform1i(gl.getUniformLocation(this.program, "u_useChromaKey"), 0);
+      if (this.video) this.video.style.opacity = "";
+    }
 
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }

@@ -179,20 +179,5 @@ fn classify_fish_audio_error(status: u16, detail: String) -> anyhow::Error {
 }
 
 async fn probe_duration(path: &Path) -> anyhow::Result<f64> {
-    let mut cmd = crate::tools::command(crate::tools::NativeTool::Ffprobe);
-    cmd.args([
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        &path.to_string_lossy(),
-    ]);
-    let output = cmd.output().await?;
-    if !output.status.success() {
-        anyhow::bail!("ffprobe failed");
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    Ok(text.trim().parse().unwrap_or(0.0))
+    crate::ffmpeg::probe_duration(path).await
 }

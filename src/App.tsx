@@ -185,6 +185,7 @@ import { WhisperSetupDialog } from "./components/WhisperSetupDialog";
 import { hasWhisperModel, shouldGateWhisperAction } from "./editor/readiness";
 import { useWhisperSetup } from "./editor/useWhisperSetup";
 import { searchStockMedia, type SearchOptions } from "./editor/stockSearch";
+import { loadGenerationSession } from "./editor/generationSession";
 import { useVoiceProfiles } from "./editor/useVoiceProfiles";
 // PanelTitle 已不再直接使用（各 Tab 自带标题）；TimelineTrack/Track 类型保留供时间线渲染
 
@@ -1693,6 +1694,9 @@ export function App() {
       return session;
     };
 
+    // 断点续跑：如果当前编辑器里有上次失败的项目，尝试从 session 恢复
+    const existingProjectId = projectRef.current?.id;
+    const resumeSession = existingProjectId ? loadGenerationSession(existingProjectId) : null;
     await runGeneratePipeline(input, {
       startPipeline,
       updateStep: updatePipelineStep,
@@ -1918,7 +1922,7 @@ export function App() {
           })();
         }
       },
-    });
+    }, resumeSession);
   }
 
   async function handleSegmentScript(opts?: { skipEdl?: boolean }) {

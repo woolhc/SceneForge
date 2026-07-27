@@ -3,7 +3,7 @@ import type { SubtitleStyle } from "../types";
 /**
  * 花字/文字模板（剪映式一键应用，用于独立文本图层）。
  * decoration（背景图/边框图）暂缺素材，先只提供纯样式模板；
- * decorationId 字段占位，接入真实装饰素材后再启用。
+ * decorationId：可选装饰素材 id（花字背景/边框等），当前模板渲染不含装饰，仅影响预览卡片外观。
  */
 export type TextTemplate = {
   id: string;
