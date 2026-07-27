@@ -184,6 +184,7 @@ import { UnifiedSettingsDialog } from "./components/UnifiedSettingsDialog";
 import { WhisperSetupDialog } from "./components/WhisperSetupDialog";
 import { hasWhisperModel, shouldGateWhisperAction } from "./editor/readiness";
 import { useWhisperSetup } from "./editor/useWhisperSetup";
+import { searchStockMedia, type SearchOptions } from "./editor/stockSearch";
 // PanelTitle 已不再直接使用（各 Tab 自带标题）；TimelineTrack/Track 类型保留供时间线渲染
 
 const ratios = ["9:16", "16:9", "1:1"];
@@ -2050,136 +2051,19 @@ export function App() {
   }
 
 
-  /**
-   * 按素材源搜索视频。
-   * 不依赖前端 settings 缓存判断 Key 是否存在——后端会校验；
-   * 任一源失败（配额/鉴权/未配置）自动尝试下一个。
-   * 会话内若 Pexels 已确认配额失败，后续请求直接优先 Pixabay，避免每个分镜先撞墙。
-   */
-  async function searchStockVideos(options: {
-    query: string;
-    ratio: string;
-    perPage?: number;
-    page?: number;
-    prefer?: StockMediaProvider;
-  }) {
-    const prefer =
-      options.prefer
-      || (stockPreferPixabayRef.current ? "pixabay" : null)
-      || libraryProvider
-      || "pexels";
-    const order: StockMediaProvider[] =
-      prefer === "pixabay" ? ["pixabay", "pexels"] : ["pexels", "pixabay"];
-    const errors: string[] = [];
-    for (const provider of order) {
-      try {
-        const result =
-          provider === "pixabay"
-            ? await desktopApi.searchPixabayVideos({
-                query: options.query,
-                ratio: options.ratio,
-                perPage: options.perPage,
-                page: options.page,
-              })
-            : await desktopApi.searchPexelsVideos({
-                query: options.query,
-                ratio: options.ratio,
-                perPage: options.perPage,
-                page: options.page,
-              });
-        // 首源失败后备用源成功 → 记会话偏好 + 轻提示一次
-        if (provider === "pixabay" && order[0] === "pexels" && errors.length > 0) {
-          stockPreferPixabayRef.current = true;
-          if (!stockFallbackNotifiedRef.current) {
-            stockFallbackNotifiedRef.current = true;
-            pushToast({
-              type: "info",
-              message: "Pexels 不可用，已自动切换到 Pixabay 继续搜素材",
-              duration: 5000,
-            });
-          }
-          if (libraryProvider !== "pixabay") setLibraryProvider("pixabay");
-        }
-        return { ...result, provider };
-      } catch (error) {
-        const parsed = parsePipelineError(error);
-        errors.push(`${provider}: ${parsed.message}`);
-        // Pexels 配额/限流：后续分镜直接优先 Pixabay
-        if (
-          provider === "pexels"
-          && (/429|配额|限流|quota|rate limit/i.test(parsed.message) || parsed.code === "PEXELS_429")
-        ) {
-          stockPreferPixabayRef.current = true;
-        }
-      }
-    }
-    throw new Error(
-      errors.length
-        ? `全部素材源搜索失败。${errors.join(" | ")}`
-        : "请先在设置中配置 Pexels 或 Pixabay API Key",
-    );
+  // 双源素材搜索（Pexels/Pixabay 自动 fallback + 会话级配额记忆），合并自原重复的 searchStockVideos/searchStockPhotos
+  const stockSearchDeps = {
+    preferPixabayRef: stockPreferPixabayRef,
+    fallbackNotifiedRef: stockFallbackNotifiedRef,
+    libraryProvider,
+    setLibraryProvider,
+    pushToast,
+  };
+  async function searchStockVideos(options: SearchOptions) {
+    return searchStockMedia("video", options, stockSearchDeps);
   }
-
-  async function searchStockPhotos(options: {
-    query: string;
-    ratio: string;
-    perPage?: number;
-    page?: number;
-    prefer?: StockMediaProvider;
-  }) {
-    const prefer =
-      options.prefer
-      || (stockPreferPixabayRef.current ? "pixabay" : null)
-      || libraryProvider
-      || "pexels";
-    const order: StockMediaProvider[] =
-      prefer === "pixabay" ? ["pixabay", "pexels"] : ["pexels", "pixabay"];
-    const errors: string[] = [];
-    for (const provider of order) {
-      try {
-        const result =
-          provider === "pixabay"
-            ? await desktopApi.searchPixabayPhotos({
-                query: options.query,
-                ratio: options.ratio,
-                perPage: options.perPage,
-                page: options.page,
-              })
-            : await desktopApi.searchPexelsPhotos({
-                query: options.query,
-                ratio: options.ratio,
-                perPage: options.perPage,
-                page: options.page,
-              });
-        if (provider === "pixabay" && order[0] === "pexels" && errors.length > 0) {
-          stockPreferPixabayRef.current = true;
-          if (!stockFallbackNotifiedRef.current) {
-            stockFallbackNotifiedRef.current = true;
-            pushToast({
-              type: "info",
-              message: "Pexels 不可用，已自动切换到 Pixabay 继续搜素材",
-              duration: 5000,
-            });
-          }
-          if (libraryProvider !== "pixabay") setLibraryProvider("pixabay");
-        }
-        return { ...result, provider };
-      } catch (error) {
-        const parsed = parsePipelineError(error);
-        errors.push(`${provider}: ${parsed.message}`);
-        if (
-          provider === "pexels"
-          && (/429|配额|限流|quota|rate limit/i.test(parsed.message) || parsed.code === "PEXELS_429")
-        ) {
-          stockPreferPixabayRef.current = true;
-        }
-      }
-    }
-    throw new Error(
-      errors.length
-        ? `全部素材源搜索失败。${errors.join(" | ")}`
-        : "请先在设置中配置 Pexels 或 Pixabay API Key",
-    );
+  async function searchStockPhotos(options: SearchOptions) {
+    return searchStockMedia("photo", options, stockSearchDeps);
   }
 
   /** 为指定视频 clip 搜素材并绑定。
