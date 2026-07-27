@@ -144,7 +144,26 @@ export function GenerateWizard({
           )}
           {(pipeline.error || pipeline.report) ? (
             <div className="wizard-actions">
-              <button className="primary-button" onClick={onClose}>
+              {pipeline.error && (
+                <button
+                  className="primary-button"
+                  onClick={() => {
+                    // 用同样的输入重跑（项目会复用或重建）
+                    onStart({
+                      script,
+                      ratio,
+                      voiceId,
+                      translate,
+                      materialDirection: resolvedMaterialDirection,
+                      audioPath: mode === "audio" ? audioPath : null,
+                      compositionTemplateId,
+                    });
+                  }}
+                >
+                  重试
+                </button>
+              )}
+              <button className="ghost-button" onClick={onClose}>
                 {pipeline.report ? "进入编辑器" : "关闭"}
               </button>
             </div>

@@ -5931,3 +5931,67 @@ textarea {
   color: #34d399;
   flex-shrink: 0;
 }
+
+
+/* 特效预览：flicker(闪烁) / shake(抖动) CSS 动画近似 */
+@keyframes fx-flicker-anim {
+  0%, 100% { filter: hue-rotate(0deg); }
+  25% { filter: hue-rotate(12deg); }
+  50% { filter: hue-rotate(-8deg); }
+  75% { filter: hue-rotate(10deg); }
+}
+
+.fx-flicker {
+  animation: fx-flicker-anim 0.4s ease-in-out infinite;
+}
+
+@keyframes fx-shake-anim {
+  0%, 100% { transform: translate(0, 0); }
+  20% { transform: translate(2px, -1px); }
+  40% { transform: translate(-2px, 1px); }
+  60% { transform: translate(1px, 2px); }
+  80% { transform: translate(-1px, -2px); }
+}
+
+.fx-shake {
+  animation: fx-shake-anim 0.12s linear infinite;
+}
+
+
+.batch-edit-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 4px 0;
+}
+
+.batch-edit-controls .style-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: #9aa3ad;
+}
+
+.batch-edit-controls .style-field input[type="range"] {
+  width: 100%;
+}
+
+
+.ghost-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  background: transparent;
+  border: 1px solid #3a3f45;
+  border-radius: 6px;
+  color: #c5cdd6;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.ghost-button:hover {
+  border-color: #5a5f65;
+  color: #e6e8ea;
+}

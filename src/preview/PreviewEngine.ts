@@ -7,7 +7,7 @@ import type { EvaluatedFrame, RenderGraph } from "../renderGraph/types";
 import { visualLayerCssStyle } from "../renderGraph/visualLayout";
 import { MediaElementPool, type PooledMedia } from "./MediaElementPool";
 import type { EngineState, PreviewRenderer } from "./PreviewRenderer";
-import { previewCssFilter, previewCssTransformExtra, previewVignetteBoxShadow } from "./previewFilters";
+import { previewCssFilter, previewCssTransformExtra, previewVignetteBoxShadow, previewEffectAnimationClass } from "./previewFilters";
 
 /** 把 ClipCrop (0-100 百分比) 转为 CSS clip-path inset() 字符串。无裁剪返回空串。 */
 function cropToClipPath(crop: Clip["crop"] | null | undefined): string {
@@ -423,6 +423,7 @@ export class PreviewEngine implements PreviewRenderer {
    item.el.style.opacity = layout.opacity;
    item.el.style.filter = previewCssFilter(clip);
    item.el.style.boxShadow = previewVignetteBoxShadow(clip);
+   item.el.className = `stage-pooled-media ${previewEffectAnimationClass(clip)}`;
    // 主轨也应用蒙版（此前仅 overlay 路径有，导致 base 设蒙版预览无效）
    this.applyOverlayMask(item.el, clip.mask);
 
@@ -610,6 +611,7 @@ export class PreviewEngine implements PreviewRenderer {
         v.style.height = layout.height;
         v.style.transform = layout.transform + cropComp + fxTransform;
         v.style.boxShadow = vignetteShadow;
+        v.className = `stage-overlay-video ${previewEffectAnimationClass(clip)}`;
         v.style.opacity = layout.opacity;
         v.style.filter = cssFilter;
         v.style.clipPath = cropPath || "";

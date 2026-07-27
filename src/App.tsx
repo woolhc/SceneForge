@@ -3756,7 +3756,59 @@ export function App() {
               {selectedClipIds.length > 1 && selectedClipTrack.kind !== "subtitle" && (
                 <div className="batch-edit-section">
                   <div className="batch-edit-title">已选择 {selectedClipIds.length} 个片段</div>
-                  <p className="style-hint">当前类型暂不支持共同属性编辑。请保留单个选中项后调整详细参数。</p>
+                  <div className="batch-edit-controls">
+                    {(selectedClipTrack.kind === "video" || selectedClipTrack.kind === "image") && (
+                      <>
+                        <label className="style-field">
+                          音量
+                          <input
+                            type="range" min={0} max={2} step={0.05}
+                            value={Math.min(...selectedClipIds.map((id) => project?.clips.find((c) => c.id === id)?.volume ?? 1))}
+                            onChange={(e) => {
+                              const vol = Number(e.target.value);
+                              void persist(
+                                { ...project!, clips: project!.clips.map((c) => selectedClipIds.includes(c.id) ? { ...c, volume: vol } : c) },
+                                `批量调整音量为 ${vol}`,
+                              );
+                            }}
+                          />
+                        </label>
+                        <label className="style-field">
+                          不透明度
+                          <input
+                            type="range" min={0} max={100} step={1}
+                            value={Math.min(...selectedClipIds.map((id) => {
+                              const c = project?.clips.find((clip) => clip.id === id);
+                              return c?.transform?.opacity ?? 100;
+                            }))}
+                            onChange={(e) => {
+                              const opacity = Number(e.target.value);
+                              void persist(
+                                { ...project!, clips: project!.clips.map((c) => selectedClipIds.includes(c.id) ? { ...c, transform: { ...c.transform!, opacity } } : c) },
+                                `批量调整不透明度为 ${opacity}%`,
+                              );
+                            }}
+                          />
+                        </label>
+                      </>
+                    )}
+                    {(selectedClipTrack.kind === "audio" || selectedClipTrack.kind === "voiceover") && (
+                      <label className="style-field">
+                        音量
+                        <input
+                          type="range" min={0} max={2} step={0.05}
+                          value={Math.min(...selectedClipIds.map((id) => project?.clips.find((c) => c.id === id)?.volume ?? 1))}
+                          onChange={(e) => {
+                            const vol = Number(e.target.value);
+                            void persist(
+                              { ...project!, clips: project!.clips.map((c) => selectedClipIds.includes(c.id) ? { ...c, volume: vol } : c) },
+                              `批量调整音量为 ${vol}`,
+                            );
+                          }}
+                        />
+                      </label>
+                    )}
+                  </div>
                 </div>
               )}
               {selectedClipIds.length === 1 && (

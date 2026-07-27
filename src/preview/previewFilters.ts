@@ -87,6 +87,23 @@ export function previewCssTransformExtra(clip: Clip | null): string {
 }
 
 /**
+ * 需要额外 CSS animation 类名的特效（flicker=闪烁 hue 周期变化，shake=画面抖动）。
+ * 返回要添加到元素 className 的字符串；无则空串。
+ * 导出端 flicker 用 hue=h='intensity*30*sin(t)'，预览用 CSS hue-rotate keyframes 近似；
+ * shake 用 crop 周期偏移，预览用 translate keyframes 近似。
+ */
+export function previewEffectAnimationClass(clip: Clip | null): string {
+  if (!clip) return "";
+  const effects = clip.visualEffects ?? [];
+  const hasFlicker = effects.some((e) => e.kind === "flicker");
+  const hasShake = effects.some((e) => e.kind === "shake");
+  const classes: string[] = [];
+  if (hasFlicker) classes.push("fx-flicker");
+  if (hasShake) classes.push("fx-shake");
+  return classes.join(" ");
+}
+
+/**
  * 暗角特效（导出为 vignette 滤镜）的 CSS 近似：inset box-shadow 内阴影。
  * 直接作用在媒体元素上，无需额外 DOM。返回 box-shadow 值；无 vignette 返回空串。
  */
