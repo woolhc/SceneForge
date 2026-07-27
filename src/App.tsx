@@ -186,6 +186,7 @@ import { hasWhisperModel, shouldGateWhisperAction } from "./editor/readiness";
 import { useWhisperSetup } from "./editor/useWhisperSetup";
 import { searchStockMedia, type SearchOptions } from "./editor/stockSearch";
 import { loadGenerationSession } from "./editor/generationSession";
+import { buildOptimizedSubtitles } from "./editor/subtitleBuilder";
 import { useVoiceProfiles } from "./editor/useVoiceProfiles";
 // PanelTitle 已不再直接使用（各 Tab 自带标题）；TimelineTrack/Track 类型保留供时间线渲染
 
@@ -1107,131 +1108,6 @@ export function App() {
     }
   }
 
-  async function buildOptimizedSubtitles(
-    currentProject: Project,
-    sentences: TimedSentencesResult["sentences"],
-    translate: boolean,
-    mode: SubtitleGenerationMode = "natural",
-  ): Promise<{ project: Project; issueCount: number }> {
-    const transcriptWords = sentences.flatMap((sentence) => sentence.words ?? []);
-    const rawTranscriptText = sentences.map((sentence) => sentence.text).join("");
-    let analyzedContext: SubtitleLanguageContext = {
-      summary: currentProject.script || rawTranscriptText.slice(0, 500),
-      contentType: "other",
-      tone: "natural",
-      terms: [],
-    };
-    if (settings.deepseekApiKey) {
-      try {
-        analyzedContext = await desktopApi.analyzeSubtitleLanguageContext({
-          projectTitle: currentProject.title,
-          script: currentProject.script,
-          transcript: rawTranscriptText,
-          mode,
-        });
-      } catch {
-        setStatus("全局语言分析不可用，继续使用项目原文上下文");
-      }
-    }
-    const languageContext = JSON.stringify(analyzedContext);
-    const layoutProfile = subtitleLayoutProfile(currentProject, translate);
-    const canUseSemanticAi = Boolean(settings.deepseekApiKey)
-      && transcriptWords.length >= 8
-      && sentences.every((sentence) => Boolean(sentence.words?.length));
-    const semanticAdvice = canUseSemanticAi
-      ? await requestSubtitleSemanticAdvice(
-          transcriptWords,
-          (words) => desktopApi.adviseSubtitleBreaks({
-            words: words.map((word) => word.text),
-            wordTimings: words.map((word, index) => ({
-              text: word.text,
-              start: word.start,
-              end: word.end,
-              gapAfter: Math.max(0, (words[index + 1]?.start ?? word.end) - word.end),
-            })),
-            constraints: {
-              ratio: layoutProfile.ratio,
-              maxLines: layoutProfile.maxLines,
-              preferredCharsPerLine: layoutProfile.preferredCharsPerLine,
-              maxCharsPerCue: layoutProfile.maxCharsPerCue,
-              minDuration: layoutProfile.minDuration,
-              preferredDuration: layoutProfile.preferredDuration,
-              maxDuration: layoutProfile.maxDuration,
-              preferredCps: layoutProfile.preferredCps,
-              maxCps: layoutProfile.maxCps,
-            },
-            context: languageContext,
-            mode,
-          }),
-        )
-      : null;
-    if (semanticAdvice?.successfulChunkCount) {
-      const fallbackText = semanticAdvice.failedChunkCount > 0
-        ? `，${semanticAdvice.failedChunkCount} 批已规则回退`
-        : "";
-      setStatus(`AI 语义断句完成：${semanticAdvice.successfulChunkCount}/${semanticAdvice.requestedChunkCount} 批${fallbackText}`);
-    } else if (canUseSemanticAi) {
-      setStatus("AI 语义断句不可用，已自动回退规则引擎");
-    }
-    const segmentedTranscript = prepareTranscriptSubtitles(
-      currentProject,
-      sentences,
-      translate,
-      semanticAdvice ?? undefined,
-    );
-    const transcript = translate
-      ? await desktopApi.refineTranscript({
-          sentences: segmentedTranscript,
-          translate: true,
-          mode,
-          context: languageContext,
-        })
-      : segmentedTranscript;
-    const subtitleBuild = buildTranscriptSubtitleProject(currentProject, transcript, translate);
-    const saved = await desktopApi.saveProject(subtitleBuild.project);
-    if (subtitleBuild.issueCount > 0) {
-      pushToast({
-        type: "warning",
-        message: `字幕排版完成，${subtitleBuild.issueCount} 个质量提示可在字幕中检查`,
-        duration: 8000,
-      });
-    }
-    try {
-      await saveSubtitleArtifact({
-        version: 1,
-        projectId: currentProject.id,
-      generatedAt: new Date().toISOString(),
-      mode,
-      bilingual: translate,
-      languageContext: analyzedContext,
-      rawTranscript: sentences,
-      sourceCues: segmentedTranscript,
-      translatedCues: transcript,
-      ai: {
-        requestedChunks: semanticAdvice?.requestedChunkCount ?? 0,
-        successfulChunks: semanticAdvice?.successfulChunkCount ?? 0,
-        failedChunks: semanticAdvice?.failedChunkCount ?? 0,
-        failureCategories: semanticAdvice?.failureCategories ?? [],
-        confidence: semanticAdvice?.confidence ?? 0,
-        preferredBreakCount: semanticAdvice?.preferredBreakAfterIndices.size ?? 0,
-        strongBreakCount: semanticAdvice?.strongBreakAfterIndices.size ?? 0,
-        protectedRangeCount: semanticAdvice?.protectedRanges.length ?? 0,
-      },
-      output: {
-        groupCount: subtitleBuild.groupCount,
-        sourceClipCount: subtitleBuild.sourceClipCount,
-        targetClipCount: subtitleBuild.targetClipCount,
-        qualityIssues: subtitleBuild.issues,
-      },
-      });
-    } catch {
-      pushToast({ type: "warning", message: "字幕已生成，但中间产物保存失败" });
-    }
-    if (translate && subtitleBuild.targetClipCount < subtitleBuild.sourceClipCount) {
-      pushToast({ type: "warning", message: `翻译字幕不完整：${subtitleBuild.targetClipCount}/${subtitleBuild.sourceClipCount}` });
-    }
-    return { project: saved, issueCount: subtitleBuild.issueCount };
-  }
 
   /** 识别字幕：项目旁白单次 Whisper → AI 语义断句 → Layout Engine → 可选翻译。 */
   async function handleRecognizeSubtitles(options: { translate: boolean; mode: SubtitleGenerationMode }, control?: { skipWhisperGate?: boolean }) {
@@ -1249,7 +1125,7 @@ export function App() {
       await desktopApi.saveProject(currentProject);
       const transcript = await desktopApi.transcribeProjectNarration(currentProject.id);
       setStatus(`旁白识别完成：${transcript.sentences.length} 个原始块，正在智能断句...`);
-      const result = await buildOptimizedSubtitles(currentProject, transcript.sentences, translate, mode);
+      const result = await buildOptimizedSubtitles(currentProject, transcript.sentences, translate, mode, settings, setStatus, pushToast);
       const next = result.project;
       projectRef.current = next;
       persistWithSnapshot(next, snapshot, `智能识别字幕（${translate ? "双语" : "单语"}）`);
@@ -1883,6 +1759,9 @@ export function App() {
           session.transcript.sentences,
           input.translate,
           "natural",
+          settings,
+          setStatus,
+          pushToast,
         );
         // 字幕建完后套版式：一次写对主画面盒模型 / 标题层 / 字幕 y
         const template = getCompositionTemplate(input.compositionTemplateId);
