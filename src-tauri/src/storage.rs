@@ -258,6 +258,14 @@ fn preserve_existing_media_cache_metadata(
     conn: &Connection,
     project: &mut Project,
 ) -> anyhow::Result<()> {
+    // 快速短路：如果所有 media 都已有 local_path（非空），无需查旧项目（高频保存的常见情况）
+    let all_have_local = !project.media.is_empty() && project.media.iter().all(|s| {
+        s.local_path.as_deref().map(|p| !p.is_empty()).unwrap_or(false)
+    });
+    if all_have_local {
+        return Ok(());
+    }
+
     let existing = match get_project(conn, &project.id) {
         Ok(existing) => existing,
         Err(error)

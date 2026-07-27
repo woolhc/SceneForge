@@ -1233,11 +1233,7 @@ pub async fn render_project_video(
         // 注意：concat copy 要求所有段的编码参数（timebase/SAR/profile/pix_fmt）严格一致，
         // 不同源视频/图片/黑屏段混排时往往不一致，会导致输出"时长对但后半黑屏"。
         // 因此 fallback 路径用 concat filter 重新编码保证统一。
-        let list_path = cache_dir.join(format!(
-            "concat-{}-{}.txt",
-            project.id,
-            chrono::Utc::now().timestamp_millis()
-        ));
+        let list_path = cache_dir.join(format!("concat-{}.txt", project.id));
         let list_content = segment_paths
             .iter()
             .map(|path| ffconcat_file_entry(path))
@@ -2287,9 +2283,8 @@ async fn render_source_window_parts_for_segment(
     }
 
     let list_path = segment_dir.join(format!(
-        "curve-concat-{}-{}.txt",
-        seg_index,
-        chrono::Utc::now().timestamp_millis()
+        "curve-concat-{}.txt",
+        seg_index
     ));
     let list_content = part_paths
         .iter()
