@@ -43,8 +43,6 @@ import type {
   TrackKind,
   TimedSentencesResult,
   VoiceProfile,
-  WhisperModelDownloadProgress,
-  WhisperModelStatus,
   StockMediaProvider,
 } from "./types";
 import { DEFAULT_SUBTITLE_STYLE, DEFAULT_TEXT_LAYER_STYLE, DEFAULT_TRANSFORM, DEFAULT_CROP, videoWidthForProject } from "./types";
@@ -184,18 +182,12 @@ import { VisualTransformInspector } from "./editor/inspector/VisualTransformInsp
 import { SubtitleInspector } from "./editor/inspector/SubtitleInspector";
 import { UnifiedSettingsDialog } from "./components/UnifiedSettingsDialog";
 import { WhisperSetupDialog } from "./components/WhisperSetupDialog";
-import {
-  createPendingWhisperAction,
-  hasWhisperModel,
-  shouldGateWhisperAction,
-  type PendingWhisperAction,
-} from "./editor/readiness";
+import { hasWhisperModel, shouldGateWhisperAction } from "./editor/readiness";
+import { useWhisperSetup } from "./editor/useWhisperSetup";
 // PanelTitle 已不再直接使用（各 Tab 自带标题）；TimelineTrack/Track 类型保留供时间线渲染
 
 const ratios = ["9:16", "16:9", "1:1"];
 const isDevelopmentPreview = (import.meta as ImportMeta & { env?: { DEV?: boolean } }).env?.DEV === true;
-
-const recommendedWhisperModelId = "medium-q5";
 
 
 // 安装包内置 whisper-cli；模型体积较大，存放在跨平台应用数据目录。
@@ -384,18 +376,29 @@ export function App() {
   const [settingsDraft, setSettingsDraft] = useState<AppSettings>(settings);
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [ffmpeg, setFfmpeg] = useState<FfmpegStatus | null>(null);
-  const [whisperModelStatus, setWhisperModelStatus] = useState<WhisperModelStatus | null>(null);
-  const [whisperDownloadProgress, setWhisperDownloadProgress] = useState<WhisperModelDownloadProgress | null>(null);
-  const [whisperSetupOpen, setWhisperSetupOpen] = useState(false);
-  const [whisperSetupError, setWhisperSetupError] = useState<string | null>(null);
-  const pendingWhisperActionRef = useRef<PendingWhisperAction<GeneratePipelineInput | { translate: boolean; mode: SubtitleGenerationMode }> | null>(null);
-  const pendingWhisperActionId = useRef(0);
   const showSettings = useUiStore((s) => s.showSettings);
   const setShowSettings = useUiStore((s) => s.setShowSettings);
   const [busy, setBusy] = useState<string | null>(null);
   // 时间线缩放：pxPerSecond 驱动（4=超小看全局，1200=帧级细节）
   const [pxPerSecond, setPxPerSecond] = useState(64);
   const [status, setStatus] = useState("准备就绪");
+  const {
+    whisperModelStatus,
+    whisperDownloadProgress,
+    whisperSetupOpen,
+    whisperSetupError,
+    setCallbacks: setWhisperPipelineCallbacks,
+    refreshWhisperModelStatus,
+    openWhisperSetup,
+    requestWhisperSetup,
+    resumePendingWhisperAction,
+    cancelPendingWhisperAction,
+    handleDownloadWhisperModel,
+    handleCancelWhisperDownload,
+    handleSelectWhisperModel,
+    handleDeleteWhisperModel,
+    handleOpenModelsDirectory,
+  } = useWhisperSetup({ setStatus, setBusy, setSettings, setSettingsDraft });
   const [voiceProfiles, setVoiceProfiles] = useState<VoiceProfile[]>([]);
   const [selectedVoiceId, setSelectedVoiceId] = useState<string>("");
   const [newVoiceName, setNewVoiceName] = useState("Fish 音色");
@@ -729,22 +732,6 @@ export function App() {
     void bootstrap();
   }, []);
 
-  useEffect(() => {
-    void refreshWhisperModelStatus();
-    let disposed = false;
-    let unlisten: (() => void) | null = null;
-    void desktopApi.listenWhisperModelProgress((progress) => {
-      if (!disposed) setWhisperDownloadProgress(progress);
-    }).then((nextUnlisten) => {
-      if (disposed) nextUnlisten();
-      else unlisten = nextUnlisten;
-    }).catch(() => undefined);
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, []);
-
   // project 变化时同步给预览引擎（重新构建调度 + 预加载配音）
   useEffect(() => {
     void syncProject(project);
@@ -1021,144 +1008,6 @@ export function App() {
     setShowSettings(true);
   }
 
-  async function refreshWhisperModelStatus() {
-    try {
-      setWhisperModelStatus(await desktopApi.getWhisperModelStatus());
-    } catch (error) {
-      const parsed = parsePipelineError(error);
-      setWhisperModelStatus(null);
-      setStatus(parsed.message);
-    }
-  }
-
-  function openWhisperSetup() {
-    pendingWhisperActionRef.current = null;
-    setWhisperSetupError(null);
-    setWhisperDownloadProgress(null);
-    setWhisperSetupOpen(true);
-  }
-
-  function requestWhisperSetup(kind: PendingWhisperAction["kind"], payload: GeneratePipelineInput | { translate: boolean; mode: SubtitleGenerationMode }) {
-    const nextId = pendingWhisperActionId.current + 1;
-    pendingWhisperActionId.current = nextId;
-    const pending = createPendingWhisperAction(nextId, kind, payload);
-    pendingWhisperActionRef.current = pending;
-    setWhisperSetupError(null);
-    setWhisperDownloadProgress(null);
-    setWhisperSetupOpen(true);
-    setStatus("请先完成 Whisper 模型设置");
-  }
-
-  async function handleDownloadWhisperModel() {
-    setBusy("whisper-download");
-    setWhisperSetupError(null);
-    setWhisperDownloadProgress(null);
-    let installedStatus: WhisperModelStatus | null = null;
-    try {
-      installedStatus = await desktopApi.downloadWhisperModel(recommendedWhisperModelId);
-      setWhisperModelStatus(installedStatus);
-      setSettings((current) => ({
-        ...current,
-        whisperModel: installedStatus?.configuredPath || installedStatus?.resolvedPath || current.whisperModel,
-      }));
-      setSettingsDraft((current) => ({
-        ...current,
-        whisperModel: installedStatus?.configuredPath || installedStatus?.resolvedPath || current.whisperModel,
-      }));
-      setStatus("Whisper 模型已就绪");
-    } catch (error) {
-      const parsed = parsePipelineError(error);
-      setWhisperSetupError(parsed.message);
-      setStatus(`Whisper 模型下载失败：${parsed.message}`);
-    } finally {
-      setBusy(null);
-    }
-    if (installedStatus) {
-      await resumePendingWhisperAction(installedStatus);
-    }
-  }
-
-  async function handleCancelWhisperDownload() {
-    try {
-      await desktopApi.cancelWhisperModelDownload();
-      setWhisperDownloadProgress(null);
-      setStatus("已取消 Whisper 模型下载");
-    } catch (error) {
-      setWhisperSetupError(parsePipelineError(error).message);
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function handleSelectWhisperModel() {
-    setBusy("whisper-select");
-    setWhisperSetupError(null);
-    let selectedStatus: WhisperModelStatus | null = null;
-    try {
-      const path = await desktopApi.pickWhisperModelFile();
-      if (!path) return;
-      selectedStatus = await desktopApi.selectWhisperModel(path);
-      setWhisperModelStatus(selectedStatus);
-      setSettings((current) => ({ ...current, whisperModel: path }));
-      setSettingsDraft((current) => ({ ...current, whisperModel: path }));
-      setStatus("已选择本地 Whisper 模型");
-    } catch (error) {
-      const parsed = parsePipelineError(error);
-      setWhisperSetupError(parsed.message);
-      setStatus(`选择 Whisper 模型失败：${parsed.message}`);
-    } finally {
-      setBusy(null);
-    }
-    if (selectedStatus) {
-      await resumePendingWhisperAction(selectedStatus);
-    }
-  }
-
-  async function handleDeleteWhisperModel() {
-    setBusy("whisper-delete");
-    try {
-      const nextStatus = await desktopApi.deleteWhisperModel();
-      setWhisperModelStatus(nextStatus);
-      setSettings((current) => ({ ...current, whisperModel: nextStatus.configuredPath || "" }));
-      setSettingsDraft((current) => ({ ...current, whisperModel: nextStatus.configuredPath || "" }));
-      setStatus("Whisper 模型已删除");
-    } catch (error) {
-      setStatus(parsePipelineError(error).message);
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function handleOpenModelsDirectory() {
-    try {
-      await desktopApi.openModelsDirectory();
-    } catch (error) {
-      setStatus(parsePipelineError(error).message);
-    }
-  }
-
-  async function resumePendingWhisperAction(statusOverride?: WhisperModelStatus | null) {
-    if (!hasWhisperModel(statusOverride ?? whisperModelStatus)) return;
-    const pending = pendingWhisperActionRef.current;
-    pendingWhisperActionRef.current = null;
-    setWhisperSetupOpen(false);
-    setWhisperSetupError(null);
-    setWhisperDownloadProgress(null);
-    if (!pending) return;
-    if (pending.kind === "generate-pipeline") {
-      await handleGeneratePipeline(pending.payload as GeneratePipelineInput, { skipWhisperGate: true });
-      return;
-    }
-    await handleRecognizeSubtitles(pending.payload as { translate: boolean; mode: SubtitleGenerationMode }, { skipWhisperGate: true });
-  }
-
-  function cancelPendingWhisperAction() {
-    pendingWhisperActionRef.current = null;
-    setWhisperSetupOpen(false);
-    setWhisperSetupError(null);
-    setStatus("已取消 Whisper 设置");
-  }
-
   async function handleSaveSettings() {
     setBusy("settings");
     try {
@@ -1401,6 +1250,14 @@ export function App() {
       setBusy(null);
     }
   }
+
+  // 把一键生成/字幕识别回调注入 Whisper hook（模型就绪后回放 pending action 用）
+  useEffect(() => {
+    setWhisperPipelineCallbacks({
+      runGeneratePipeline: (input, control) => handleGeneratePipeline(input, control),
+      runRecognizeSubtitles: (payload, control) => handleRecognizeSubtitles(payload, control),
+    });
+  });
 
   /** 手动添加一条空字幕到字幕轨末尾；没有字幕轨时自动创建 */
   function handleAddManualSubtitle() {
