@@ -5,6 +5,7 @@ mod ffmpeg;
 mod ffmpeg_expression;
 mod lut_data;
 mod models;
+mod keychain;
 mod pexels;
 mod pixabay;
 mod render_graph;

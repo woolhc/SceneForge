@@ -203,14 +203,53 @@ pub fn save_settings(
     state: State<'_, AppState>,
     settings: AppSettings,
 ) -> Result<AppSettings, String> {
+    // API key 写入系统 Keychain，SQLite 只存空字符串（防止明文泄露）
+    let mut to_store = settings.clone();
+    for (key_name, value) in [
+        ("deepseek_api_key", &settings.deepseek_api_key),
+        ("pexels_api_key", &settings.pexels_api_key),
+        ("pixabay_api_key", &settings.pixabay_api_key),
+        ("fish_audio_api_key", &settings.fish_audio_api_key),
+    ] {
+        if let Err(e) = crate::keychain::save_key(key_name, value) {
+            eprintln!("[keychain] 保存 {key_name} 失败（回退到 SQLite 明文）：{e}");
+            // Keychain 失败时保留明文到 SQLite（降级，不阻断用户）
+        } else {
+            match key_name {
+                "deepseek_api_key" => to_store.deepseek_api_key = String::new(),
+                "pexels_api_key" => to_store.pexels_api_key = String::new(),
+                "pixabay_api_key" => to_store.pixabay_api_key = String::new(),
+                "fish_audio_api_key" => to_store.fish_audio_api_key = String::new(),
+                _ => {}
+            }
+        }
+    }
     let conn = state.db.lock().map_err(map_error)?;
-    storage::save_settings(&conn, &settings).map_err(map_error)
+    storage::save_settings(&conn, &to_store).map_err(map_error)?;
+    // 返回原始 settings（含 key），前端正常显示
+    Ok(settings)
 }
 
 #[tauri::command]
 pub fn load_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
     let conn = state.db.lock().map_err(map_error)?;
-    storage::load_settings(&conn).map_err(map_error)
+    let mut settings = storage::load_settings(&conn).map_err(map_error)?;
+    // API key 安全存储：优先从系统 Keychain 读取，旧数据（SQLite 明文）自动迁移后清空
+    for (key_name, field) in [
+        ("deepseek_api_key", &mut settings.deepseek_api_key),
+        ("pexels_api_key", &mut settings.pexels_api_key),
+        ("pixabay_api_key", &mut settings.pixabay_api_key),
+        ("fish_audio_api_key", &mut settings.fish_audio_api_key),
+    ] {
+        let kc_value = crate::keychain::load_key(key_name);
+        if !kc_value.is_empty() {
+            *field = kc_value;
+        } else if crate::keychain::migrate_if_needed(key_name, field) {
+            // 旧值已迁移到 Keychain，SQLite 里的值在下次 save 时会被清空
+            *field = String::new();
+        }
+    }
+    Ok(settings)
 }
 
 #[tauri::command]

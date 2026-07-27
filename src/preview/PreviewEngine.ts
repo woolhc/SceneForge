@@ -98,10 +98,9 @@ export class PreviewEngine implements PreviewRenderer {
    * 容器由 App.tsx 通过 overlayContainer 提供；引擎在内部增删 video 子节点。
    */
   private overlayContainer: HTMLElement | null = null;
-  private overlayVideoPool = new Map<string, HTMLVideoElement | HTMLImageElement>();
-  private overlayInactiveSince = new Map<string, number>();
+  /** 双池合一：overlay 复用 MediaElementPool（以 clip.id 为 key，上限 3），统一 LRU/seek/释放 */
+  private overlayPool: MediaElementPool | null = null;
   private overlayStyleSignatures = new Map<string, string>();
-  private overlaySyncedClips = new Set<string>();
 
  constructor(stageContainer: HTMLElement, onTick: (state: EngineState) => void) {
    this.mediaPool = new MediaElementPool(stageContainer, () => this.ensureAudioContext(), 6);
@@ -244,28 +243,11 @@ export class PreviewEngine implements PreviewRenderer {
 
   /** T4.1: 清空画中画 video 池 */
   private clearOverlayPool() {
-    this.overlayVideoPool.forEach((_, clipId) => this.releaseOverlayVideo(clipId));
-    this.overlayVideoPool.clear();
-    this.overlayInactiveSince.clear();
+    this.overlayPool?.dispose();
+    this.overlayPool = this.overlayContainer
+      ? new MediaElementPool(this.overlayContainer, () => this.ensureAudioContext(), 3)
+      : null;
     this.overlayStyleSignatures.clear();
-    this.overlaySyncedClips.clear();
-  }
-
-  private releaseOverlayVideo(clipId: string) {
-    const v = this.overlayVideoPool.get(clipId);
-    if (!v) return;
-    if (v instanceof HTMLVideoElement) {
-      try { v.pause(); } catch { /* ignore */ }
-    }
-    v.removeAttribute("src");
-    if (v instanceof HTMLVideoElement) {
-      try { v.load(); } catch { /* ignore */ }
-    }
-    v.remove();
-    this.overlayVideoPool.delete(clipId);
-    this.overlayInactiveSince.delete(clipId);
-    this.overlayStyleSignatures.delete(clipId);
-    this.overlaySyncedClips.delete(clipId);
   }
 
   private loop = () => {
@@ -537,21 +519,7 @@ export class PreviewEngine implements PreviewRenderer {
     const activeIds = new Set(overlays.map((layer) => layer.id));
     const now = performance.now();
 
-    // 1. 移除不再活跃的 overlay video
-    for (const [clipId, v] of this.overlayVideoPool) {
-      if (!activeIds.has(clipId)) {
-        if (v instanceof HTMLVideoElement) {
-          try { v.pause(); } catch { /* ignore */ }
-        }
-        v.style.display = "none";
-        this.overlaySyncedClips.delete(clipId);
-        if (!this.overlayInactiveSince.has(clipId)) {
-          this.overlayInactiveSince.set(clipId, now);
-        }
-      }
-    }
-
-    // 2. 为活跃 clip 分配 video（上限 3）
+    // 1-2. 为活跃 clip 分配元素（MediaElementPool 管理 LRU/释放/src 去重）
     const MAX_OVERLAYS = 3;
     let allocated = 0;
     for (const evaluated of overlays) {
@@ -560,34 +528,17 @@ export class PreviewEngine implements PreviewRenderer {
       const clip = evaluated.clip;
       const media = evaluated.media;
       const src = media ? this.resolveSrc(media) : null;
-      if (!src) continue;
+      if (!src || !media) continue;
+      if (!this.overlayPool) continue;
 
-      let v = this.overlayVideoPool.get(clip.id);
-      if (!v) {
-        if (!this.overlayContainer) continue;
-        v = media?.kind === "image" ? document.createElement("img") : document.createElement("video");
-        v.className = "stage-overlay-video";
-        v.crossOrigin = "anonymous";
-        if (v instanceof HTMLVideoElement) {
-          // 初始静音防加载抢跑；每帧按 audioLayers 的 gain 同步（与导出混音语义一致：
-          // 导出会把未静音视频轨的原声混入，预览必须能听到，否则所听非所得）
-          v.muted = true;
-          v.playsInline = true;
-        }
-        v.style.position = "absolute";
-        v.style.pointerEvents = "none";
-        v.style.transformOrigin = "center center";
-        this.overlayContainer.appendChild(v);
-        this.overlayVideoPool.set(clip.id, v);
-      }
-      this.overlayInactiveSince.delete(clip.id);
+      // 用 clip.id 作为 pool key（同一 media 可出现在多个 overlay clip 中）
+      const kind = media.kind === "image" ? "image" : "video";
+      void this.overlayPool.acquire(clip.id, src, kind);
+      // acquire 是 async 但我们这里同步取已缓存的元素（首次会 miss 跳过，下一帧命中）
+      const v = this.overlayPool.get(clip.id)?.el;
+      if (!v) continue;
+
       v.style.display = "block";
-
-      // 设置 src（仅当变化时）
-      if (!v.getAttribute("src") || !v.getAttribute("src")?.includes(src)) {
-        v.src = src;
-        if (v instanceof HTMLVideoElement) v.load();
-      }
 
       // 应用 transform（位置/缩放/不透明度/混合模式）
       // T4.2: 有 keyframes 时按当前时间采样覆盖
@@ -720,26 +671,8 @@ export class PreviewEngine implements PreviewRenderer {
     }
   }
 
-  private sweepOverlayPool(now: number) {
-    const GRACE_MS = 10_000;
-    const MAX_POOL = 8;
-    for (const [clipId, inactiveAt] of [...this.overlayInactiveSince]) {
-      if (now - inactiveAt >= GRACE_MS) {
-        this.releaseOverlayVideo(clipId);
-      }
-    }
-    while (this.overlayVideoPool.size > MAX_POOL && this.overlayInactiveSince.size > 0) {
-      let oldestClipId: string | null = null;
-      let oldestAt = Number.POSITIVE_INFINITY;
-      for (const [clipId, inactiveAt] of this.overlayInactiveSince) {
-        if (inactiveAt < oldestAt) {
-          oldestAt = inactiveAt;
-          oldestClipId = clipId;
-        }
-      }
-      if (!oldestClipId) break;
-      this.releaseOverlayVideo(oldestClipId);
-    }
+  private sweepOverlayPool(_now: number) {
+    // MediaElementPool 自带 LRU + limit=3 淘汰，无需手动宽限期回收
   }
 
   private async ensureAudioContext(): Promise<AudioContext> {
