@@ -187,6 +187,7 @@ import { useWhisperSetup } from "./editor/useWhisperSetup";
 import { searchStockMedia, type SearchOptions } from "./editor/stockSearch";
 import { loadGenerationSession } from "./editor/generationSession";
 import { buildOptimizedSubtitles } from "./editor/subtitleBuilder";
+import { arrangeSegmentsToClips, buildAudioDrivenTimeline } from "./editor/timelineBuild";
 import { useVoiceProfiles } from "./editor/useVoiceProfiles";
 // PanelTitle 已不再直接使用（各 Tab 自带标题）；TimelineTrack/Track 类型保留供时间线渲染
 
@@ -265,87 +266,6 @@ function ensureTrackForAsset(project: Project, asset: MediaSource): { project: P
   return { project: { ...project, tracks: [...project.tracks, track] }, track };
 }
 
-/**
- * 把 AI 文案片段编排成轨道初始结构。
- * 每个 AiSegment → 视频clip（占位）+ 字幕clip + 配音clip，三者 startOnTrack 对齐。
- * 轨道 ID 按实际项目的 tracks 按 kind 动态查找（支持多轨道，取第一个匹配的）。
- *
- * 时间来源：
- * - 音频模式：seg.start/end 由 whisper 提供（真实音频时间），直接用
- * - 文案模式：seg.start/end 为 0，用 estimatedDuration 累加（cursor）
- */
-function arrangeSegmentsToClips(
-  segments: { text: string; visualQuery: string; estimatedDuration: number; start?: number; end?: number }[],
-  tracks: { id: string; kind: string; order: number }[],
-): Clip[] {
-  const videoTrackId = pickPrimaryTrack(tracks, "video");
-  const voiceoverTrackId = pickPrimaryTrack(tracks, "voiceover");
-  const clips: Clip[] = [];
-  let cursor = 0;
-  const isAudioMode = segments.some((s) => (s.start ?? 0) !== 0 || (s.end ?? 0) !== 0);
-  for (const [index, seg] of segments.entries()) {
-    // 音频模式：用 whisper 真实时间；文案模式：累加 estimatedDuration
-    const hasRealTime = (seg.start ?? 0) !== 0 || (seg.end ?? 0) !== 0;
-    const start = hasRealTime ? (seg.start ?? cursor) : cursor;
-    const duration = hasRealTime ? ((seg.end ?? 0) - (seg.start ?? 0)) : seg.estimatedDuration;
-    // 视频轨（占位，sourceId 暂空，等用户绑定素材）
-    // 音频模式下首尾相接：startOnTrack = 本句真实开始时间，结束延伸到下一句真实开始
-    // （画面切换点必须踩在语音真正开始的瞬间；停顿由本句的画面撑满，而不是下一句提前抢跑）
-    if (videoTrackId) {
-      const vStart = isAudioMode ? start : cursor;
-      const nextStart = isAudioMode ? segments[index + 1]?.start : undefined;
-      const vDuration = isAudioMode
-        ? Math.max(0.05, (nextStart ?? (seg.end ?? (start + duration))) - start)
-        : duration;
-      clips.push({
-        id: newClipId(),
-        trackId: videoTrackId,
-        sourceId: null,
-        startOnTrack: vStart,
-        duration: vDuration,
-        sourceIn: 0,
-        sourceOut: vDuration,
-        speed: 1,
-        // 分镜编排通常同步生成配音轨：视频原声默认静音，避免导出接缝电音
-        volume: voiceoverTrackId ? 0 : 1,
-        fadeIn: 0,
-        fadeOut: 0,
-      brightness: 0,
-      contrast: 0,
-      saturation: 0,
-        visualQuery: seg.visualQuery,
-        transitionIn: null,
-        transitionOut: null,
-      });
-    }
-    // 字幕不再自动生成 —— 改由「识别字幕」按钮通过 ASR 语音识别 + AI 整理生成
-    // 配音轨（sourceId 暂空，等生成配音后填充）
-    if (voiceoverTrackId) {
-      clips.push({
-        id: newClipId(),
-        trackId: voiceoverTrackId,
-        sourceId: null,
-        startOnTrack: start,
-        duration,
-        sourceIn: 0,
-        sourceOut: duration,
-        speed: 1,
-        volume: 1,
-        fadeIn: 0,
-        fadeOut: 0,
-      brightness: 0,
-      contrast: 0,
-      saturation: 0,
-        text: seg.text,
-        transitionIn: null,
-        transitionOut: null,
-      });
-    }
-    // 文案模式：累加 cursor；音频模式：cursor 跟随真实 end
-    cursor = hasRealTime ? (seg.end ?? (cursor + duration)) : cursor + duration;
-  }
-  return clips;
-}
 
 export function App() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
@@ -1681,6 +1601,12 @@ export function App() {
           session.transcript,
           segments,
           ratio,
+          {
+            setProject,
+            setSelectedClipId,
+            onProjectRef: (p) => { projectRef.current = p; },
+            refreshProjects,
+          },
         );
         pipelineProject = saved;
         return persistSession(updateGenerationSession(session, { stage: "timeline_ready", segments }));
@@ -1855,50 +1781,6 @@ export function App() {
    * 4. 把音频源放到配音轨（作为整条配音）
    * 5. 自动绑素材
    */
-  async function buildAudioDrivenTimeline(
-    baseProject: Project,
-    narrationSourceId: string,
-    transcript: TimedSentencesResult,
-    segments: AiSegment[],
-    ratio: string,
-  ): Promise<Project> {
-    const clips = arrangeSegmentsToClips(segments, baseProject.tracks);
-    const voiceoverTrackId = pickPrimaryTrack(baseProject.tracks, "voiceover");
-    const withoutSegmentVoiceover = voiceoverTrackId
-      ? clips.filter((clip) => clip.trackId !== voiceoverTrackId)
-      : clips;
-    if (voiceoverTrackId) {
-      withoutSegmentVoiceover.push({
-        id: newClipId(),
-        trackId: voiceoverTrackId,
-        sourceId: narrationSourceId,
-        startOnTrack: 0,
-        duration: transcript.totalDuration,
-        sourceIn: 0,
-        sourceOut: transcript.totalDuration,
-        speed: 1,
-        volume: 1,
-        fadeIn: 0,
-        fadeOut: 0,
-        brightness: 0,
-        contrast: 0,
-        saturation: 0,
-        transitionIn: null,
-        transitionOut: null,
-      });
-    }
-    const saved = await desktopApi.saveProject({
-      ...baseProject,
-      ratio,
-      script: transcript.fullText || baseProject.script,
-      clips: withoutSegmentVoiceover,
-    });
-    projectRef.current = saved;
-    setProject(saved);
-    setSelectedClipId(saved.clips[0]?.id || null);
-    await refreshProjects(saved.id);
-    return saved;
-  }
 
   /**
    * 执行 EDL：把用户确认/编辑后的 segments 编排成轨道 clip + 自动绑素材。
